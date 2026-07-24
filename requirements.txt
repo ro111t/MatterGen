@@ -1,0 +1,44 @@
+# Core dependencies
+numpy>=1.24.0
+scipy>=1.10.0
+pandas>=2.0.0
+
+# Materials science
+pymatgen>=2023.10.0
+ase>=3.22.0
+matgl>=0.9.0
+chgnet>=0.3.0
+alignn>=2023.11.0
+
+# Machine learning
+torch>=2.0.0
+scikit-learn>=1.3.0
+
+# LLM integration
+openai>=1.0.0
+anthropic>=0.5.0
+langchain>=0.1.0
+
+# Data storage
+chromadb>=0.4.0
+sqlalchemy>=2.0.0
+psycopg2-binary>=2.9.0
+
+# Utilities
+pydantic>=2.0.0
+tqdm>=4.66.0
+click>=8.1.0
+streamlit>=1.30.0
+pandas>=2.0.0
+
+# Visualization
+matplotlib>=3.7.0
+plotly>=5.17.0
+
+# Experiment tracking
+wandb>=0.16.0
+
+# Optional: DFT calculators
+# vasp-interactive  # Requires VASP license
+# gpaw>=23.9.0
+# quantum-espresso-ase>=0.1.0
