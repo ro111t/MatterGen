@@ -8,6 +8,7 @@ max iteration count is reached or a success criterion is met.
 """
 
 import argparse
+from collections import Counter
 import json
 import os
 import time
@@ -398,10 +399,7 @@ class MaterialsDiscoveryCampaign:
             result.get('generation_backend', 'pymatgen_mock')
             for result in self.results_history
         ]
-        backend_counts = {
-            backend: batch_backends.count(backend)
-            for backend in sorted(set(batch_backends))
-        }
+        backend_counts = dict(Counter(batch_backends))
         if set(batch_backends) == {'mattergen'}:
             backend_name = 'mattergen'
         elif set(batch_backends) == {'pymatgen_mock'}:

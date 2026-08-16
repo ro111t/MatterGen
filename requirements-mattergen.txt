@@ -1,5 +1,5 @@
 # MatterGen v1.0.3 runtime dependencies not already listed in requirements.txt.
-# The PyG wheels below target the assignment's CUDA 11.8 / PyTorch 2.4 runtime.
+# PyG publishes PyTorch 2.4.x ABI-compatible binary wheels under the torch-2.4.0 index.
 --find-links https://data.pyg.org/whl/torch-2.4.0+cu118.html
 autopep8
 cachetools

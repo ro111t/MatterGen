@@ -125,8 +125,9 @@ class MattergenGenerator:
             if bundled_scale_file.exists() and not pkg_scale_file.exists():
                 pkg_scale_file.parent.mkdir(parents=True, exist_ok=True)
                 shutil.copy(bundled_scale_file, pkg_scale_file)
-        except Exception:
-            pass
+        except Exception as e:
+            print(f"  [Generator] Note: could not bootstrap GemNet scale file to package directory ({e}); relying on Hydra config override")
+
 
         scale_file_path = (self.sampling_config_path / "gemnet-dT.json").as_posix()
         overrides = self.config_overrides + [
