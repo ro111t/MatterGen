@@ -79,9 +79,8 @@ pip install -r requirements.txt
 pip install pymatgen ase matgl chgnet alignn
 
 # Optional: enable the real MatterGen diffusion backend
-# Requires Python 3.10, numpy<2.0, and torch==2.4.1 per the official package.
-# If these are not satisfied, the agent still works using the pymatgen mock.
-pip install mattergen
+# Follow the exact, pinned setup in the "Real MatterGen Setup" section below.
+# The default environment continues to use the pymatgen mock.
 
 # The project ships with bundled sampling configs and a GemNet scaling
 # factor file so that the pip wheel can find them even when its own data
@@ -90,6 +89,40 @@ pip install mattergen
 # Optional: set a HuggingFace token to avoid rate limits when downloading checkpoints
 export HF_TOKEN="your-hf-token"
 ```
+
+## Real MatterGen Setup
+
+The default `requirements.txt` workflow remains mock-only and does not require
+MatterGen, CUDA, or a Hugging Face download. Use the separate environment below
+when you need real diffusion sampling. It targets **Linux with an NVIDIA CUDA
+11.8-capable GPU**; on Windows, create it inside WSL2 or use a remote Linux GPU
+host.
+
+```bash
+# From a clean clone on the Linux GPU host
+conda env create -f environment.yml
+conda activate mattergen-agent
+
+# Preserve the assignment's torch==2.4.1 pin while installing MatterGen 1.0.3.
+python scripts/install_mattergen_runtime.py
+
+# Normal tests remain offline-safe and continue to exercise the mock path.
+python -m pytest tests/ -v
+
+# Opt in to a checkpoint download and one real generated pymatgen.Structure.
+# Option A (via pytest):
+RUN_MATTERGEN_SMOKE=1 python -m pytest tests/test_mattergen_smoke.py -m mattergen_smoke -v
+
+# Option B (standalone script):
+python tests/test_mattergen_smoke.py
+```
+
+The smoke test fails if initialization or generation falls back to the mock
+backend. It also checks Python 3.10, `numpy<2.0`, `torch==2.4.1`, and
+`mattergen==1.0.3`. MatterGen 1.0.3 declares a Linux-specific Torch 2.2.1
+dependency upstream, so the bootstrap script intentionally installs the pinned
+MatterGen package without re-resolving dependencies; `environment.yml` and
+`requirements-mattergen.txt` supply the configured Torch 2.4.1 runtime instead.
 
 ## Quick Start
 

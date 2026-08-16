@@ -12,6 +12,7 @@ gracefully falls back to the mock generator and logs the reason.
 
 from typing import Dict, List, Any, Optional, Tuple
 from pathlib import Path
+from math import ceil
 import random
 import tempfile
 import numpy as np
@@ -64,11 +65,8 @@ _PROTOTYPE_COMPOSITIONS = {
     ],
 }
 
-_DEFAULT_PROTOTYPES = [
-    ("Li", "P", "S"),
-    ("Li", "O", "P"),
-    ("Li", "Si", "O"),
-]
+
+
 
 
 class MattergenGenerator:
@@ -95,6 +93,8 @@ class MattergenGenerator:
         self.pretrained_name = pretrained_name
         self.model_path = model_path
         self.device = device
+        if batch_size < 1:
+            raise ValueError("MatterGen batch_size must be at least 1")
         self.batch_size = batch_size
         self.properties_to_condition_on = properties_to_condition_on or {}
         self.target_compositions = target_compositions or []
@@ -115,14 +115,23 @@ class MattergenGenerator:
         from mattergen.generator import CrystalGenerator
 
         # Restrict element vocabulary to the user's desired chemical system.
-        # Also redirect hardcoded training paths that are absent from the pip wheel
-        # to the bundled data files shipped with this project.
-        scale_file_override = (
-            f"++lightning_module.diffusion_module.model.scale_file={self.sampling_config_path / 'gemnet-dT.json'}"
-        )
+        # Also ensure hardcoded training paths that are absent from the pip wheel
+        # are populated from the bundled data files shipped with this project.
+        try:
+            import shutil
+            import mattergen.common.utils.globals as g
+            pkg_scale_file = Path(g.MODELS_PROJECT_ROOT) / "common" / "gemnet" / "gemnet-dT.json"
+            bundled_scale_file = self.sampling_config_path / "gemnet-dT.json"
+            if bundled_scale_file.exists() and not pkg_scale_file.exists():
+                pkg_scale_file.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy(bundled_scale_file, pkg_scale_file)
+        except Exception:
+            pass
+
+        scale_file_path = (self.sampling_config_path / "gemnet-dT.json").as_posix()
         overrides = self.config_overrides + [
             "++lightning_module.diffusion_module.model.element_mask_func={_target_:'mattergen.denoiser.mask_disallowed_elements',_partial_:True}",
-            scale_file_override,
+            f"++lightning_module.diffusion_module.model.gemnet.scale_file={scale_file_path}",
         ]
 
         if self.model_path:
@@ -159,7 +168,10 @@ class MattergenGenerator:
         target_properties: Optional[Dict[str, Any]] = None,
     ) -> List[Any]:
         """Generate up to num_candidates structures."""
-        num_batches = max(1, num_candidates // self.batch_size)
+        if num_candidates < 1:
+            return []
+
+        num_batches = ceil(num_candidates / self.batch_size)
 
         properties = dict(self.properties_to_condition_on)
         if target_properties:
@@ -173,12 +185,15 @@ class MattergenGenerator:
             properties["chemical_system"] = system
 
         with tempfile.TemporaryDirectory() as tmpdir:
-            return self._generator.generate(
+            structures = self._generator.generate(
                 batch_size=self.batch_size,
                 num_batches=num_batches,
                 target_compositions_dict=target_comps,
                 output_dir=Path(tmpdir),
             )
+        # MatterGen produces whole batches. Keep the adapter contract exact when
+        # the requested count is not a multiple of the MatterGen batch size.
+        return list(structures)[:num_candidates]
 
 
 class GenerationAgent:
@@ -203,6 +218,8 @@ class GenerationAgent:
         self._total_generated = 0
         self.use_mattergen = use_mattergen
         self._mattergen: Optional[MattergenGenerator] = None
+        self.last_generation_backend: Optional[str] = None
+        self._generation_batch_backends: List[str] = []
 
         if self.use_mattergen:
             try:
@@ -237,9 +254,11 @@ class GenerationAgent:
         Returns:
             List of pymatgen Structure objects (or stub dicts if pymatgen unavailable)
         """
+        backend = "pymatgen_mock"
         if self.use_mattergen and self._mattergen is not None:
             try:
                 structures = self._mattergen.generate(num_candidates, elements=elements)
+                backend = "mattergen"
             except Exception as e:
                 print(
                     f"  [Generator] MatterGen generation failed ({e}); "
@@ -249,6 +268,8 @@ class GenerationAgent:
         else:
             structures = self._generate_pymatgen_fallback(elements, num_candidates, seed)
 
+        self.last_generation_backend = backend
+        self._generation_batch_backends.append(backend)
         self._total_generated += len(structures)
         self.generation_history.extend(structures)
         return structures
@@ -352,4 +373,6 @@ class GenerationAgent:
         return {
             'total_generated': self._total_generated,
             'session_generated': len(self.generation_history),
+            'last_generation_backend': self.last_generation_backend,
+            'generation_batch_backends': list(self._generation_batch_backends),
         }

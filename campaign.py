@@ -160,7 +160,9 @@ class MaterialsDiscoveryCampaign:
             num_candidates=strategy.get('num_candidates', self.config.num_candidates),
             seed=42 + self.iteration
         )
+        generation_backend = self.generator.last_generation_backend or "pymatgen_mock"
         self._log(f"  Generated: {len(candidates)} structures")
+        self._log(f"  Generation backend: {generation_backend}")
 
         # 3. Screen with CHGNet/M3GNet
         self._log("\n[3/6] Screening with ML Models...")
@@ -253,6 +255,7 @@ class MaterialsDiscoveryCampaign:
         )
 
         insights = {
+            'generation_backend': generation_backend,
             'num_generated': len(candidates),
             'num_screened': len(screened),
             'num_passed': n_pass,
@@ -291,6 +294,7 @@ class MaterialsDiscoveryCampaign:
 
         return {
             'iteration': self.iteration,
+            'generation_backend': generation_backend,
             'num_generated': len(candidates),
             'num_screened': len(screened),
             'num_validated': len(validation_results),
@@ -390,7 +394,20 @@ class MaterialsDiscoveryCampaign:
             )
 
         n_iterations = len(self.results_history)
-        backend_name = "mattergen" if getattr(self.generator, "use_mattergen", False) else "pymatgen_mock"
+        batch_backends = [
+            result.get('generation_backend', 'pymatgen_mock')
+            for result in self.results_history
+        ]
+        backend_counts = {
+            backend: batch_backends.count(backend)
+            for backend in sorted(set(batch_backends))
+        }
+        if set(batch_backends) == {'mattergen'}:
+            backend_name = 'mattergen'
+        elif set(batch_backends) == {'pymatgen_mock'}:
+            backend_name = 'pymatgen_mock'
+        else:
+            backend_name = 'mixed'
         report = {
             'campaign_name': self.config.name,
             'campaign_id': self.campaign_id,
@@ -398,7 +415,10 @@ class MaterialsDiscoveryCampaign:
             'iterations': n_iterations,
             'elapsed_time_seconds': elapsed_time,
             'generation_backend': backend_name,
-            'mattergen_pretrained': self.config.mattergen_pretrained if backend_name == "mattergen" else None,
+            'generation_backend_counts': backend_counts,
+            'mattergen_pretrained': (
+                self.config.mattergen_pretrained if 'mattergen' in backend_counts else None
+            ),
             'total_generated': total_generated,
             'total_passed_screening': total_passed,
             'overall_pass_rate': total_passed / total_generated if total_generated > 0 else 0,

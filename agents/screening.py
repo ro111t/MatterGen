@@ -5,6 +5,8 @@ Uses CHGNet as the primary predictor (energy, forces, stress).
 Falls back to heuristic scoring if CHGNet is unavailable.
 """
 
+from __future__ import annotations
+
 from typing import Dict, List, Tuple, Any, Optional
 import numpy as np
 from dataclasses import dataclass

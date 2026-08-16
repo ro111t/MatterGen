@@ -1,0 +1,20 @@
+name: mattergen-agent
+channels:
+  - pytorch
+  - nvidia
+  - conda-forge
+dependencies:
+  - python=3.10
+  - pip
+  - numpy=1.26.4
+  - pytorch=2.4.1
+  - torchvision=0.19.1
+  - torchaudio=2.4.1
+  - pytorch-cuda=11.8
+  - pip:
+      # MatterGen itself is pinned and installed by
+      # scripts/install_mattergen_runtime.py after this solve. Its upstream
+      # Linux Torch 2.2.1 metadata conflicts with the assignment's Torch 2.4.1 pin.
+      - -c constraints-mattergen.txt
+      - -r requirements.txt
+      - -r requirements-mattergen.txt
