@@ -186,6 +186,7 @@ class MattergenGenerator:
             properties["chemical_system"] = system
 
         with tempfile.TemporaryDirectory() as tmpdir:
+            self._generator.properties_to_condition_on = properties
             structures = self._generator.generate(
                 batch_size=self.batch_size,
                 num_batches=num_batches,

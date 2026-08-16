@@ -26,8 +26,11 @@ def test_mattergen_generates_a_real_pymatgen_structure():
 
     assert np.__version__.startswith("1."), "MatterGen requires numpy<2.0"
     assert torch.__version__.startswith("2.4.1"), "Expected torch==2.4.1"
-    assert importlib.metadata.version("mattergen") == "1.0.3"
-    assert HAS_MATTERGEN, "MatterGen must be importable in the real runtime"
+    assert HAS_MATTERGEN, "MatterGen must be installed and importable in the real runtime"
+    try:
+        assert importlib.metadata.version("mattergen") == "1.0.3", "Expected mattergen==1.0.3"
+    except importlib.metadata.PackageNotFoundError:
+        pytest.fail("mattergen package distribution is not installed in this environment")
 
     agent = GenerationAgent(
         use_mattergen=True,
