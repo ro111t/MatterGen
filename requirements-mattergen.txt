@@ -1,0 +1,29 @@
+# MatterGen v1.0.3 runtime dependencies not already listed in requirements.txt.
+# PyG publishes PyTorch 2.4.x ABI-compatible binary wheels under the torch-2.4.0 index.
+--find-links https://data.pyg.org/whl/torch-2.4.0+cu118.html
+autopep8
+cachetools
+contextlib2
+emmet-core>=0.84.2
+fire
+huggingface-hub
+hydra-core==1.3.1
+hydra-joblib-launcher==1.1.5
+jupyterlab>=4.2.5
+lmdb
+matplotlib==3.8.4
+matscipy>=0.7.0
+mattersim>=1.1
+monty==2024.7.30
+notebook>=7.2.2
+omegaconf==2.3.0
+pylint
+pytorch-lightning==2.0.6
+seaborn>=0.13.2
+SMACT
+sympy>=1.11.1
+torch-geometric>=2.5
+pyg-lib
+torch-cluster
+torch-scatter
+torch-sparse
