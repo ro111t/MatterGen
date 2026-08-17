@@ -385,7 +385,7 @@ If you use this system, please cite:
 ```bibtex
 @software{mattergen_agent,
   title={Mattergen Autonomous Discovery Agent},
-  author={Your Name},
+  authors={Rohit Vennelakanti, Joseph Press, Bradley Hawkins, Andrei Ivanou},
   year={2026}
 }
 ```
@@ -393,5 +393,5 @@ If you use this system, please cite:
 ## Support
 
 For issues and questions:
-- GitHub Issues: [link]
-- Email: your-email@example.com
+- GitHub Issues: [[here]](https://github.com/ro111t/MatterGen/issues)
+- Email: mattergenamda@gmail.com
