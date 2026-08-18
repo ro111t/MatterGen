@@ -129,7 +129,9 @@ def test_generation_agent_deterministic_replay():
             assert c1["candidate_id"] == c2["candidate_id"]
         else:
             assert c1.composition.reduced_formula == c2.composition.reduced_formula
-            assert getattr(c1, "_candidate_id", None) == getattr(c2, "_candidate_id", None)
+            id1 = getattr(c1, "_candidate_id", None) or (c1.properties.get("_candidate_id") if hasattr(c1, "properties") else None)
+            id2 = getattr(c2, "_candidate_id", None) or (c2.properties.get("_candidate_id") if hasattr(c2, "properties") else None)
+            assert id1 == id2
 
 
 def test_backend_name_accuracy():
@@ -140,4 +142,12 @@ def test_backend_name_accuracy():
         assert agent.backend_name == "pymatgen_mock"
     else:
         assert agent.backend_name == "stub"
+
+    class FakeMattergen:
+        pass
+
+    agent_mg = GenerationAgent(use_mattergen=False)
+    agent_mg.use_mattergen = True
+    agent_mg._mattergen = FakeMattergen()
+    assert agent_mg.backend_name == "mattergen"
 

@@ -38,10 +38,13 @@ def test_candidate_id_preserved_across_all_stages():
 
     candidates = gen.generate_batch(elements=["Li", "P", "S"], num_candidates=2, seed=42)
     assert len(candidates) == 2
-    cand0_id = candidates[0].get("candidate_id") if isinstance(candidates[0], dict) else getattr(candidates[0], "_candidate_id", None)
-    cand1_id = candidates[1].get("candidate_id") if isinstance(candidates[1], dict) else getattr(candidates[1], "_candidate_id", None)
-    assert cand0_id == "MAT-000001"
-    assert cand1_id == "MAT-000002"
+    def _extract_id(c):
+        if isinstance(c, dict):
+            return c.get("candidate_id")
+        return getattr(c, "_candidate_id", None) or (c.properties.get("_candidate_id") if hasattr(c, "properties") else None)
+
+    assert _extract_id(candidates[0]) == "MAT-000001"
+    assert _extract_id(candidates[1]) == "MAT-000002"
 
     # Screen
     screened = screener.screen_batch(candidates, criteria={})
@@ -57,3 +60,47 @@ def test_candidate_id_preserved_across_all_stages():
     assessed = synthesis.assess_batch(candidates, validated_ids)
     assessed_ids = [a.structure_id for a in assessed]
     assert assessed_ids == ["MAT-000001", "MAT-000002"]
+
+
+def test_multi_iteration_candidate_id_incrementing():
+    """Candidate IDs should strictly increment across consecutive generate_batch calls without resetting or collisions."""
+    gen = GenerationAgent(use_mattergen=False)
+    def _extract_id(c):
+        if isinstance(c, dict):
+            return c.get("candidate_id")
+        return getattr(c, "_candidate_id", None) or (c.properties.get("_candidate_id") if hasattr(c, "properties") else None)
+
+    batch1 = gen.generate_batch(elements=["Li", "P", "S"], num_candidates=3, seed=1)
+    batch2 = gen.generate_batch(elements=["Li", "P", "S", "Cl"], num_candidates=3, seed=2)
+
+    ids1 = [_extract_id(c) for c in batch1]
+    ids2 = [_extract_id(c) for c in batch2]
+
+    assert ids1 == ["MAT-000001", "MAT-000002", "MAT-000003"]
+    assert ids2 == ["MAT-000004", "MAT-000005", "MAT-000006"]
+    assert len(set(ids1 + ids2)) == 6
+
+
+def test_synthesis_assessment_is_deterministic():
+    """Synthesis assessment must be deterministic across different agent instances."""
+    synth1 = SynthesisFeasibilityAgent(mode="mock")
+    synth2 = SynthesisFeasibilityAgent(mode="mock")
+
+    stub_struct = {
+        "composition": "Li3PS4",
+        "candidate_id": "MAT-000001",
+        "generation_id": "MAT-000001",
+        "positions": [[0.0, 0.0, 0.0]],
+        "lattice": [[5.0, 0.0, 0.0], [0.0, 5.0, 0.0], [0.0, 0.0, 5.0]],
+    }
+
+    res1 = synth1.assess(stub_struct, "MAT-000001")
+    res2 = synth2.assess(stub_struct, "MAT-000001")
+
+    assert res1.feasible == res2.feasible
+    assert res1.feasibility_score == res2.feasibility_score
+    assert res1.difficulty_score == res2.difficulty_score
+    assert res1.synthesis_route == res2.synthesis_route
+    assert res1.structure_id == "MAT-000001"
+    assert res2.structure_id == "MAT-000001"
+
