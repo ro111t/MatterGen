@@ -90,7 +90,7 @@ def test_full_pipeline_runs_and_reports_expected_keys():
         assert results["total_validated"] == 2
         assert results["total_converged"] == 2
         assert results["total_synthesis_feasible"] == 2
-        expected_backend = "pymatgen_mock" if getattr(campaign.generator, "backend_name", "stub") == "pymatgen_mock" else "stub"
+        expected_backend = campaign.generator.last_generation_backend
         assert results["generation_backend"] == expected_backend
         assert results["generation_backend_counts"] == {expected_backend: 1}
         assert "best_validated_stability_ever" in results
@@ -138,7 +138,7 @@ def test_report_uses_the_backend_that_generated_the_batch():
 
         results = campaign.run_campaign()
 
-        expected_backend = "pymatgen_mock" if getattr(campaign.generator, "backend_name", "stub") == "pymatgen_mock" else "stub"
+        expected_backend = campaign.generator.last_generation_backend
         assert results["generation_backend"] == expected_backend
         assert results["generation_backend_counts"] == {expected_backend: 1}
         assert results["mattergen_pretrained"] is None
