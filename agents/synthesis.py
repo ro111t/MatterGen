@@ -113,8 +113,16 @@ class SynthesisFeasibilityAgent:
     def _structure_id(self, structure: Any, idx: int = 0) -> str:
         """Generate a stable identifier."""
         if isinstance(structure, dict):
-            return structure.get('generation_id', f"struct_{idx}")
+            if 'candidate_id' in structure:
+                return str(structure['candidate_id'])
+            if 'generation_id' in structure:
+                return str(structure['generation_id'])
+            return f"struct_{idx}"
+        if hasattr(structure, '_candidate_id'):
+            return str(getattr(structure, '_candidate_id'))
         if HAS_PYMATGEN and isinstance(structure, Structure):
+            if hasattr(structure, 'properties') and isinstance(structure.properties, dict) and '_candidate_id' in structure.properties:
+                return str(structure.properties['_candidate_id'])
             return f"{structure.composition.reduced_formula}_{idx}"
         if HAS_PYMATGEN and hasattr(structure, 'composition'):
             return f"{structure.composition.reduced_formula}_{idx}"
@@ -123,7 +131,10 @@ class SynthesisFeasibilityAgent:
     def _formula(self, structure: Any) -> str:
         """Extract a formula string from a structure object or dict."""
         if isinstance(structure, dict):
-            return structure.get('composition', f"struct_{hash(str(structure)) % 10000}")
+            if 'composition' in structure:
+                return str(structure['composition'])
+            h = int(hashlib.md5(str(structure).encode('utf-8')).hexdigest(), 16) % 10000
+            return f"struct_{h}"
         if HAS_PYMATGEN and isinstance(structure, Structure):
             return structure.composition.reduced_formula
         if HAS_PYMATGEN and hasattr(structure, 'composition'):
