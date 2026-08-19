@@ -136,6 +136,25 @@ class MaterialsDiscoveryCampaign:
 
         return final_results
         
+    @staticmethod
+    def _format_screened_candidate(struct: Any, result: Any) -> Dict[str, Any]:
+        """Serialize a screened candidate for UI/reporting."""
+        composition = ""
+        if hasattr(struct, "composition"):
+            composition = str(struct.composition.reduced_formula)
+        elif isinstance(struct, dict):
+            composition = str(struct.get("composition", ""))
+        return {
+            'structure_id': result.structure_id,
+            'composition': composition,
+            'score': result.score,
+            'rank': result.rank,
+            'passes_filters': result.passes_filters,
+            'filter_reasons': result.filter_reasons,
+            'score_components': result.score_components,
+            'predictions': result.predictions,
+        }
+
     def _run_iteration(self) -> Dict[str, Any]:
         """Execute one iteration: plan → generate → screen → validate → synthesize → distill → report."""
 
@@ -299,6 +318,10 @@ class MaterialsDiscoveryCampaign:
             'generation_backend': generation_backend,
             'num_generated': len(candidates),
             'num_screened': len(screened),
+            'screened_candidates': [
+                self._format_screened_candidate(struct, result)
+                for struct, result in screened
+            ],
             'num_validated': len(validation_results),
             'validation_results': [
                 {
