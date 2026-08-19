@@ -1,5 +1,7 @@
 # Mattergen Autonomous Materials Discovery Agent
 
+[![Tests](https://github.com/ro111t/MatterGen/actions/workflows/pytest.yml/badge.svg)](https://github.com/ro111t/MatterGen/actions/workflows/pytest.yml)
+
 An agentic system for autonomous discovery of novel materials using Mattergen and computational validation.
 
 ## Overview
@@ -24,7 +26,7 @@ This system implements a closed-loop materials discovery pipeline that:
 
 - `campaign.py`: orchestration entry point, configuration dataclass, CLI, checkpoints, and final reports.
 - `agents/generator.py`: MatterGen adapter and deterministic pymatgen mock fallback.
-- `agents/screening.py`: CHGNet-backed fast screening.
+- `agents/screening.py`: CHGNet-backed fast screening with multi-objective scoring, target-property matching, and composition deduplication.
 - `agents/validation.py`: ASE validation interface; uses a deterministic mock calculator by default.
 - `agents/analysis.py`, `agents/synthesis.py`, and `agents/strategy.py`: calibration analysis, synthesis heuristics, and adaptive search strategy.
 - `agents/career_memory.py` and `agents/experience_distiller.py`: persistent learning between campaigns.
@@ -234,6 +236,25 @@ Filter candidates:
 - `max_formation_energy`: Maximum formation energy
 - `min_band_gap`, `max_band_gap`: Band gap range
 - `max_forces`: Maximum atomic forces
+
+### Multi-Objective Screening
+
+`agents/screening.py` ranks candidates with a composite score that combines:
+- **Stability** (favoring lower formation energy)
+- **Relaxation quality** (low forces/stress)
+- **Target property match** (closeness to campaign objective targets such as `band_gap`)
+- **Composition novelty** (rarity within the generated batch)
+
+The default weights are configurable via the `weights` argument to `screen_batch`. Duplicate compositions within a batch are deduplicated, keeping the highest-scoring representative.
+
+```python
+screened = screener.screen_batch(
+    structures=candidates,
+    criteria={"max_forces": 1.0},
+    target_properties={"band_gap": 2.5},
+    weights={"stability": 0.4, "target_property_match": 0.3, "relaxation_quality": 0.2, "composition_novelty": 0.1},
+)
+```
 
 ## Workflow
 
