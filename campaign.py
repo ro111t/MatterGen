@@ -161,7 +161,7 @@ class MaterialsDiscoveryCampaign:
             num_candidates=strategy.get('num_candidates', self.config.num_candidates),
             seed=42 + self.iteration
         )
-        generation_backend = self.generator.last_generation_backend or "pymatgen_mock"
+        generation_backend = self.generator.last_generation_backend or getattr(self.generator, "backend_name", "stub")
         self._log(f"  Generated: {len(candidates)} structures")
         self._log(f"  Generation backend: {generation_backend}")
 
@@ -396,15 +396,16 @@ class MaterialsDiscoveryCampaign:
             )
 
         n_iterations = len(self.results_history)
+        default_backend = getattr(self.generator, "backend_name", "stub")
         batch_backends = [
-            result.get('generation_backend', 'pymatgen_mock')
+            result.get('generation_backend', default_backend)
             for result in self.results_history
         ]
         backend_counts = dict(Counter(batch_backends))
-        if set(batch_backends) == {'mattergen'}:
-            backend_name = 'mattergen'
-        elif set(batch_backends) == {'pymatgen_mock'}:
-            backend_name = 'pymatgen_mock'
+        if len(set(batch_backends)) == 1:
+            backend_name = batch_backends[0]
+        elif len(set(batch_backends)) == 0:
+            backend_name = default_backend
         else:
             backend_name = 'mixed'
         report = {

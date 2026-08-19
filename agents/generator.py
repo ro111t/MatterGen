@@ -167,10 +167,22 @@ class MattergenGenerator:
         num_candidates: int,
         elements: Optional[List[str]] = None,
         target_properties: Optional[Dict[str, Any]] = None,
+        seed: Optional[int] = None,
     ) -> List[Any]:
         """Generate up to num_candidates structures."""
         if num_candidates < 1:
             return []
+
+        if seed is not None:
+            random.seed(seed)
+            np.random.seed(seed % (2**32))
+            try:
+                import torch
+                torch.manual_seed(seed)
+                if torch.cuda.is_available():
+                    torch.cuda.manual_seed_all(seed)
+            except ImportError:
+                pass
 
         num_batches = ceil(num_candidates / self.batch_size)
 
@@ -237,6 +249,15 @@ class GenerationAgent:
                 print(f"  [Generator] MatterGen unavailable ({e}); falling back to pymatgen mock")
                 self.use_mattergen = False
 
+    @property
+    def backend_name(self) -> str:
+        """Accurately report the active generation backend."""
+        if self.use_mattergen and self._mattergen is not None:
+            return "mattergen"
+        if HAS_PYMATGEN:
+            return "pymatgen_mock"
+        return "stub"
+
     def generate_batch(
         self,
         elements: List[str],
@@ -256,19 +277,38 @@ class GenerationAgent:
         Returns:
             List of pymatgen Structure objects (or stub dicts if pymatgen unavailable)
         """
-        backend = "pymatgen_mock"
+        start_idx = self._total_generated
+        backend = "pymatgen_mock" if HAS_PYMATGEN else "stub"
         if self.use_mattergen and self._mattergen is not None:
             try:
-                structures = self._mattergen.generate(num_candidates, elements=elements)
+                try:
+                    structures = self._mattergen.generate(num_candidates, elements=elements, seed=seed)
+                except TypeError:
+                    structures = self._mattergen.generate(num_candidates, elements=elements)
                 backend = "mattergen"
             except Exception as e:
                 print(
                     f"  [Generator] MatterGen generation failed ({e}); "
-                    "falling back to pymatgen mock for this batch"
+                    "falling back to mock for this batch"
                 )
-                structures = self._generate_pymatgen_fallback(elements, num_candidates, seed)
+                structures = self._generate_pymatgen_fallback(elements, num_candidates, seed, start_idx=start_idx)
+                backend = "pymatgen_mock" if HAS_PYMATGEN else "stub"
         else:
-            structures = self._generate_pymatgen_fallback(elements, num_candidates, seed)
+            structures = self._generate_pymatgen_fallback(elements, num_candidates, seed, start_idx=start_idx)
+
+        # Tag each structure with an immutable candidate ID at birth
+        for i, struct in enumerate(structures):
+            cand_id = f"MAT-{start_idx + i + 1:06d}"
+            if isinstance(struct, dict):
+                struct['candidate_id'] = cand_id
+                struct['generation_id'] = cand_id
+            else:
+                try:
+                    setattr(struct, '_candidate_id', cand_id)
+                except (AttributeError, TypeError):
+                    pass
+                if hasattr(struct, 'properties') and isinstance(struct.properties, dict):
+                    struct.properties['_candidate_id'] = cand_id
 
         self.last_generation_backend = backend
         self._generation_batch_backends.append(backend)
@@ -278,16 +318,18 @@ class GenerationAgent:
 
     def _generate_pymatgen_fallback(self, elements: List[str],
                                      num_candidates: int,
-                                     seed: int) -> List[Any]:
+                                     seed: int,
+                                     start_idx: int = 0) -> List[Any]:
         """Use pymatgen mock (or stub) with a deterministic RNG."""
         rng = random.Random(seed)
         if HAS_PYMATGEN:
-            return self._generate_pymatgen_structures(elements, num_candidates, rng)
-        return self._generate_stub_structures(elements, num_candidates, rng)
+            return self._generate_pymatgen_structures(elements, num_candidates, rng, start_idx=start_idx)
+        return self._generate_stub_structures(elements, num_candidates, rng, start_idx=start_idx)
 
     def _generate_pymatgen_structures(self, elements: List[str],
                                        num_candidates: int,
-                                       rng: random.Random) -> List[Any]:
+                                       rng: random.Random,
+                                       start_idx: int = 0) -> List[Any]:
         """Generate realistic mock structures using pymatgen."""
         structures = []
         valid_elements = self._filter_valid_elements(elements)
@@ -354,19 +396,26 @@ class GenerationAgent:
 
     def _generate_stub_structures(self, elements: List[str],
                                    num_candidates: int,
-                                   rng: random.Random) -> List[Dict[str, Any]]:
-        """Fallback when pymatgen is unavailable — returns dicts."""
+                                   rng: random.Random,
+                                   start_idx: int = 0) -> List[Dict[str, Any]]:
+        """Fallback when pymatgen is unavailable — returns dicts with deterministic rng positions."""
         structs = []
         for i in range(num_candidates):
             chosen = rng.sample(elements, min(3, len(elements)))
             stoich = [rng.randint(1, 4) for _ in chosen]
             formula = ''.join(f"{e}{s}" for e, s in zip(chosen, stoich))
+            total_atoms = sum(stoich)
+            positions = [[rng.random(), rng.random(), rng.random()] for _ in range(total_atoms)]
+            lattice_scaling = rng.uniform(4.0, 8.0)
+            lattice = [[lattice_scaling, 0.0, 0.0], [0.0, lattice_scaling, 0.0], [0.0, 0.0, lattice_scaling]]
+            cand_id = f"MAT-{start_idx + i + 1:06d}"
             structs.append({
                 'composition': formula,
-                'lattice': np.eye(3) * rng.uniform(4.0, 8.0),
-                'positions': np.random.rand(sum(stoich), 3),
+                'lattice': lattice,
+                'positions': positions,
                 'elements': chosen,
-                'generation_id': f"stub_{self._total_generated}_{i}"
+                'generation_id': cand_id,
+                'candidate_id': cand_id,
             })
         return structs
 
@@ -377,4 +426,5 @@ class GenerationAgent:
             'session_generated': len(self.generation_history),
             'last_generation_backend': self.last_generation_backend,
             'generation_batch_backends': list(self._generation_batch_backends),
+            'backend_name': self.backend_name,
         }

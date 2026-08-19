@@ -213,9 +213,17 @@ class ValidationAgent:
     def _structure_id(self, structure: Any, idx: int = 0) -> str:
         """Generate a stable identifier for a structure."""
         if isinstance(structure, dict):
+            if "candidate_id" in structure:
+                return str(structure["candidate_id"])
+            if "generation_id" in structure:
+                return str(structure["generation_id"])
             formula = structure.get("composition", f"unknown_{idx}")
-            return structure.get("generation_id", f"{formula}_{idx}")
+            return f"{formula}_{idx}"
+        if hasattr(structure, "_candidate_id"):
+            return str(getattr(structure, "_candidate_id"))
         if HAS_PYMATGEN and isinstance(structure, Structure):
+            if hasattr(structure, "properties") and isinstance(structure.properties, dict) and "_candidate_id" in structure.properties:
+                return str(structure.properties["_candidate_id"])
             return f"{structure.composition.reduced_formula}_{idx}"
         if HAS_ASE and isinstance(structure, Atoms):
             return f"{structure.get_chemical_formula()}_{idx}"
