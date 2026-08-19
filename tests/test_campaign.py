@@ -14,7 +14,7 @@ from agents.screening import ScreeningAgent, ScreeningResult
 class FakeScreener:
     """Deterministic, CHGNet-free screener for fast integration tests."""
 
-    def screen_batch(self, structures, criteria=None):
+    def screen_batch(self, structures, criteria=None, **kwargs):
         results = []
         for i, struct in enumerate(structures):
             sid = struct.get("generation_id", f"struct_{i}") if isinstance(struct, dict) else f"struct_{i}"

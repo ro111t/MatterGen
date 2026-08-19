@@ -169,7 +169,8 @@ class MaterialsDiscoveryCampaign:
         self._log("\n[3/6] Screening with ML Models...")
         screened = self.screener.screen_batch(
             structures=candidates,
-            criteria=strategy.get('screening_criteria', {})
+            criteria=strategy.get('screening_criteria', {}),
+            target_properties=self.config.objective.target_properties,
         )
         n_pass = sum(1 for _, r in screened if r.passes_filters)
         scores = [r.score for _, r in screened]

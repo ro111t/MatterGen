@@ -7,10 +7,11 @@ Falls back to heuristic scoring if CHGNet is unavailable.
 
 from __future__ import annotations
 
-import hashlib
+from collections import defaultdict
+from dataclasses import dataclass, field
 from typing import Dict, List, Tuple, Any, Optional
+import hashlib
 import numpy as np
-from dataclasses import dataclass
 
 try:
     from chgnet.model import CHGNet
@@ -26,6 +27,14 @@ except ImportError:
     HAS_PYMATGEN = False
 
 
+DEFAULT_SCREENING_WEIGHTS = {
+    "stability": 0.35,
+    "relaxation_quality": 0.25,
+    "target_property_match": 0.25,
+    "composition_novelty": 0.15,
+}
+
+
 @dataclass
 class ScreeningResult:
     """Results from ML-based screening."""
@@ -34,6 +43,8 @@ class ScreeningResult:
     score: float
     passes_filters: bool
     filter_reasons: List[str]
+    rank: Optional[int] = None
+    score_components: Dict[str, float] = field(default_factory=dict)
 
 
 class ScreeningAgent:
@@ -57,35 +68,56 @@ class ScreeningAgent:
         else:
             print("  [Screener] CHGNet not installed, using heuristic scoring")
         
-    def screen_batch(self,
-                     structures: List[Any],
-                     criteria: Dict[str, Any]) -> List[Tuple[Any, ScreeningResult]]:
+    def screen_batch(
+        self,
+        structures: List[Any],
+        criteria: Dict[str, Any],
+        target_properties: Optional[Dict[str, float]] = None,
+        weights: Optional[Dict[str, float]] = None,
+        deduplicate: bool = True,
+    ) -> List[Tuple[Any, ScreeningResult]]:
         """
         Screen all structures; return all results sorted by score (best first).
 
         Args:
             structures: List of pymatgen Structure objects (or stub dicts)
             criteria: Dict with optional keys: max_formation_energy, max_forces, min_stability
+            target_properties: Optional map of property name -> target value, used to
+                compute a target-property-match component of the score.
+            weights: Optional map overriding the default multi-objective score weights.
+            deduplicate: If True, keep only the highest-scored structure per composition.
 
         Returns:
             List of (structure, ScreeningResult) sorted by score descending
         """
-        results = []
+        target_properties = target_properties or {}
+        weights = weights or DEFAULT_SCREENING_WEIGHTS
+
+        raw_results = []
         for i, struct in enumerate(structures):
             struct_id = self._get_struct_id(struct, i)
             predictions = self._predict(struct, struct_id)
             passes, reasons = self._apply_filters(predictions, criteria)
-            score = self._calculate_score(predictions)
-            results.append((struct, ScreeningResult(
+            score, components = self._calculate_score(predictions, target_properties, weights)
+            raw_results.append((struct, ScreeningResult(
                 structure_id=struct_id,
                 predictions=predictions,
                 score=score,
                 passes_filters=passes,
-                filter_reasons=reasons
+                filter_reasons=reasons,
+                score_components=components,
             )))
 
-        results.sort(key=lambda x: x[1].score, reverse=True)
-        return results
+        if deduplicate:
+            raw_results = self._deduplicate_by_composition(raw_results)
+
+        self._update_novelty_scores(raw_results, weights)
+
+        raw_results.sort(key=lambda x: x[1].score, reverse=True)
+        for rank, (_, result) in enumerate(raw_results, start=1):
+            result.rank = rank
+
+        return raw_results
 
     def _get_struct_id(self, struct: Any, idx: int) -> str:
         """Extract a stable ID from a structure."""
@@ -175,6 +207,26 @@ class ScreeningAgent:
             'stability': energy + stability_bonus,
         }
 
+    def _deduplicate_by_composition(
+        self,
+        results: List[Tuple[Any, ScreeningResult]],
+    ) -> List[Tuple[Any, ScreeningResult]]:
+        """Keep the highest-scoring structure for each reduced composition."""
+        best_by_formula: Dict[str, Tuple[Any, ScreeningResult]] = {}
+        for struct, result in results:
+            formula = self._get_composition_key(struct)
+            if formula not in best_by_formula or result.score > best_by_formula[formula][1].score:
+                best_by_formula[formula] = (struct, result)
+        return list(best_by_formula.values())
+
+    def _get_composition_key(self, struct: Any) -> str:
+        """Return a reduced composition string used for deduplication."""
+        if HAS_PYMATGEN and isinstance(struct, Structure):
+            return str(struct.composition.reduced_formula)
+        if isinstance(struct, dict):
+            return str(struct.get("composition", struct.get("generation_id", id(struct))))
+        return f"struct_{id(struct)}"
+
     def _apply_filters(self, predictions: Dict[str, float],
                         criteria: Dict[str, Any]) -> Tuple[bool, List[str]]:
         """Apply configurable filters; return (passes, failure_reasons)."""
@@ -202,20 +254,90 @@ class ScreeningAgent:
 
         return len(reasons) == 0, reasons
 
-    def _calculate_score(self, predictions: Dict[str, float]) -> float:
+    def _calculate_score(
+        self,
+        predictions: Dict[str, float],
+        target_properties: Optional[Dict[str, float]] = None,
+        weights: Optional[Dict[str, float]] = None,
+    ) -> Tuple[float, Dict[str, float]]:
         """
-        Normalized 0-100 score. Higher = more promising candidate.
-        Based on formation energy magnitude, low forces, and stability.
+        Multi-objective score normalized to 0-100. Higher = better candidate.
+
+        Combines stability, relaxation quality, target-property match, and
+        within-batch composition novelty.
         """
-        score = 50.0
+        target_properties = target_properties or {}
+        weights = weights or DEFAULT_SCREENING_WEIGHTS
 
-        fe = predictions.get('formation_energy', 0)
-        score += min(25.0, max(-25.0, -fe * 5.0))
+        # Stability component: favor lower formation energies.
+        fe = predictions.get('formation_energy', 0.0)
+        stability = round(max(0.0, min(100.0, 50.0 - fe * 12.5)), 3)
 
+        # Relaxation quality component: penalize high forces/stress.
         forces = predictions.get('forces', 0.5)
-        score += max(0.0, 15.0 - forces * 20.0)
-
         stress = predictions.get('stress', 1.0)
-        score += max(0.0, 10.0 - stress * 3.0)
+        force_score = round(max(0.0, min(100.0, 100.0 - forces * 50.0)), 3)
+        stress_score = round(max(0.0, min(100.0, 100.0 - stress * 20.0)), 3)
+        relaxation_quality = round((force_score + stress_score) / 2.0, 3)
 
-        return round(max(0.0, min(100.0, score)), 3)
+        # Target property match component: closeness to specified targets.
+        property_scores = []
+        for prop, target in target_properties.items():
+            if prop in predictions:
+                actual = predictions[prop]
+                # Normalize closeness using a generous tolerance scale.
+                scale = max(abs(target), 1.0)
+                error = abs(actual - target) / scale
+                property_scores.append(max(0.0, min(100.0, 100.0 - error * 100.0)))
+        target_property_match = round(sum(property_scores) / max(len(property_scores), 1), 3) if property_scores else 50.0
+
+        # Composition novelty is computed at batch level; default to neutral.
+        composition_novelty = 50.0
+
+        components = {
+            'stability': stability,
+            'relaxation_quality': relaxation_quality,
+            'target_property_match': target_property_match,
+            'composition_novelty': composition_novelty,
+        }
+
+        total_weight = sum(weights.get(k, 0.0) for k in components)
+        if total_weight == 0.0:
+            total_weight = 1.0
+
+        score = sum(
+            weights.get(k, 0.0) * components[k] / total_weight
+            for k in components
+        )
+        return round(max(0.0, min(100.0, score)), 3), components
+
+    def _update_novelty_scores(
+        self,
+        results: List[Tuple[Any, ScreeningResult]],
+        weights: Optional[Dict[str, float]] = None,
+    ) -> None:
+        """
+        Adjust composition novelty scores so rare compositions in the batch score higher.
+        Called automatically inside screen_batch after deduplication.
+        """
+        weights = weights or DEFAULT_SCREENING_WEIGHTS
+        counts: Dict[str, int] = defaultdict(int)
+        for struct, _ in results:
+            counts[self._get_composition_key(struct)] += 1
+
+        max_count = max(counts.values()) if counts else 1
+        for struct, result in results:
+            formula = self._get_composition_key(struct)
+            rarity = 1.0 - (counts[formula] - 1) / max_count
+            result.score_components['composition_novelty'] = round(rarity * 100.0, 3)
+            # Recompute overall score with the updated novelty component.
+            total_weight = sum(weights.get(k, 0.0) for k in result.score_components)
+            if total_weight == 0.0:
+                total_weight = 1.0
+            result.score = round(
+                sum(
+                    weights.get(k, 0.0) * result.score_components[k] / total_weight
+                    for k in result.score_components
+                ),
+                3,
+            )
