@@ -10,6 +10,7 @@ from __future__ import annotations
 from collections import defaultdict
 from dataclasses import dataclass, field
 from typing import Dict, List, Tuple, Any, Optional
+import hashlib
 import numpy as np
 
 try:
@@ -120,10 +121,18 @@ class ScreeningAgent:
 
     def _get_struct_id(self, struct: Any, idx: int) -> str:
         """Extract a stable ID from a structure."""
-        if HAS_PYMATGEN and isinstance(struct, Structure):
-            return f"struct_{idx}_{struct.composition.reduced_formula}"
         if isinstance(struct, dict):
-            return struct.get('generation_id', f"stub_{idx}")
+            if 'candidate_id' in struct:
+                return str(struct['candidate_id'])
+            if 'generation_id' in struct:
+                return str(struct['generation_id'])
+            return f"stub_{idx}"
+        if hasattr(struct, '_candidate_id'):
+            return str(getattr(struct, '_candidate_id'))
+        if HAS_PYMATGEN and isinstance(struct, Structure):
+            if hasattr(struct, 'properties') and isinstance(struct.properties, dict) and '_candidate_id' in struct.properties:
+                return str(struct.properties['_candidate_id'])
+            return f"struct_{idx}_{struct.composition.reduced_formula}"
         return f"struct_{idx}"
 
     def _predict(self, struct: Any, struct_id: str) -> Dict[str, float]:
@@ -139,7 +148,7 @@ class ScreeningAgent:
         self.prediction_cache[struct_id] = preds
         return preds
 
-    def _chgnet_predict(self, struct: Structure) -> Dict[str, float]:
+    def _chgnet_predict(self, struct: Any) -> Dict[str, float]:
         """Run real CHGNet inference."""
         try:
             result = self.chgnet.predict_structure(struct)
@@ -162,14 +171,14 @@ class ScreeningAgent:
     def _heuristic_predict(self, struct: Any) -> Dict[str, float]:
         """
         Deterministic heuristic scoring based on structural features.
-        Produces consistent scores for the same structure.
+        Produces consistent scores for the same structure across processes.
         """
         seed_val = 0
         if HAS_PYMATGEN and isinstance(struct, Structure):
             formula = struct.composition.reduced_formula
             n_atoms = len(struct)
             vol_per_atom = struct.volume / max(n_atoms, 1)
-            seed_val = hash(formula) % 10000
+            seed_val = int(hashlib.sha256(formula.encode('utf-8')).hexdigest(), 16) % 10000
             rng = np.random.default_rng(seed_val)
 
             energy = float(rng.uniform(-4.0, -0.5))
@@ -177,7 +186,8 @@ class ScreeningAgent:
             max_stress = float(rng.uniform(0.1, 3.0))
             stability_bonus = -0.1 if 3.0 < vol_per_atom < 25.0 else 0.2
         elif isinstance(struct, dict):
-            seed_val = hash(struct.get('composition', '')) % 10000
+            formula = struct.get('composition', '')
+            seed_val = int(hashlib.sha256(formula.encode('utf-8')).hexdigest(), 16) % 10000
             rng = np.random.default_rng(seed_val)
             energy = float(rng.uniform(-4.0, -0.5))
             max_force = float(rng.uniform(0.01, 0.8))
