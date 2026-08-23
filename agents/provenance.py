@@ -689,6 +689,7 @@ class ProvenanceTracker:
             self.stream_candidate_event(cand_id)
 
         self.manifest.total_candidates_generated = len(self.records)
+        self.write_manifest()
         return registered_ids
 
     def record_screening(
@@ -765,6 +766,10 @@ class ProvenanceTracker:
             if not record:
                 continue
 
+            # Restrict validation to candidates that passed screening
+            if record.status not in (CandidateStatus.SCREENED.value, CandidateStatus.GENERATED.value):
+                continue
+
             record.validation_calculator = getattr(v, "calculator", "mock")
             record.validation_converged = getattr(v, "converged", False)
             record.validation_properties = getattr(v, "properties", {}) or {}
@@ -796,6 +801,10 @@ class ProvenanceTracker:
             cand_id = getattr(s, "structure_id", None)
             record = self.records.get(cand_id)
             if not record:
+                continue
+
+            # Restrict synthesis assessment to valid predecessor stages (VALIDATED or SCREENED)
+            if record.status not in (CandidateStatus.VALIDATED.value, CandidateStatus.SCREENED.value):
                 continue
 
             record.synthesis_mode = mode
@@ -832,6 +841,13 @@ class ProvenanceTracker:
         for cand_id, score, rank in ranking_entries:
             record = self.records.get(cand_id)
             if not record:
+                continue
+            # Restrict ranking to valid predecessor stages
+            if record.status not in (
+                CandidateStatus.SYNTHESIS_ASSESSED.value,
+                CandidateStatus.VALIDATED.value,
+                CandidateStatus.SCREENED.value,
+            ):
                 continue
             record.ranking_score = score
             record.iteration_rank = rank

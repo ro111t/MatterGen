@@ -39,7 +39,7 @@ Every candidate progresses through an explicit 7-stage lifecycle (`CandidateStat
       ├──► [REJECTED (Validation)] (e.g. unconverged relaxation after 200 steps)
       ▼
 [4. SYNTHESIS_ASSESSED]
-      │  • Evaluated ONLY on successfully converged candidates
+      │  • Evaluated on converged candidates (or top screened candidates if validation is disabled)
       │  • Precursor availability & oxidation sanity checked
       │  • Synthesis route & difficulty score calculated
       ├──► [REJECTED (Synthesis)] (e.g. feasibility score 0.25 < 0.40 threshold)
@@ -48,8 +48,8 @@ Every candidate progresses through an explicit 7-stage lifecycle (`CandidateStat
       │  • Global multi-objective ranking score and rank assigned
       ▼
 [6. ACCEPTED / REJECTED]
-      │  • Candidates outside validation cutoff marked REJECTED (Ranking cutoff)
-      │  • Successful candidates marked ACCEPTED
+      │  • Candidates outside top-k cutoff marked REJECTED (Ranking cutoff)
+      │  • Successful candidates marked ACCEPTED (gated by convergence and feasibility)
       ▼
 [7. Career Memory Influence (Metadata)]
          • Stored in long-term CareerMemory (`stored_in_memory: bool = True`)

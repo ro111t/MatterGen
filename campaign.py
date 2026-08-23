@@ -12,6 +12,7 @@ from collections import Counter
 import json
 import os
 import time
+import uuid
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Union
@@ -93,7 +94,7 @@ class MaterialsDiscoveryCampaign:
 
         self.config.output_dir.mkdir(parents=True, exist_ok=True)
         self.provenance = ProvenanceTracker(
-            campaign_id=self.campaign_id or f"camp_{int(time.time())}",
+            campaign_id=self.campaign_id or f"camp_{int(time.time())}_{uuid.uuid4().hex[:6]}",
             campaign_name=self.config.name,
             domain=self.config.objective.domain,
             output_dir=self.config.output_dir,
@@ -136,7 +137,7 @@ class MaterialsDiscoveryCampaign:
             self._log(f"\nCareer memory: {career_summary['total_campaigns']} prior campaigns, "
                       f"{career_summary['high_confidence_principles']} known principles")
         else:
-            self.campaign_id = f"camp_{int(time.time())}"
+            self.campaign_id = f"camp_{int(time.time())}_{uuid.uuid4().hex[:6]}"
 
         self.provenance.campaign_id = self.campaign_id
         self.provenance.manifest.campaign_id = self.campaign_id
@@ -369,12 +370,12 @@ class MaterialsDiscoveryCampaign:
             if self.config.use_synthesis:
                 if cid in failed_synth_ids:
                     continue  # already marked REJECTED in record_synthesis
-                if (not self.config.use_validation) and (cid not in feasible_synth_ids):
+                if cid not in feasible_synth_ids:
                     self.provenance.record_decision(
                         candidate_id=cid,
                         status=CandidateStatus.REJECTED,
-                        rejection_stage="ranking",
-                        rejection_reason=f"Rank {res.rank} exceeds synthesis cutoff",
+                        rejection_stage="synthesis",
+                        rejection_reason="Synthesis feasibility assessment not passed or missing",
                         ranking_score=res.score,
                         iteration_rank=res.rank,
                     )
