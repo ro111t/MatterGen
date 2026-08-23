@@ -91,9 +91,11 @@ class CareerMemory:
                         properties: Dict[str, float],
                         hypothesis_ids: List[str],
                         principle_ids: List[str],
-                        iteration: int):
+                        iteration: int,
+                        candidate_id: Optional[str] = None):
         """Store a generated candidate with full provenance."""
-        candidate_id = str(uuid.uuid4())[:8]
+        if not candidate_id:
+            candidate_id = str(uuid.uuid4())[:8]
         c = self.conn.cursor()
         c.execute("""
             INSERT INTO candidates

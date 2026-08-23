@@ -359,6 +359,11 @@ Respond as JSON array:
         """Store all screened candidates with full provenance."""
         principle_ids = [p['id'] for p in principles if 'id' in p]
         for struct, result in screening_results:
+            cand_id = getattr(result, 'structure_id', None)
+            if not cand_id and isinstance(struct, dict):
+                cand_id = struct.get('candidate_id') or struct.get('generation_id')
+            if not cand_id:
+                cand_id = getattr(struct, '_candidate_id', None)
             self.memory.store_candidate(
                 campaign_id=campaign_id,
                 domain=domain,
@@ -369,6 +374,7 @@ Respond as JSON array:
                 hypothesis_ids=hypothesis_ids,
                 principle_ids=principle_ids,
                 iteration=iteration,
+                candidate_id=cand_id,
             )
 
     # -------------------------------------------------------------------------
