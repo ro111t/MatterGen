@@ -662,8 +662,13 @@ class ProvenanceTracker:
         now_iso = _get_utc_now_iso()
 
         for rank_idx, (struct, res) in enumerate(screening_results, 1):
-            cand_id = getattr(res, "structure_id", None) or extract_candidate_id(struct)
+            cand_id = extract_candidate_id(struct) if struct is not None else (getattr(res, "structure_id", None) or f"MAT-{rank_idx:06d}")
             record = self.records.get(cand_id)
+            if not record:
+                res_id = getattr(res, "structure_id", None)
+                if res_id and res_id in self.records:
+                    cand_id = res_id
+                    record = self.records[cand_id]
             if not record:
                 formula, elements, chem_sys = extract_formula_and_elements(struct)
                 struct_path, struct_hash = self.save_structure_file(cand_id, struct)
@@ -709,8 +714,14 @@ class ProvenanceTracker:
         now_iso = _get_utc_now_iso()
 
         for v in validation_results:
-            cand_id = getattr(v, "structure_id", None) or extract_candidate_id(getattr(v, "structure", None))
+            struct = getattr(v, "structure", None)
+            cand_id = extract_candidate_id(struct) if struct is not None else getattr(v, "structure_id", None)
             record = self.records.get(cand_id)
+            if not record:
+                res_id = getattr(v, "structure_id", None)
+                if res_id and res_id in self.records:
+                    cand_id = res_id
+                    record = self.records[cand_id]
             if not record:
                 continue
 

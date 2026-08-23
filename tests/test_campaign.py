@@ -17,7 +17,15 @@ class FakeScreener:
     def screen_batch(self, structures, criteria=None, **kwargs):
         results = []
         for i, struct in enumerate(structures):
-            sid = struct.get("generation_id", f"struct_{i}") if isinstance(struct, dict) else f"struct_{i}"
+            if isinstance(struct, dict):
+                sid = struct.get("candidate_id") or struct.get("generation_id") or f"struct_{i}"
+            elif hasattr(struct, "_candidate_id") and getattr(struct, "_candidate_id"):
+                sid = getattr(struct, "_candidate_id")
+            elif hasattr(struct, "properties") and isinstance(struct.properties, dict) and "_candidate_id" in struct.properties:
+                sid = struct.properties["_candidate_id"]
+            else:
+                sid = f"struct_{i}"
+
             results.append((struct, ScreeningResult(
                 structure_id=sid,
                 predictions={
