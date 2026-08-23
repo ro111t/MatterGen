@@ -186,16 +186,27 @@ class MattergenGenerator:
 
         num_batches = ceil(num_candidates / self.batch_size)
 
+        allowed_cond = set()
+        try:
+            allowed_cond = set(self._generator.diffusion_module.model.cond_fields_model_was_trained_on)
+        except Exception:
+            pass
+
         properties = dict(self.properties_to_condition_on)
         if target_properties:
             properties.update(target_properties)
 
         target_comps = list(self.target_compositions)
-        if elements and not target_comps and not properties:
-            # Best-effort chemical-system conditioning when no other conditioning
-            # is supplied. The "chemical_system" model handles this natively.
+        if elements and not target_comps and not properties and "chemical_system" in allowed_cond:
+            # Best-effort chemical-system conditioning when supported by model
             system = "-".join(sorted(elements))
             properties["chemical_system"] = system
+
+        # Filter properties strictly to those the model checkpoint was trained on
+        if allowed_cond:
+            properties = {k: v for k, v in properties.items() if k in allowed_cond}
+        else:
+            properties = {}
 
         with tempfile.TemporaryDirectory() as tmpdir:
             self._generator.properties_to_condition_on = properties

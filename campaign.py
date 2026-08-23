@@ -332,7 +332,7 @@ class MaterialsDiscoveryCampaign:
         self._log(f"  Failures recorded: {distill_result['failures_recorded']}")
         if distill_result.get('top_principles'):
             for p in distill_result['top_principles']:
-                self._log(f"    → {p[:80]}...")
+                self._log(f"    -> {p[:80]}...")
 
         # Record ranking
         ranking_entries = [
