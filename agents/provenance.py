@@ -88,6 +88,20 @@ def _parse_formula_elements(formula: str) -> List[str]:
     return sorted(list(set(matches)))
 
 
+def _expand_formula_species(formula: str) -> List[str]:
+    """Expand chemical formula with stoichiometry (e.g. 'Li3PS4' -> ['Li', 'Li', 'Li', 'P', 'S', 'S', 'S', 'S'])."""
+    if not formula or formula == "Unknown":
+        return []
+    matches = re.findall(r'([A-Z][a-z]*)(\d*)', formula)
+    species = []
+    for el, count_str in matches:
+        if not el:
+            continue
+        count = int(count_str) if count_str else 1
+        species.extend([el] * count)
+    return species
+
+
 def extract_formula_and_elements(struct: Any) -> Tuple[str, List[str], str]:
     """
     Extract reduced formula, element list, and chemical system string.
@@ -392,6 +406,7 @@ class RunManifest:
     constraints: Dict[str, Any] = field(default_factory=dict)
     config: Dict[str, Any] = field(default_factory=dict)
     strategies: List[Dict[str, Any]] = field(default_factory=list)
+    manifest_hash: Optional[str] = None
     start_time_iso: str = field(default_factory=_get_utc_now_iso)
     end_time_iso: Optional[str] = None
     elapsed_time_seconds: Optional[float] = None
@@ -416,6 +431,19 @@ class RunManifest:
             json.dump(self.to_dict(), f, indent=2, default=str)
         return path
 
+    def compute_manifest_hash(self) -> str:
+        """Compute SHA256 integrity hash over canonicalized behavior-affecting configuration."""
+        content = {
+            "master_seed": self.master_seed,
+            "iteration_seeds": self.iteration_seeds,
+            "domain": self.domain,
+            "objective": self.objective,
+            "constraints": self.constraints,
+            "config": self.config,
+            "strategies": self.strategies,
+        }
+        return hashlib.sha256(json.dumps(content, sort_keys=True, default=str).encode("utf-8")).hexdigest()
+
     def is_consistent_with(self, other: RunManifest) -> Tuple[bool, List[str]]:
         """Verify configuration consistency between an original and a reproduced run."""
         discrepancies = []
@@ -425,6 +453,14 @@ class RunManifest:
             discrepancies.append(f"Domain mismatch: {self.domain} != {other.domain}")
         if self.iteration_seeds != other.iteration_seeds:
             discrepancies.append(f"Iteration seeds mismatch: {self.iteration_seeds} != {other.iteration_seeds}")
+        if json.dumps(self.objective, sort_keys=True, default=str) != json.dumps(other.objective, sort_keys=True, default=str):
+            discrepancies.append(f"Objective mismatch: {self.objective} != {other.objective}")
+        if json.dumps(self.constraints, sort_keys=True, default=str) != json.dumps(other.constraints, sort_keys=True, default=str):
+            discrepancies.append(f"Constraints mismatch: {self.constraints} != {other.constraints}")
+        if json.dumps(self.config, sort_keys=True, default=str) != json.dumps(other.config, sort_keys=True, default=str):
+            discrepancies.append(f"Config mismatch: {self.config} != {other.config}")
+        if json.dumps(self.strategies, sort_keys=True, default=str) != json.dumps(other.strategies, sort_keys=True, default=str):
+            discrepancies.append(f"Strategies mismatch: {self.strategies} != {other.strategies}")
         return (len(discrepancies) == 0, discrepancies)
 
 
@@ -482,6 +518,7 @@ class ProvenanceTracker:
 
     def write_manifest(self) -> Path:
         """Write current manifest state to manifest.json."""
+        self.manifest.manifest_hash = self.manifest.compute_manifest_hash()
         return self.manifest.save(self.manifest_path)
 
     def record_strategy(self, iteration: int, strategy: Dict[str, Any]) -> None:
@@ -543,13 +580,16 @@ class ProvenanceTracker:
         formula, elements, _ = extract_formula_and_elements(struct)
         lattice_vectors = [[5.0, 0.0, 0.0], [0.0, 5.0, 0.0], [0.0, 0.0, 5.0]]
         positions = [[0.0, 0.0, 0.0]]
-        site_elements = elements if elements else ["Li"]
+        expanded_species = _expand_formula_species(formula)
+        site_elements = expanded_species if expanded_species else (elements if elements else ["Li"])
 
         if isinstance(struct, dict):
             if "lattice" in struct and isinstance(struct["lattice"], list):
                 lattice_vectors = struct["lattice"]
             if "positions" in struct and isinstance(struct["positions"], list):
                 positions = struct["positions"]
+            if "species" in struct and isinstance(struct["species"], list) and struct["species"]:
+                site_elements = struct["species"]
 
         # Compute cell dimensions: a, b, c lengths
         a_vec = lattice_vectors[0] if len(lattice_vectors) > 0 else [5.0, 0.0, 0.0]
@@ -816,6 +856,24 @@ class ProvenanceTracker:
             return
 
         status_val = status.value if isinstance(status, CandidateStatus) else str(status)
+        if status_val not in (CandidateStatus.ACCEPTED.value, CandidateStatus.REJECTED.value):
+            raise ValueError(f"Invalid terminal status: {status_val}")
+
+        # Enforce lifecycle predecessor rules: once REJECTED, cannot become ACCEPTED
+        if record.status == CandidateStatus.REJECTED.value and status_val == CandidateStatus.ACCEPTED.value:
+            raise ValueError(f"Cannot accept previously rejected candidate {candidate_id} (Reason: {record.rejection_reason})")
+
+        # Validate that ACCEPTED requires valid predecessor and no disqualifying evidence
+        if status_val == CandidateStatus.ACCEPTED.value:
+            if record.status == CandidateStatus.GENERATED.value:
+                raise ValueError(f"Candidate {candidate_id} cannot be ACCEPTED directly from GENERATED status")
+            if record.passes_screening_filters is False:
+                raise ValueError(f"Candidate {candidate_id} failed screening filters and cannot be ACCEPTED")
+            if record.validation_converged is False:
+                raise ValueError(f"Candidate {candidate_id} failed validation convergence and cannot be ACCEPTED")
+            if record.synthesis_feasible is False:
+                raise ValueError(f"Candidate {candidate_id} failed synthesis feasibility and cannot be ACCEPTED")
+
         record.status = status_val
         if rejection_stage:
             record.rejection_stage = rejection_stage

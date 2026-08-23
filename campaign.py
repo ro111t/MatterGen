@@ -101,9 +101,13 @@ class MaterialsDiscoveryCampaign:
             config={
                 'name': self.config.name,
                 'domain': self.config.objective.domain,
+                'use_career_memory': self.config.use_career_memory,
                 'use_mattergen': self.config.use_mattergen,
                 'mattergen_pretrained': self.config.mattergen_pretrained,
                 'mattergen_batch_size': self.config.mattergen_batch_size,
+                'mattergen_model_path': self.config.mattergen_model_path,
+                'mattergen_sampling_config_path': self.config.mattergen_sampling_config_path,
+                'mattergen_sampling_config_name': self.config.mattergen_sampling_config_name,
                 'use_validation': self.config.use_validation,
                 'validation_top_k': self.config.validation_top_k,
                 'use_synthesis': self.config.use_synthesis,
@@ -225,6 +229,7 @@ class MaterialsDiscoveryCampaign:
             structures=candidates,
             criteria=screening_criteria,
             target_properties=self.config.objective.target_properties,
+            deduplicate=False,
         )
         screener_backend = "chgnet" if getattr(self.screener, "chgnet", None) is not None else "heuristic"
         self.provenance.record_screening(
@@ -606,6 +611,14 @@ class MaterialsDiscoveryCampaign:
         manifest = RunManifest.from_dict(data)
         out_dir = Path(output_dir).resolve() if output_dir else manifest_file.parent / "reproduced"
 
+        # Verify manifest integrity hash if present
+        if manifest.manifest_hash:
+            computed_hash = manifest.compute_manifest_hash()
+            if manifest.manifest_hash != computed_hash:
+                raise ValueError(
+                    f"Manifest tampering detected! Embedded hash: {manifest.manifest_hash} != Computed hash: {computed_hash}"
+                )
+
         obj_data = manifest.objective or {}
         constr_data = manifest.constraints or {}
         cfg_data = manifest.config or {}
@@ -630,7 +643,10 @@ class MaterialsDiscoveryCampaign:
             num_candidates=cfg_data.get('num_candidates', 15),
             use_mattergen=cfg_data.get('use_mattergen', False),
             mattergen_pretrained=cfg_data.get('mattergen_pretrained', 'mattergen_base'),
+            mattergen_model_path=cfg_data.get('mattergen_model_path', None),
             mattergen_batch_size=cfg_data.get('mattergen_batch_size', 16),
+            mattergen_sampling_config_path=cfg_data.get('mattergen_sampling_config_path', None),
+            mattergen_sampling_config_name=cfg_data.get('mattergen_sampling_config_name', 'default'),
             verbose=True,
         )
 
@@ -692,7 +708,7 @@ class MaterialsDiscoveryCampaign:
 def main():
     """CLI entry-point for running a test campaign or reproducing from manifest."""
     parser = argparse.ArgumentParser(description="MatAgent Discovery Campaign")
-    parser.add_argument('--reproduce', type=str, default=None,
+    parser.add_argument('--reproduce', '--reproduce-from-manifest', dest='reproduce', type=str, default=None,
                         help='Path to manifest.json to reproduce a previously executed campaign')
     parser.add_argument('--output-dir', type=str, default=None,
                         help='Output directory override (especially when reproducing)')

@@ -428,3 +428,71 @@ def test_report_matches_provenance_source_of_truth():
         assert results["total_passed_screening"] == stats["total_passed_screening"]
         assert results["total_validated"] == stats["total_validated"]
         assert results["total_converged"] == stats["total_converged"]
+
+
+def test_record_decision_state_transition_enforcement():
+    """Verify that record_decision strictly enforces state machine predecessor rules."""
+    with tempfile.TemporaryDirectory() as tmp:
+        tracker = ProvenanceTracker(
+            campaign_id="test_trans",
+            campaign_name="transitions",
+            domain="li_battery",
+            output_dir=Path(tmp),
+        )
+        dummy = [{"composition": "Li3PS4", "candidate_id": "MAT-000001"}]
+        tracker.register_generation(dummy, iteration=0, backend="mock", seed=42, target_elements=["Li"])
+
+        # 1. Cannot jump directly from GENERATED to ACCEPTED
+        with pytest.raises(ValueError, match="cannot be ACCEPTED directly from GENERATED"):
+            tracker.record_decision("MAT-000001", status=CandidateStatus.ACCEPTED)
+
+        # 2. Cannot accept previously rejected candidate
+        tracker.record_decision("MAT-000001", status=CandidateStatus.REJECTED, rejection_reason="Failed screening")
+        with pytest.raises(ValueError, match="Cannot accept previously rejected candidate"):
+            tracker.record_decision("MAT-000001", status=CandidateStatus.ACCEPTED)
+
+
+def test_expand_formula_species_stoichiometry():
+    """Verify chemical formula expansion produces correct stoichiometry for CIF generation."""
+    from agents.provenance import _expand_formula_species
+    expanded = _expand_formula_species("Li3PS4")
+    assert expanded == ["Li", "Li", "Li", "P", "S", "S", "S", "S"]
+    assert _expand_formula_species("La2Zr2O7") == ["La", "La", "Zr", "Zr", "O", "O", "O", "O", "O", "O", "O"]
+
+
+def test_multi_campaign_career_memory_duplicate_candidate_ids(tmp_path):
+    """Verify CareerMemory handles identical candidate_ids across distinct campaigns cleanly."""
+    from agents.career_memory import CareerMemory
+    db_path = str(tmp_path / "test_memory.db")
+    memory = CareerMemory(db_path=db_path)
+
+    # Campaign 1 creates MAT-000001
+    id1 = memory.store_candidate(
+        campaign_id="campaign_1",
+        domain="li_battery",
+        formula="Li3PS4",
+        score=92.0,
+        passed=True,
+        properties={"stability": -0.2},
+        hypothesis_ids=[],
+        principle_ids=[],
+        iteration=0,
+        candidate_id="MAT-000001",
+    )
+    assert id1 == "campaign_1_MAT-000001"
+
+    # Campaign 2 creates MAT-000001 (must not raise sqlite3.IntegrityError)
+    id2 = memory.store_candidate(
+        campaign_id="campaign_2",
+        domain="li_battery",
+        formula="Li10GeP2S12",
+        score=95.0,
+        passed=True,
+        properties={"stability": -0.25},
+        hypothesis_ids=[],
+        principle_ids=[],
+        iteration=0,
+        candidate_id="MAT-000001",
+    )
+    assert id2 == "campaign_2_MAT-000001"
+

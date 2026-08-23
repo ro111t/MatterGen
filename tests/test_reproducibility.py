@@ -132,10 +132,10 @@ def test_reproduction_cli_replay():
         manifest_file = run1_dir / "manifest.json"
         assert manifest_file.exists()
 
-        # 2. Reproduce via CLI
+        # 2. Reproduce via CLI using long alias --reproduce-from-manifest
         cmd2 = [
             sys.executable, "campaign.py",
-            "--reproduce", str(manifest_file),
+            "--reproduce-from-manifest", str(manifest_file),
             "--output-dir", str(run2_dir),
         ]
         res2 = subprocess.run(cmd2, capture_output=True, text=True, timeout=60, check=False)
@@ -160,14 +160,46 @@ def test_reproduction_detects_configuration_tampering():
         domain="li_battery",
         master_seed=42,
         iteration_seeds=[42, 43],
+        objective={"stability": -0.1},
+        constraints={"elements": ["Li", "P", "S"]},
+        config={"num_candidates": 10},
     )
     m2 = RunManifest(
         campaign_id="c1_tampered",
         domain="li_battery",
         master_seed=999,  # tampered seed
         iteration_seeds=[42, 43],
+        objective={"stability": -0.5},  # tampered objective
+        constraints={"elements": ["Li", "P", "S"]},
+        config={"num_candidates": 10},
     )
 
     consistent, discrepancies = m1.is_consistent_with(m2)
     assert not consistent
     assert any("Master seed mismatch" in d for d in discrepancies)
+    assert any("Objective mismatch" in d for d in discrepancies)
+
+
+def test_reproduce_from_manifest_raises_on_tampered_hash(tmp_path):
+    """Verify reproduce_from_manifest raises ValueError when manifest content is tampered with."""
+    manifest = RunManifest(
+        campaign_id="camp_hash_test",
+        campaign_name="hash_test",
+        domain="li_solid_electrolyte",
+        master_seed=42,
+        iteration_seeds=[42],
+        objective={"stability": -0.1},
+        constraints={"elements": ["Li", "P", "S"]},
+    )
+    manifest.manifest_hash = manifest.compute_manifest_hash()
+    
+    # Tamper with master_seed without updating hash
+    manifest_dict = manifest.to_dict()
+    manifest_dict["master_seed"] = 9999
+
+    manifest_file = tmp_path / "manifest.json"
+    with open(manifest_file, "w", encoding="utf-8") as f:
+        json.dump(manifest_dict, f, indent=2)
+
+    with pytest.raises(ValueError, match="Manifest tampering detected"):
+        MaterialsDiscoveryCampaign.reproduce_from_manifest(manifest_file, output_dir=tmp_path / "out")

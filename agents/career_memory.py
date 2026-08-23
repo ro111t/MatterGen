@@ -95,20 +95,25 @@ class CareerMemory:
                         candidate_id: Optional[str] = None):
         """Store a generated candidate with full provenance."""
         if not candidate_id:
-            candidate_id = str(uuid.uuid4())[:8]
+            record_id = str(uuid.uuid4())[:8]
+        elif candidate_id.startswith(f"{campaign_id}_"):
+            record_id = candidate_id
+        else:
+            record_id = f"{campaign_id}_{candidate_id}"
+
         c = self.conn.cursor()
         c.execute("""
-            INSERT INTO candidates
+            INSERT OR REPLACE INTO candidates
             (id, campaign_id, domain, formula, score, passed_screening,
              hypothesis_ids, principle_ids, properties, iteration, created_at)
             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """, (
-            candidate_id, campaign_id, domain, formula, score,
+            record_id, campaign_id, domain, formula, score,
             int(passed), json.dumps(hypothesis_ids), json.dumps(principle_ids),
             json.dumps(properties), iteration, time.time()
         ))
         self.conn.commit()
-        return candidate_id
+        return record_id
 
     def store_failure(self,
                       campaign_id: str,
