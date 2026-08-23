@@ -184,6 +184,8 @@ class StrategyAgent:
     def _recommend_batch_size(self) -> int:
         """Increase batch size when yield is low; shrink when yield is high."""
         if len(self.outcomes) < 2:
+            if self.outcomes:
+                return self.outcomes[-1].num_candidates
             return 15
 
         recent = self.outcomes[-3:]
@@ -197,7 +199,7 @@ class StrategyAgent:
         if avg_rate < 0.05:
             return min(100, int(last_batch * 1.3))
         if avg_rate > 0.3:
-            return max(5, int(last_batch * 0.85))
+            return max(1, int(last_batch * 0.85))
         return last_batch
 
     def _recommend_diversity(self) -> float:

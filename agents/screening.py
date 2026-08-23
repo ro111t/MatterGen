@@ -55,6 +55,7 @@ class ScreeningAgent:
 
     def __init__(self):
         self.chgnet = None
+        self.last_backend_used: str = "heuristic"
         self.prediction_cache: Dict[str, Dict[str, float]] = {}
         self._init_models()
 
@@ -141,32 +142,35 @@ class ScreeningAgent:
             return self.prediction_cache[struct_id]
 
         if self.chgnet and HAS_PYMATGEN and isinstance(struct, Structure):
-            preds = self._chgnet_predict(struct)
+            try:
+                preds = self._chgnet_predict(struct)
+                self.last_backend_used = "chgnet"
+            except Exception:
+                preds = self._heuristic_predict(struct)
+                self.last_backend_used = "heuristic"
         else:
             preds = self._heuristic_predict(struct)
+            self.last_backend_used = "heuristic"
 
         self.prediction_cache[struct_id] = preds
         return preds
 
     def _chgnet_predict(self, struct: Any) -> Dict[str, float]:
         """Run real CHGNet inference."""
-        try:
-            result = self.chgnet.predict_structure(struct)
-            energy = float(result['e']) if 'e' in result else float(result.get('energy', 0))
-            forces = result.get('f', result.get('forces', np.zeros((1, 3))))
-            stress = result.get('s', result.get('stress', np.zeros((3, 3))))
+        result = self.chgnet.predict_structure(struct)
+        energy = float(result['e']) if 'e' in result else float(result.get('energy', 0))
+        forces = result.get('f', result.get('forces', np.zeros((1, 3))))
+        stress = result.get('s', result.get('stress', np.zeros((3, 3))))
 
-            max_force = float(np.max(np.linalg.norm(np.array(forces).reshape(-1, 3), axis=1)))
-            max_stress = float(np.max(np.abs(np.array(stress))))
+        max_force = float(np.max(np.linalg.norm(np.array(forces).reshape(-1, 3), axis=1)))
+        max_stress = float(np.max(np.abs(np.array(stress))))
 
-            return {
-                'formation_energy': energy,
-                'forces': max_force,
-                'stress': max_stress,
-                'stability': -abs(energy),
-            }
-        except Exception as e:
-            return self._heuristic_predict(struct)
+        return {
+            'formation_energy': energy,
+            'forces': max_force,
+            'stress': max_stress,
+            'stability': -abs(energy),
+        }
 
     def _heuristic_predict(self, struct: Any) -> Dict[str, float]:
         """
