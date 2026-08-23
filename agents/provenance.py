@@ -660,6 +660,8 @@ class ProvenanceTracker:
 
         for idx, struct in enumerate(candidates):
             cand_id = extract_candidate_id(struct, fallback_idx=len(self.records))
+            if cand_id in self.records:
+                cand_id = f"MAT-{len(self.records) + 1:06d}"
             formula, elements, chem_sys = extract_formula_and_elements(struct)
             struct_path, struct_hash = self.save_structure_file(cand_id, struct)
 

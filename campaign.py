@@ -188,8 +188,10 @@ class MaterialsDiscoveryCampaign:
             iteration=self.iteration,
             recommendations=self.current_recommendations,
         )
-        if self.config.num_candidates != 15 and strategy.get('num_candidates') == 15:
-            strategy['num_candidates'] = self.config.num_candidates
+        if not strategy.get("_replayed"):
+            # Only set user-configured batch size on the first iteration if no recommendation exists
+            if self.iteration == 0 and not self.current_recommendations and self.config.num_candidates:
+                strategy['num_candidates'] = self.config.num_candidates
         self.provenance.record_strategy(self.iteration, strategy)
         self._log(f"  Elements: {strategy.get('elements', [])}")
         self._log(f"  Candidates: {strategy.get('num_candidates', self.config.num_candidates)}")
@@ -199,7 +201,14 @@ class MaterialsDiscoveryCampaign:
 
         # 2. Generate
         self._log("\n[2/6] Generating Candidates...")
-        iter_seed = getattr(self.config, "master_seed", 42) + self.iteration
+        if (
+            self.provenance
+            and self.provenance.manifest.iteration_seeds
+            and self.iteration < len(self.provenance.manifest.iteration_seeds)
+        ):
+            iter_seed = self.provenance.manifest.iteration_seeds[self.iteration]
+        else:
+            iter_seed = getattr(self.config, "master_seed", 42) + self.iteration
         num_to_gen = strategy.get('num_candidates', self.config.num_candidates)
         candidates = self.generator.generate_batch(
             elements=strategy.get('elements', ['Li', 'P', 'S', 'O']),
@@ -411,6 +420,7 @@ class MaterialsDiscoveryCampaign:
             'num_screened': len(screened),
             'num_passed': n_pass,
             'success_rate': n_pass / max(len(screened), 1),
+            'screening_rate': n_pass / max(len(screened), 1),
             'best_score': best_score,
             'avg_stability': avg_stability,
             'num_validated': len(validation_results),
@@ -652,6 +662,8 @@ class MaterialsDiscoveryCampaign:
         )
 
         campaign = cls(config)
+        if manifest.iteration_seeds:
+            campaign.provenance.manifest.iteration_seeds = list(manifest.iteration_seeds)
 
         # If strategies were recorded in the manifest, replay with exact strategy per iteration
         if manifest.strategies:
@@ -661,7 +673,9 @@ class MaterialsDiscoveryCampaign:
             def replay_plan(*args, **kwargs):
                 iter_num = kwargs.get("iteration", campaign.iteration)
                 if iter_num in saved_strats:
-                    return dict(saved_strats[iter_num])
+                    strat = dict(saved_strats[iter_num])
+                    strat["_replayed"] = True
+                    return strat
                 return orig_plan(*args, **kwargs)
 
             campaign.orchestrator.plan_iteration = replay_plan

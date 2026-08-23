@@ -152,8 +152,8 @@ Example:
         """
         if not self.llm_available:
             n_gen = batch_results.get('num_generated', 0)
-            n_scr = batch_results.get('num_screened', 0)
-            rate = batch_results.get('screening_rate', 0)
+            n_scr = batch_results.get('num_passed', batch_results.get('num_screened', 0))
+            rate = batch_results.get('screening_rate', batch_results.get('success_rate', 0.0))
             return (
                 f"Generated {n_gen} candidates, {n_scr} passed screening "
                 f"({rate:.1%} pass rate). "
@@ -162,7 +162,7 @@ Example:
 
         prompt = f"""Analyze these materials discovery results briefly (2-3 sentences):
 - Generated: {batch_results.get('num_generated', 0)} candidates
-- Passed screening: {batch_results.get('num_screened', 0)} ({batch_results.get('screening_rate', 0):.1%})
+- Passed screening: {batch_results.get('num_passed', batch_results.get('num_screened', 0))} ({batch_results.get('screening_rate', batch_results.get('success_rate', 0.0)):.1%})
 - Avg stability: {batch_results.get('avg_stability', 0):.3f} eV/atom
 - Successful: {batch_results.get('num_successful', 0)}
 
@@ -317,7 +317,7 @@ Respond ONLY with JSON with keys:
             if recommendations.get('screening_criteria'):
                 strategy['screening_criteria'] = recommendations['screening_criteria']
 
-        strategy['num_candidates'] = min(max(int(strategy.get('num_candidates', 15)), 5), 100)
+        strategy['num_candidates'] = min(max(int(strategy.get('num_candidates', 15)), 1), 100)
         strategy['diversity_weight'] = min(max(float(strategy.get('diversity_weight', 0.3)), 0.0), 1.0)
         if 'elements' not in strategy or not strategy['elements']:
             strategy['elements'] = objective.constraints.get('elements', ['Li', 'P', 'S', 'O'])

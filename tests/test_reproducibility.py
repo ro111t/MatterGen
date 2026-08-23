@@ -203,3 +203,55 @@ def test_reproduce_from_manifest_raises_on_tampered_hash(tmp_path):
 
     with pytest.raises(ValueError, match="Manifest tampering detected"):
         MaterialsDiscoveryCampaign.reproduce_from_manifest(manifest_file, output_dir=tmp_path / "out")
+
+
+def test_reproduce_dynamic_batch_sizes_candidate_count_parity(tmp_path):
+    """Verify that multi-iteration runs with different candidate counts reproduce with exact candidate counts."""
+    run1_dir = tmp_path / "run1"
+    run2_dir = tmp_path / "run2"
+
+    objective = CampaignObjective(
+        target_properties={"stability": -0.1},
+        constraints={"elements": ["Li", "P", "S"]},
+        success_criteria={"min_score": 999.0},
+        domain="dynamic_batch_test",
+        max_iterations=2,
+    )
+    config = CampaignConfig(
+        name="dynamic_batch_campaign",
+        objective=objective,
+        output_dir=run1_dir,
+        master_seed=777,
+        use_career_memory=False,
+        verbose=False,
+        num_candidates=3,
+    )
+
+    campaign1 = MaterialsDiscoveryCampaign(config)
+    # Monkey-patch plan_iteration to simulate dynamic batch size change in iteration 1
+    orig_plan = campaign1.orchestrator.plan_iteration
+    def dynamic_plan(*args, **kwargs):
+        strat = orig_plan(*args, **kwargs)
+        if campaign1.iteration == 0:
+            strat["num_candidates"] = 3
+        else:
+            strat["num_candidates"] = 7
+        return strat
+    campaign1.orchestrator.plan_iteration = dynamic_plan
+
+    res1 = campaign1.run_campaign()
+    assert res1["total_generated"] == 10  # 3 + 7 = 10
+
+    # Reproduce from manifest
+    manifest_file = run1_dir / "manifest.json"
+    campaign2 = MaterialsDiscoveryCampaign.reproduce_from_manifest(manifest_file, output_dir=run2_dir)
+
+    with open(run1_dir / "campaign_provenance.json", "r", encoding="utf-8") as f:
+        prov1 = json.load(f)
+    with open(run2_dir / "campaign_provenance.json", "r", encoding="utf-8") as f:
+        prov2 = json.load(f)
+
+    assert len(prov1["candidates"]) == 10
+    assert len(prov2["candidates"]) == 10
+    assert prov1["manifest"]["total_candidates_generated"] == 10
+    assert prov2["manifest"]["total_candidates_generated"] == 10
