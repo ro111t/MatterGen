@@ -877,7 +877,7 @@ class ProvenanceTracker:
                 getattr(res, "geometry_failure_code", None)
                 or getattr(res, "failure_code", None)
             )
-            if res_failure_code in {"INVALID_GEOMETRY", "ORACLE_BUDGET_EXHAUSTED", "PREDICTION_FAILED"}:
+            if res_failure_code in {"INVALID_GEOMETRY", "ORACLE_BUDGET_EXHAUSTED", "PREDICTION_FAILED", "THERMODYNAMIC_ORACLE_FAILED"}:
                 record.screening_predictions = {}
             else:
                 record.screening_predictions = canonicalize_screening_predictions(
@@ -911,10 +911,12 @@ class ProvenanceTracker:
                     record.rejection_stage = "geometry_validation"
                 elif record.geometry_failure_code == "ORACLE_BUDGET_EXHAUSTED" or record.provenance_stage == "oracle_budget":
                     record.rejection_stage = "oracle_budget"
+                elif record.provenance_stage == "thermodynamics":
+                    record.rejection_stage = "thermodynamics"
                 else:
                     record.rejection_stage = "screening"
                 reasons_str = "; ".join(record.screening_filter_reasons) if record.screening_filter_reasons else "Failed screening criteria"
-                if record.geometry_failure_code in {"INVALID_GEOMETRY", "ORACLE_BUDGET_EXHAUSTED", "PREDICTION_FAILED"}:
+                if record.geometry_failure_code in {"INVALID_GEOMETRY", "ORACLE_BUDGET_EXHAUSTED", "PREDICTION_FAILED", "THERMODYNAMIC_ORACLE_FAILED"}:
                     record.rejection_reason = f"{record.geometry_failure_code}: {reasons_str}"
                 else:
                     record.rejection_reason = f"Screening filter failed: {reasons_str}"

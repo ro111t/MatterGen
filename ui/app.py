@@ -42,7 +42,19 @@ with st.sidebar:
     domain = st.text_input("Domain", value="li_solid_electrolyte")
 
     st.subheader("Target Properties")
-    st.info("Thermodynamic targets are unavailable until the reference-set/hull calculation is configured.")
+    st.info("Hull metrics require an offline-built, certified frozen reference set evaluated with the same CHGNet checkpoint.")
+    thermodynamics_reference_set_path = st.text_input(
+        "Frozen reference-set JSON (optional)", value="",
+        help="No reference data is downloaded at runtime; the adjacent .sha256 file is required.",
+    )
+    thermodynamics_retain_threshold_ev_per_atom = st.number_input(
+        "Retain hull threshold (eV/atom)", value=0.10, min_value=0.0, step=0.01,
+        format="%.2f", help="Candidates at or below this predicted energy above hull are retained.",
+    )
+    thermodynamics_stable_threshold_ev_per_atom = st.number_input(
+        "Stable hull threshold (eV/atom)", value=0.03, min_value=0.0, step=0.01,
+        format="%.2f", help="Candidates at or below this predicted energy above hull are labeled predicted stable.",
+    )
 
     st.subheader("Constraints")
     elements = st.text_input(
@@ -140,6 +152,9 @@ def _run_campaign_ui(
     mattergen_sampling_config_name: str,
     mattergen_batch_size: int,
     mattergen_model_path: str,
+    thermodynamics_reference_set_path: str,
+    thermodynamics_retain_threshold_ev_per_atom: float,
+    thermodynamics_stable_threshold_ev_per_atom: float,
 ):
     """Lazy import heavy deps and run one campaign."""
     from campaign import CampaignConfig, MaterialsDiscoveryCampaign
@@ -172,6 +187,9 @@ def _run_campaign_ui(
         mattergen_sampling_config_name=mattergen_sampling_config_name,
         mattergen_batch_size=mattergen_batch_size,
         mattergen_model_path=mattergen_model_path if mattergen_model_path else None,
+        thermodynamics_reference_set_path=(thermodynamics_reference_set_path or None),
+        thermodynamics_retain_threshold_ev_per_atom=thermodynamics_retain_threshold_ev_per_atom,
+        thermodynamics_stable_threshold_ev_per_atom=thermodynamics_stable_threshold_ev_per_atom,
     )
 
     campaign = MaterialsDiscoveryCampaign(config)
@@ -204,6 +222,9 @@ if run_button:
             mattergen_sampling_config_name=mattergen_sampling_config_name,
             mattergen_batch_size=mattergen_batch_size,
             mattergen_model_path=mattergen_model_path,
+            thermodynamics_reference_set_path=thermodynamics_reference_set_path,
+            thermodynamics_retain_threshold_ev_per_atom=thermodynamics_retain_threshold_ev_per_atom,
+            thermodynamics_stable_threshold_ev_per_atom=thermodynamics_stable_threshold_ev_per_atom,
         )
 
     progress.progress(100, text="Campaign complete")

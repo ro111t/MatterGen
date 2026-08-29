@@ -63,6 +63,7 @@ All agents below are implemented. Heavy external backends (Mattergen API, VASP/Q
 - **Screening Agent**: Fast ML-based filtering with CHGNet/M3GNet/ALIGNN (currently CHGNet enabled by default).
 
 - **Geometry and budget gate**: Every generated candidate is retained in provenance, but only finite, nondegenerate 3-D periodic structures with a minimum periodic separation of at least 0.8 Å reach the oracle. Proposal and oracle budgets are independently auditable; the paper defaults are 400 proposals and 200 oracle evaluations. Development ``CampaignConfig`` instances may omit either limit for unlimited operation.
+- **Frozen thermodynamic oracle**: Research runs load a certified, checksummed reference set prepared offline with the identical pinned CHGNet weights and relaxation settings used for candidates. Formation energy uses elemental references and energy above hull uses all competing frozen phases; neither is inferred from raw CHGNet energy.
 - **Validation Agent**: DFT relaxation and property calculation via ASE; supports VASP, Quantum ESPRESSO, GPAW, and a deterministic `mock` backend.
 - **Analysis Agent**: Compares ML screening predictions against DFT validation and reports MAE, RMSE, bias, Pearson r, failure modes, and top candidates.
 - **Synthesis Feasibility Agent**: Estimates precursor difficulty, synthesis route, and experimental cost from composition heuristics.
@@ -207,6 +208,7 @@ Flags:
 - `--proposal-budget`: maximum generated proposals (paper default: 400; omitted is unlimited in development)
 - `--oracle-budget`: maximum geometrically valid oracle evaluations (paper default: 200; omitted is unlimited in development)
 - `--geometry-min-distance`: absolute periodic minimum distance in Å (default: 0.8)
+- `--thermodynamics-reference-set`: local frozen reference JSON; its adjacent `.sha256` is mandatory and no runtime download is performed
 - `--mattergen-sampling-config-name`: name of the sampling config YAML file to use (`default` or `csp`)
 - `--mattergen-sampling-config-path`: path to a MatterGen sampling config directory (defaults to bundled configs)
 
@@ -241,6 +243,30 @@ Control generation space:
 Filter candidates:
 - `min_band_gap`, `max_band_gap`: Band gap range
 - `max_force_ev_per_angstrom`: Maximum residual force diagnostic
+- `max_predicted_energy_above_hull_ev_per_atom`: predicted hull cutoff (default `0.10` eV/atom)
+
+### Offline thermodynamic reference sets
+
+Reference construction is a separate, one-time workflow. First download and
+curate structures outside the campaign, then pass the local JSON to
+`scripts/build_reference_set.py` with an importable pinned evaluator factory.
+The builder deduplicates structures, relaxes references with cell relaxation,
+`fmax <= 0.05 eV/Å`, and 500 steps by default, and writes canonical JSON plus
+an adjacent SHA256 file. A set is certified only when every elemental endpoint
+and every supplied source-near-hull phase (`<= 0.05 eV/atom`) succeeds and at
+least 95% of the remaining unique phases succeed. Failures remain in the
+artifact; they are never silently dropped.
+
+Use a versioned name such as `frozen_reference_set_Li_P_S_chgnet_v1.json`.
+Campaigns only load and verify this artifact; they never query Materials
+Project or relax reference phases at runtime. The loader rejects checksum,
+schema, chemical-system, model-weight hash, checkpoint-version, relaxation-
+setting, or certification mismatches. Candidate results report
+`predicted_formation_energy_ev_per_atom`,
+`predicted_energy_above_hull_ev_per_atom`, and explicit decomposition products.
+The default retained cutoff is `0.10 eV/atom`, while “predicted stable” means
+`<= 0.03 eV/atom`; sensitivity counts at 0.03/0.05/0.10 are available. These
+are model-predicted thermodynamic quantities, not evidence of synthesizability.
 
 ### Multi-Objective Screening
 

@@ -265,7 +265,7 @@ def build_scientific_preflight(
         report.errors.append("generation must request the MatterGen backend")
     if report.actual_backends.get("generation") != "mattergen":
         report.errors.append("MatterGen generation is unavailable or fell back to a development backend")
-    if report.actual_backends.get("screening") != "chgnet":
+    if report.actual_backends.get("screening") not in {"chgnet", "chgnet_thermodynamic_oracle"}:
         report.errors.append("CHGNet screening is unavailable or fell back to heuristic scoring")
     requested_validation = report.requested_backends.get("validation")
     actual_validation = report.actual_backends.get("validation")

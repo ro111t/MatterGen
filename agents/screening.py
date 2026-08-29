@@ -27,6 +27,7 @@ from agents.geometry import (
     GeometryValidator,
 )
 from agents.budget import DualBudgetTracker
+from agents.thermodynamics import ThermodynamicOracle
 
 try:
     from chgnet.model import CHGNet
@@ -53,7 +54,7 @@ DEFAULT_SCREENING_WEIGHTS = {
 class ScreeningResult:
     """Results from ML-based screening."""
     structure_id: str
-    predictions: Dict[str, float]
+    predictions: Dict[str, Any]
     score: float
     passes_filters: bool
     filter_reasons: List[str]
@@ -75,7 +76,8 @@ class ScreeningResult:
         # Invalid geometry and budget-exhausted candidates must contain no
         # synthetic energy/heuristic prediction at all.
         if self.geometry_valid is False or self.geometry_failure_code in {
-            "INVALID_GEOMETRY", "ORACLE_BUDGET_EXHAUSTED", "PREDICTION_FAILED"
+            "INVALID_GEOMETRY", "ORACLE_BUDGET_EXHAUSTED", "PREDICTION_FAILED",
+            "THERMODYNAMIC_ORACLE_FAILED",
         }:
             self.predictions = {}
         else:
@@ -101,17 +103,22 @@ class ScreeningAgent:
     def __init__(self, run_mode: RunMode | str = RunMode.DEVELOPMENT, mode: Optional[str] = None,
                  min_distance: float = DEFAULT_MIN_DISTANCE_ANGSTROM,
                  geometry_validator: Optional[GeometryValidator] = None,
-                 minimum_distance: Optional[float] = None):
+                 minimum_distance: Optional[float] = None,
+                 thermodynamic_oracle: Optional[ThermodynamicOracle] = None):
         self.run_mode = normalize_run_mode(mode if mode is not None else run_mode)
         self.chgnet = None
         self.last_backend_used: str = "uninitialized"
         self.prediction_cache: Dict[str, Dict[str, float]] = {}
+        self.thermodynamic_oracle = thermodynamic_oracle
         self.geometry_validator = geometry_validator or GeometryValidator(
             min_distance=(minimum_distance if minimum_distance is not None else min_distance)
         )
         self.last_geometry_results: Dict[str, GeometryValidationResult] = {}
         self.last_budget_snapshot: Dict[str, Any] = {}
-        self._init_models()
+        if self.thermodynamic_oracle is not None:
+            self.last_backend_used = "chgnet_thermodynamic_oracle"
+        else:
+            self._init_models()
 
     def _init_models(self):
         if HAS_CHGNET:
@@ -203,7 +210,11 @@ class ScreeningAgent:
                 )))
                 continue
 
-            cache_hit = struct_id in self.prediction_cache
+            cache_hit = (
+                self.thermodynamic_oracle.has_cached_result(struct_id)
+                if self.thermodynamic_oracle is not None
+                else struct_id in self.prediction_cache
+            )
             if budget_tracker is not None and not budget_tracker.admit_oracle(cache_hit=cache_hit):
                 raw_results.append((struct, ScreeningResult(
                     structure_id=struct_id,
@@ -224,7 +235,26 @@ class ScreeningAgent:
                 continue
 
             try:
-                predictions = self._predict(struct, struct_id)
+                if self.thermodynamic_oracle is not None:
+                    thermo_result = self.thermodynamic_oracle.evaluate(struct, cache_key=struct_id)
+                    if not thermo_result.success:
+                        raw_results.append((struct, ScreeningResult(
+                            structure_id=struct_id, predictions={}, score=0.0,
+                            passes_filters=False,
+                            filter_reasons=["THERMODYNAMIC_ORACLE_FAILED", thermo_result.failure_message or ""],
+                            score_components={}, backend="chgnet_thermodynamic_oracle",
+                            scientific_validity="demo_only", geometry_valid=True,
+                            geometry_failure_code="THERMODYNAMIC_ORACLE_FAILED",
+                            geometry_details={"failure_code": thermo_result.failure_code,
+                                              "failure_message": thermo_result.failure_message},
+                            provenance_stage="thermodynamics", oracle_evaluated=True,
+                            oracle_cache_hit=cache_hit,
+                        )))
+                        continue
+                    predictions = thermo_result.scientific_values()
+                    self.last_backend_used = "chgnet_thermodynamic_oracle"
+                else:
+                    predictions = self._predict(struct, struct_id)
             except Exception as exc:
                 # Research mode remains fail-closed (the underlying _predict
                 # exception is part of Sprint 1's execution boundary).  In
@@ -418,6 +448,14 @@ class ScreeningAgent:
         stress = predictions.get(STRESS_KEY, 0.0)
         if max_stress is not None and stress > max_stress:
             reasons.append(f"max_stress_gpa {stress:.3f} > {max_stress}")
+
+        hull = predictions.get("predicted_energy_above_hull_ev_per_atom")
+        if hull is not None:
+            max_hull = criteria.get("max_predicted_energy_above_hull_ev_per_atom", 0.10)
+            if float(hull) > float(max_hull) + 1e-12:
+                reasons.append(
+                    f"predicted_energy_above_hull_ev_per_atom {float(hull):.4f} > {float(max_hull):.4f}"
+                )
 
         return len(reasons) == 0, reasons
 

@@ -45,6 +45,12 @@ from agents.integrity import (
 )
 from agents.geometry import DEFAULT_MIN_DISTANCE_ANGSTROM, GeometryValidator
 from agents.budget import DualBudgetTracker
+from agents.thermodynamics import (
+    CHGNetRelaxationEvaluator,
+    ThermodynamicOracle,
+    load_frozen_reference_set,
+    threshold_sensitivity,
+)
 
 
 @dataclass
@@ -77,7 +83,11 @@ class CampaignConfig:
     synthesis_mode: str = "mock"
     require_thermodynamics: bool = True
     thermodynamics_backend: Optional[str] = None
+    thermodynamics_reference_set_path: Optional[str] = None
+    thermodynamics_evaluator: Any = None
     thermodynamics_available: bool = False
+    thermodynamics_retain_threshold_ev_per_atom: float = 0.10
+    thermodynamics_stable_threshold_ev_per_atom: float = 0.03
     # Resource accounting.  ``None`` keeps the existing unlimited development
     # behavior; research runs must provide explicit positive limits.
     proposal_budget: Optional[int] = None
@@ -112,6 +122,11 @@ class CampaignConfig:
             raise ValueError("geometry_min_distance must be finite and positive") from exc
         if not __import__("math").isfinite(self.geometry_min_distance) or self.geometry_min_distance <= 0:
             raise ValueError("geometry_min_distance must be finite and positive")
+        for name in ("thermodynamics_retain_threshold_ev_per_atom", "thermodynamics_stable_threshold_ev_per_atom"):
+            value = float(getattr(self, name))
+            if not __import__("math").isfinite(value) or value < 0:
+                raise ValueError(f"{name} must be finite and nonnegative")
+            setattr(self, name, value)
 
 
 class MaterialsDiscoveryCampaign:
@@ -141,6 +156,7 @@ class MaterialsDiscoveryCampaign:
             self._initialize_components_research()
             self._run_research_preflight()
         else:
+            self.thermodynamic_oracle = self._init_thermodynamic_oracle()
             self.generator = self._init_generator()
             self.screener = self._init_screener()
             self.validator = self._init_validator()
@@ -188,6 +204,9 @@ class MaterialsDiscoveryCampaign:
                 'synthesis_mode': self.config.synthesis_mode,
                 'require_thermodynamics': self.config.require_thermodynamics,
                 'thermodynamics_backend': self.config.thermodynamics_backend,
+                'thermodynamics_reference_set_path': self.config.thermodynamics_reference_set_path,
+                'thermodynamics_retain_threshold_ev_per_atom': self.config.thermodynamics_retain_threshold_ev_per_atom,
+                'thermodynamics_stable_threshold_ev_per_atom': self.config.thermodynamics_stable_threshold_ev_per_atom,
                 'use_validation': self.config.use_validation,
                 'validation_top_k': self.config.validation_top_k,
                 'use_synthesis': self.config.use_synthesis,
@@ -247,7 +266,12 @@ class MaterialsDiscoveryCampaign:
             "screening": screener_backend or "unavailable",
             "validation": validation_backend or "unavailable",
             "synthesis": synthesis_backend,
-            "thermodynamics": "configured" if self.config.thermodynamics_available else "not_configured",
+            "thermodynamics": (
+                "certified_frozen_chgnet_hull"
+                if getattr(self, "thermodynamic_oracle", None) is not None
+                and self.thermodynamic_oracle.capability
+                else "not_configured"
+            ),
         }
 
     def _initialize_components_research(self) -> None:
@@ -263,6 +287,7 @@ class MaterialsDiscoveryCampaign:
                 return fallback
 
         self.generator = init("generation", self._init_generator)
+        self.thermodynamic_oracle = init("thermodynamics", self._init_thermodynamic_oracle)
         self.screener = init("screening", self._init_screener)
         self.validator = (
             init("validation", self._init_validator)
@@ -285,7 +310,10 @@ class MaterialsDiscoveryCampaign:
             requested_backends=self.requested_backends,
             actual_backends=self.actual_backends,
             require_thermodynamics=self.config.require_thermodynamics,
-            thermodynamics_available=self.config.thermodynamics_available,
+            thermodynamics_available=(
+                getattr(self, "thermodynamic_oracle", None) is not None
+                and self.thermodynamic_oracle.capability
+            ),
         )
         if self._component_init_errors:
             report.errors = self._component_init_errors + report.errors
@@ -624,6 +652,11 @@ class MaterialsDiscoveryCampaign:
             (s.feasibility_score for s in synthesis_results),
             default=0.0
         )
+        hull_values = [
+            result.predictions.get("predicted_energy_above_hull_ev_per_atom")
+            for _, result in screened
+            if result.predictions.get("predicted_energy_above_hull_ev_per_atom") is not None
+        ]
 
         insights = {
             'generation_backend': generation_backend,
@@ -633,7 +666,8 @@ class MaterialsDiscoveryCampaign:
             'success_rate': n_pass / max(len(screened), 1),
             'screening_rate': n_pass / max(len(screened), 1),
             'best_score': best_score,
-            'thermodynamics_metrics_available': False,
+            'thermodynamics_metrics_available': bool(hull_values),
+            'predicted_hull_threshold_sensitivity': threshold_sensitivity(hull_values),
             'num_validated': len(validation_results),
             'num_converged': n_converged,
             'validation_cost_hours': total_cost,
@@ -787,6 +821,9 @@ class MaterialsDiscoveryCampaign:
                 'proposal_budget': self.config.proposal_budget,
                 'oracle_budget': self.config.oracle_budget,
                 'geometry_min_distance': self.config.geometry_min_distance,
+                'thermodynamics_reference_set_path': self.config.thermodynamics_reference_set_path,
+                'thermodynamics_retain_threshold_ev_per_atom': self.config.thermodynamics_retain_threshold_ev_per_atom,
+                'thermodynamics_stable_threshold_ev_per_atom': self.config.thermodynamics_stable_threshold_ev_per_atom,
             },
             'budget': self.budget_tracker.to_dict(termination_reason=self.termination_reason),
         }
@@ -836,7 +873,10 @@ class MaterialsDiscoveryCampaign:
                 if self.config.run_mode == RunMode.RESEARCH
                 else ScientificValidity.DEMO_ONLY.value
             ),
-            'thermodynamics_metrics_available': False,
+            'thermodynamics_metrics_available': any(
+                result.get("insights", {}).get("thermodynamics_metrics_available", False)
+                for result in self.results_history
+            ),
             'requested_backends': self.requested_backends,
             'actual_backends': self.actual_backends,
             'mattergen_pretrained': (
@@ -951,7 +991,12 @@ class MaterialsDiscoveryCampaign:
             synthesis_mode=cfg_data.get('synthesis_mode', 'mock'),
             require_thermodynamics=cfg_data.get('require_thermodynamics', True),
             thermodynamics_backend=cfg_data.get('thermodynamics_backend'),
-            thermodynamics_available=cfg_data.get('thermodynamics_available', False),
+            thermodynamics_reference_set_path=cfg_data.get('thermodynamics_reference_set_path'),
+            thermodynamics_retain_threshold_ev_per_atom=cfg_data.get('thermodynamics_retain_threshold_ev_per_atom', 0.10),
+            thermodynamics_stable_threshold_ev_per_atom=cfg_data.get('thermodynamics_stable_threshold_ev_per_atom', 0.03),
+            # Legacy Boolean is intentionally ignored: capability must be
+            # established by loading the certified artifact and evaluator.
+            thermodynamics_available=False,
             proposal_budget=cfg_data.get('proposal_budget', manifest.proposal_budget),
             oracle_budget=cfg_data.get('oracle_budget', manifest.oracle_budget),
             geometry_min_distance=cfg_data.get(
@@ -1005,6 +1050,38 @@ class MaterialsDiscoveryCampaign:
         return ScreeningAgent(
             run_mode=self.config.run_mode,
             geometry_validator=self.geometry_validator,
+            thermodynamic_oracle=getattr(self, "thermodynamic_oracle", None),
+        )
+
+    def _init_thermodynamic_oracle(self):
+        """Load an immutable certified set; never retrieve references at runtime."""
+        path = self.config.thermodynamics_reference_set_path
+        evaluator = self.config.thermodynamics_evaluator
+        if not path:
+            if self.config.run_mode == RunMode.RESEARCH and self.config.require_thermodynamics:
+                raise RuntimeError("research thermodynamics requires thermodynamics_reference_set_path")
+            return None
+        configured_elements = self.config.objective.constraints.get("elements")
+        required_chemical_system = (
+            list(configured_elements)
+            if isinstance(configured_elements, (list, tuple, set)) and configured_elements
+            else None
+        )
+        frozen = load_frozen_reference_set(
+            path, required_chemical_system=required_chemical_system,
+        )
+        if evaluator is None:
+            evaluator = CHGNetRelaxationEvaluator(settings=frozen.relaxation_settings)
+        frozen = load_frozen_reference_set(
+            path, expected_model=evaluator.model_identity,
+            expected_settings=evaluator.relaxation_settings,
+            required_chemical_system=required_chemical_system,
+        )
+        return ThermodynamicOracle(
+            frozen, evaluator, research=self.config.run_mode == RunMode.RESEARCH,
+            geometry_min_distance=self.config.geometry_min_distance,
+            retain_threshold_ev_per_atom=self.config.thermodynamics_retain_threshold_ev_per_atom,
+            stable_threshold_ev_per_atom=self.config.thermodynamics_stable_threshold_ev_per_atom,
         )
 
     def _init_validator(self):
@@ -1051,6 +1128,12 @@ def main():
                         help='Maximum geometrically valid oracle evaluations (paper default: 200; omitted means unlimited in development)')
     parser.add_argument('--geometry-min-distance', '--min-distance', dest='geometry_min_distance', type=float, default=DEFAULT_MIN_DISTANCE_ANGSTROM,
                         help='Absolute periodic minimum-distance threshold in Angstrom (default: 0.8)')
+    parser.add_argument('--thermodynamics-reference-set', type=str, default=None,
+                        help='Path to an offline certified frozen reference-set JSON (runtime never downloads references)')
+    parser.add_argument('--thermodynamics-retain-threshold', type=float, default=0.10,
+                        help='Maximum predicted energy above hull retained, eV/atom (default: 0.10)')
+    parser.add_argument('--thermodynamics-stable-threshold', type=float, default=0.03,
+                        help='Predicted-stable energy-above-hull threshold, eV/atom (default: 0.03)')
     parser.add_argument('--master-seed', type=int, default=42)
     parser.add_argument('--no-career-memory', action='store_true')
     parser.add_argument('--no-validation', action='store_true')
@@ -1112,6 +1195,9 @@ def main():
         proposal_budget=args.proposal_budget,
         oracle_budget=args.oracle_budget,
         geometry_min_distance=args.geometry_min_distance,
+        thermodynamics_reference_set_path=args.thermodynamics_reference_set,
+        thermodynamics_retain_threshold_ev_per_atom=args.thermodynamics_retain_threshold,
+        thermodynamics_stable_threshold_ev_per_atom=args.thermodynamics_stable_threshold,
     )
 
     campaign = MaterialsDiscoveryCampaign(config)
