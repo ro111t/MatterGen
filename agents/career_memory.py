@@ -23,6 +23,7 @@ from pathlib import Path
 from typing import Dict, List, Any, Optional, Tuple
 
 from agents.db_schema import ALL_SCHEMAS
+from agents.integrity import SCHEMA_VERSION, ScientificValidity
 
 
 class CareerMemory:
@@ -92,7 +93,9 @@ class CareerMemory:
                         hypothesis_ids: List[str],
                         principle_ids: List[str],
                         iteration: int,
-                        candidate_id: Optional[str] = None):
+                        candidate_id: Optional[str] = None,
+                        schema_version: str = SCHEMA_VERSION,
+                        scientific_validity: str = ScientificValidity.DEMO_ONLY.value):
         """Store a generated candidate with full provenance."""
         if not candidate_id:
             record_id = str(uuid.uuid4())[:8]
@@ -102,6 +105,13 @@ class CareerMemory:
             record_id = f"{campaign_id}_{candidate_id}"
 
         c = self.conn.cursor()
+        # The existing SQLite table intentionally remains unchanged for legacy
+        # DB compatibility.  Provenance metadata is embedded in the JSON
+        # payload; legacy rows without this marker are quarantined at read
+        # time and are never used as v2 scientific evidence.
+        properties_payload = dict(properties or {})
+        properties_payload.setdefault("_schema_version", schema_version)
+        properties_payload.setdefault("_scientific_validity", scientific_validity)
         c.execute("""
             INSERT OR REPLACE INTO candidates
             (id, campaign_id, domain, formula, score, passed_screening,
@@ -110,7 +120,7 @@ class CareerMemory:
         """, (
             record_id, campaign_id, domain, formula, score,
             int(passed), json.dumps(hypothesis_ids), json.dumps(principle_ids),
-            json.dumps(properties), iteration, time.time()
+            json.dumps(properties_payload), iteration, time.time()
         ))
         self.conn.commit()
         return record_id
@@ -401,20 +411,30 @@ class CareerMemory:
             c.execute("""
                 SELECT formula, score, domain, campaign_id, iteration, properties
                 FROM candidates WHERE domain=?
-                ORDER BY score DESC LIMIT ?
-            """, (domain, top_n))
+                ORDER BY score DESC
+            """, (domain,))
         else:
             c.execute("""
                 SELECT formula, score, domain, campaign_id, iteration, properties
-                FROM candidates ORDER BY score DESC LIMIT ?
-            """, (top_n,))
+                FROM candidates ORDER BY score DESC
+            """)
 
         rows = c.fetchall()
-        return [
-            {
+        results = []
+        for r in rows:
+            try:
+                props = json.loads(r[5])
+            except (TypeError, json.JSONDecodeError):
+                continue
+            if not isinstance(props, dict) or props.get("_schema_version") != SCHEMA_VERSION:
+                # v1/unknown rows are retained for audit in the DB but are
+                # quarantined from v2 scientific retrieval/statistics.
+                continue
+            results.append({
                 'formula': r[0], 'score': r[1], 'domain': r[2],
                 'campaign_id': r[3], 'iteration': r[4],
-                'properties': json.loads(r[5])
-            }
-            for r in rows
-        ]
+                'properties': props,
+            })
+            if len(results) >= top_n:
+                break
+        return results

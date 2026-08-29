@@ -18,6 +18,8 @@ import tempfile
 import numpy as np
 from dataclasses import dataclass
 
+from agents.integrity import RunMode, normalize_run_mode
+
 try:
     from pymatgen.core import Structure, Lattice, Element
     HAS_PYMATGEN = True
@@ -237,14 +239,22 @@ class GenerationAgent:
         mattergen_batch_size: int = 16,
         mattergen_sampling_config_path: Optional[str] = None,
         mattergen_sampling_config_name: str = "default",
+        run_mode: RunMode | str = RunMode.DEVELOPMENT,
+        mode: Optional[str] = None,
     ):
         self.generation_history = []
         self.diversity_threshold = diversity_threshold
         self._total_generated = 0
+        self.run_mode = normalize_run_mode(mode if mode is not None else run_mode)
         self.use_mattergen = use_mattergen
         self._mattergen: Optional[MattergenGenerator] = None
         self.last_generation_backend: Optional[str] = None
         self._generation_batch_backends: List[str] = []
+
+        if self.run_mode == RunMode.RESEARCH and not self.use_mattergen:
+            raise RuntimeError(
+                "Research mode requires MatterGen generation; refusing the development generator."
+            )
 
         if self.use_mattergen:
             try:
@@ -257,12 +267,19 @@ class GenerationAgent:
                 )
                 print(f"  [Generator] MatterGen backend loaded ({mattergen_pretrained})")
             except Exception as e:
+                if self.run_mode == RunMode.RESEARCH:
+                    raise RuntimeError(
+                        f"Research mode requires an available MatterGen backend; initialization failed: {e}"
+                    ) from e
                 print(f"  [Generator] MatterGen unavailable ({e}); falling back to pymatgen mock")
                 self.use_mattergen = False
 
     @property
     def backend_name(self) -> str:
         """Accurately report the active generation backend."""
+        if self.run_mode == RunMode.RESEARCH and (not self.use_mattergen or self._mattergen is None):
+            raise RuntimeError("Research mode cannot generate candidates without MatterGen.")
+
         if self.use_mattergen and self._mattergen is not None:
             return "mattergen"
         if HAS_PYMATGEN:
@@ -298,6 +315,10 @@ class GenerationAgent:
                     structures = self._mattergen.generate(num_candidates, elements=elements)
                 backend = "mattergen"
             except Exception as e:
+                if self.run_mode == RunMode.RESEARCH:
+                    raise RuntimeError(
+                        f"MatterGen generation failed in research mode; no fallback is permitted: {e}"
+                    ) from e
                 print(
                     f"  [Generator] MatterGen generation failed ({e}); "
                     "falling back to mock for this batch"

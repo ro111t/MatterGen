@@ -31,7 +31,6 @@ class StrategyOutcome:
     num_converged: int
     num_synthesis_feasible: int
     best_score: float
-    best_validated_stability: float
     best_synthesis_feasibility: float
     validation_cost_hours: float
 
@@ -43,9 +42,8 @@ class StrategyAgent:
     Args:
         exploration_weight: UCB exploration coefficient. Higher values favor
             trying less-tested element sets. 0.0 means pure exploitation.
-        target_metric: Which metric to optimize. Options:
-            'best_score', 'best_validated_stability', 'best_synthesis_feasibility',
-            'combined'.
+        target_metric: Retained for configuration compatibility; Sprint 1
+            optimizes only the non-thermodynamic ``best_score``.
     """
 
     def __init__(
@@ -78,7 +76,6 @@ class StrategyAgent:
             num_converged=int(insights.get('num_converged', 0)),
             num_synthesis_feasible=int(insights.get('num_synthesis_feasible', 0)),
             best_score=float(insights.get('best_score', 0.0)),
-            best_validated_stability=float(insights.get('best_validated_stability', 0.0)),
             best_synthesis_feasibility=float(insights.get('best_synthesis_feasibility', 0.0)),
             validation_cost_hours=float(insights.get('validation_cost_hours', 0.0)),
         )
@@ -133,16 +130,10 @@ class StrategyAgent:
         """Combine multiple objectives into a single reward signal."""
         if self.target_metric == 'best_score':
             return outcome.best_score / 100.0  # score is 0-100
-        if self.target_metric == 'best_validated_stability':
-            return max(0.0, -outcome.best_validated_stability)
-        if self.target_metric == 'best_synthesis_feasibility':
-            return outcome.best_synthesis_feasibility
-
-        # combined: normalize and weight each signal
-        score_component = outcome.best_score / 100.0
-        stability_component = max(0.0, -outcome.best_validated_stability) / 5.0
-        synthesis_component = outcome.best_synthesis_feasibility
-        return 0.3 * score_component + 0.4 * stability_component + 0.3 * synthesis_component
+        # Sprint 1 intentionally rewards only the non-thermodynamic screening
+        # score.  Raw energies and thermodynamic labels cannot be compared
+        # across compositions until a reference-set/hull result exists.
+        return outcome.best_score / 100.0
 
     def _recommend_elements(self, allowed_elements: List[str]) -> Tuple[str, ...]:
         """Use UCB to pick the most promising element set."""

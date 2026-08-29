@@ -13,6 +13,15 @@ from typing import Dict, List, Tuple, Any, Optional
 import hashlib
 import numpy as np
 
+from agents.integrity import (
+    FORCE_KEY,
+    SCREENING_ENERGY_KEY,
+    STRESS_KEY,
+    RunMode,
+    normalize_run_mode,
+    canonicalize_screening_predictions,
+)
+
 try:
     from chgnet.model import CHGNet
     from chgnet.model.model import CHGNet as CHGNetModel
@@ -28,10 +37,9 @@ except ImportError:
 
 
 DEFAULT_SCREENING_WEIGHTS = {
-    "stability": 0.35,
-    "relaxation_quality": 0.25,
-    "target_property_match": 0.25,
-    "composition_novelty": 0.15,
+    "relaxation_quality": 0.40,
+    "target_property_match": 0.35,
+    "composition_novelty": 0.25,
 }
 
 
@@ -45,6 +53,14 @@ class ScreeningResult:
     filter_reasons: List[str]
     rank: Optional[int] = None
     score_components: Dict[str, float] = field(default_factory=dict)
+    backend: str = ""
+    scientific_validity: str = "demo_only"
+
+    def __post_init__(self) -> None:
+        # Ensure explicitly constructed results use schema-v2 vocabulary.
+        self.predictions = canonicalize_screening_predictions(
+            self.predictions, backend=self.backend or "heuristic"
+        )
 
 
 class ScreeningAgent:
@@ -53,9 +69,10 @@ class ScreeningAgent:
     Score is normalized 0-100; higher = better candidate.
     """
 
-    def __init__(self):
+    def __init__(self, run_mode: RunMode | str = RunMode.DEVELOPMENT, mode: Optional[str] = None):
+        self.run_mode = normalize_run_mode(mode if mode is not None else run_mode)
         self.chgnet = None
-        self.last_backend_used: str = "heuristic"
+        self.last_backend_used: str = "uninitialized"
         self.prediction_cache: Dict[str, Dict[str, float]] = {}
         self._init_models()
 
@@ -63,10 +80,21 @@ class ScreeningAgent:
         if HAS_CHGNET:
             try:
                 self.chgnet = CHGNet.load()
+                self.last_backend_used = "chgnet"
                 print("  [Screener] CHGNet loaded successfully")
             except Exception as e:
+                if self.run_mode == RunMode.RESEARCH:
+                    raise RuntimeError(
+                        f"Research mode requires CHGNet screening; model initialization failed: {e}"
+                    ) from e
+                self.last_backend_used = "heuristic"
                 print(f"  [Screener] CHGNet load failed ({e}), using heuristic scoring")
         else:
+            if self.run_mode == RunMode.RESEARCH:
+                raise RuntimeError(
+                    "Research mode requires CHGNet screening, but CHGNet is not installed."
+                )
+            self.last_backend_used = "heuristic"
             print("  [Screener] CHGNet not installed, using heuristic scoring")
         
     def screen_batch(
@@ -82,7 +110,7 @@ class ScreeningAgent:
 
         Args:
             structures: List of pymatgen Structure objects (or stub dicts)
-            criteria: Dict with optional keys: max_formation_energy, max_forces, min_stability
+            criteria: Dict with optional force/stress thresholds.
             target_properties: Optional map of property name -> target value, used to
                 compute a target-property-match component of the score.
             weights: Optional map overriding the default multi-objective score weights.
@@ -92,7 +120,7 @@ class ScreeningAgent:
             List of (structure, ScreeningResult) sorted by score descending
         """
         target_properties = target_properties or {}
-        weights = weights or DEFAULT_SCREENING_WEIGHTS
+        weights = dict(weights or DEFAULT_SCREENING_WEIGHTS)
 
         raw_results = []
         for i, struct in enumerate(structures):
@@ -107,6 +135,8 @@ class ScreeningAgent:
                 passes_filters=passes,
                 filter_reasons=reasons,
                 score_components=components,
+                backend=self.last_backend_used,
+                scientific_validity=("research_valid" if self.run_mode == RunMode.RESEARCH else "demo_only"),
             )))
 
         if deduplicate:
@@ -145,10 +175,19 @@ class ScreeningAgent:
             try:
                 preds = self._chgnet_predict(struct)
                 self.last_backend_used = "chgnet"
-            except Exception:
+            except Exception as exc:
+                if self.run_mode == RunMode.RESEARCH:
+                    raise RuntimeError(
+                        f"CHGNet prediction failed for {struct_id} in research mode: {exc}"
+                    ) from exc
                 preds = self._heuristic_predict(struct)
                 self.last_backend_used = "heuristic"
         else:
+            if self.run_mode == RunMode.RESEARCH:
+                raise RuntimeError(
+                    f"CHGNet cannot screen candidate {struct_id} in research mode; "
+                    "heuristic substitution is disabled."
+                )
             preds = self._heuristic_predict(struct)
             self.last_backend_used = "heuristic"
 
@@ -166,10 +205,10 @@ class ScreeningAgent:
         max_stress = float(np.max(np.abs(np.array(stress))))
 
         return {
-            'formation_energy': energy,
-            'forces': max_force,
-            'stress': max_stress,
-            'stability': -abs(energy),
+            SCREENING_ENERGY_KEY: energy,
+            FORCE_KEY: max_force,
+            STRESS_KEY: max_stress,
+            'energy_semantics': 'raw_predicted_per_atom',
         }
 
     def _heuristic_predict(self, struct: Any) -> Dict[str, float]:
@@ -181,14 +220,12 @@ class ScreeningAgent:
         if HAS_PYMATGEN and isinstance(struct, Structure):
             formula = struct.composition.reduced_formula
             n_atoms = len(struct)
-            vol_per_atom = struct.volume / max(n_atoms, 1)
             seed_val = int(hashlib.sha256(formula.encode('utf-8')).hexdigest(), 16) % 10000
             rng = np.random.default_rng(seed_val)
 
             energy = float(rng.uniform(-4.0, -0.5))
             max_force = float(rng.uniform(0.01, 0.8))
             max_stress = float(rng.uniform(0.1, 3.0))
-            stability_bonus = -0.1 if 3.0 < vol_per_atom < 25.0 else 0.2
         elif isinstance(struct, dict):
             formula = struct.get('composition', '')
             seed_val = int(hashlib.sha256(formula.encode('utf-8')).hexdigest(), 16) % 10000
@@ -196,19 +233,17 @@ class ScreeningAgent:
             energy = float(rng.uniform(-4.0, -0.5))
             max_force = float(rng.uniform(0.01, 0.8))
             max_stress = float(rng.uniform(0.1, 3.0))
-            stability_bonus = 0.0
         else:
             rng = np.random.default_rng(0)
             energy = float(rng.uniform(-3.0, -1.0))
             max_force = 0.3
             max_stress = 1.0
-            stability_bonus = 0.0
 
         return {
-            'formation_energy': energy,
-            'forces': max_force,
-            'stress': max_stress,
-            'stability': energy + stability_bonus,
+            'mock_predicted_energy_per_atom_ev': energy,
+            FORCE_KEY: max_force,
+            STRESS_KEY: max_stress,
+            'energy_semantics': 'mock_raw_per_atom',
         }
 
     def _deduplicate_by_composition(
@@ -236,25 +271,22 @@ class ScreeningAgent:
         """Apply configurable filters; return (passes, failure_reasons)."""
         reasons = []
 
-        # CHGNet returns total energy/atom (always negative for stable phases).
-        # Only reject clearly unphysical positive energies.
-        max_fe = criteria.get('max_formation_energy', 5.0)
-        fe = predictions.get('formation_energy', -1.0)
-        if fe > max_fe:
-            reasons.append(f"formation_energy {fe:.3f} > {max_fe}")
+        # Raw model energy is recorded for audit only.  Until a reference-set
+        # thermodynamic calculation exists (Sprint 3), it must not be used as
+        # a cross-composition filter.
 
         # Random mock structures have large forces (not relaxed).
-        # Use max_forces=500 by default; tighten to ~0.1 for relaxed structures.
-        max_f = criteria.get('max_forces', 500.0)
-        forces = predictions.get('forces', 0.0)
+        # Generated structures are unrelaxed; force/stress thresholds are
+        # geometry diagnostics, not thermodynamic claims.
+        max_f = criteria.get('max_force_ev_per_angstrom', 500.0)
+        forces = predictions.get(FORCE_KEY, 0.0)
         if forces > max_f:
-            reasons.append(f"forces {forces:.3f} > {max_f}")
+            reasons.append(f"max_force_ev_per_angstrom {forces:.3f} > {max_f}")
 
-        # Reject structures with suspiciously low (unphysical) total energy
-        min_stab = criteria.get('min_stability', -20.0)
-        stab = predictions.get('stability', -1.0)
-        if stab < min_stab:
-            reasons.append(f"stability {stab:.3f} < {min_stab}")
+        max_stress = criteria.get('max_stress_gpa')
+        stress = predictions.get(STRESS_KEY, 0.0)
+        if max_stress is not None and stress > max_stress:
+            reasons.append(f"max_stress_gpa {stress:.3f} > {max_stress}")
 
         return len(reasons) == 0, reasons
 
@@ -267,19 +299,16 @@ class ScreeningAgent:
         """
         Multi-objective score normalized to 0-100. Higher = better candidate.
 
-        Combines stability, relaxation quality, target-property match, and
-        within-batch composition novelty.
+        Combines relaxation quality, target-property match, and within-batch
+        composition novelty. Raw energy is diagnostic-only until Sprint 3.
         """
         target_properties = target_properties or {}
         weights = weights or DEFAULT_SCREENING_WEIGHTS
-
-        # Stability component: favor lower formation energies.
-        fe = predictions.get('formation_energy', 0.0)
-        stability = round(max(0.0, min(100.0, 50.0 - fe * 12.5)), 3)
+        weights = dict(weights)
 
         # Relaxation quality component: penalize high forces/stress.
-        forces = predictions.get('forces', 0.5)
-        stress = predictions.get('stress', 1.0)
+        forces = predictions.get(FORCE_KEY, 0.5)
+        stress = predictions.get(STRESS_KEY, 1.0)
         force_score = round(max(0.0, min(100.0, 100.0 - forces * 50.0)), 3)
         stress_score = round(max(0.0, min(100.0, 100.0 - stress * 20.0)), 3)
         relaxation_quality = round((force_score + stress_score) / 2.0, 3)
@@ -287,7 +316,7 @@ class ScreeningAgent:
         # Target property match component: closeness to specified targets.
         property_scores = []
         for prop, target in target_properties.items():
-            if prop in predictions:
+            if prop in predictions and prop != SCREENING_ENERGY_KEY:
                 actual = predictions[prop]
                 # Normalize closeness using a generous tolerance scale.
                 scale = max(abs(target), 1.0)
@@ -299,7 +328,6 @@ class ScreeningAgent:
         composition_novelty = 50.0
 
         components = {
-            'stability': stability,
             'relaxation_quality': relaxation_quality,
             'target_property_match': target_property_match,
             'composition_novelty': composition_novelty,

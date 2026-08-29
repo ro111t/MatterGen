@@ -36,7 +36,7 @@ KNOWN_DOMAIN_ANALOGIES = {
     ),
     ("battery_cathode", "li_solid_electrolyte"): (
         "Layered oxide frameworks studied as cathodes share structural features with "
-        "lithium-conducting oxides; stability criteria overlap"
+        "lithium-conducting oxides; structural criteria overlap"
     ),
 }
 
@@ -135,7 +135,9 @@ class ExperienceDistiller:
         # Aggregate stats
         total_generated = sum(r.get('num_generated', 0) for r in all_results)
         total_screened = sum(r.get('num_screened', 0) for r in all_results)
-        best_scores = [r.get('insights', {}).get('avg_stability', 0) for r in all_results]
+        # Screening score is a neutral structural/target-quality score; raw
+        # per-atom energy is deliberately not used as a memory signal.
+        best_scores = [r.get('insights', {}).get('best_score', 0) for r in all_results]
         improving = len(best_scores) > 2 and best_scores[-1] > best_scores[0]
 
         # Build summary for LLM
@@ -178,7 +180,7 @@ class ExperienceDistiller:
             p_id = self.memory.store_principle(
                 domain=domain,
                 statement=p['statement'],
-                property_target=p.get('property_target', 'stability'),
+                property_target=p.get('property_target', 'screening_quality'),
                 structural_motif=p.get('structural_motif', 'unknown'),
                 campaign_id=campaign_id,
                 confidence=p.get('confidence', 0.5),
@@ -215,9 +217,9 @@ class ExperienceDistiller:
             principles.append({
                 'statement': (
                     f"In {domain}, combinations including {elem_str} consistently "
-                    f"pass stability screening — prioritize these in generation"
+                    f"pass diagnostic screening — prioritize these in generation"
                 ),
-                'property_target': 'stability',
+                'property_target': 'screening_quality',
                 'structural_motif': elem_str,
                 'confidence': min(0.7, 0.4 + 0.05 * len(passing))
             })
@@ -231,7 +233,7 @@ class ExperienceDistiller:
                     f"Iteration {domain} screening achieved avg score {avg_score:.2f} "
                     f"with elements {elements} — continue prioritizing this space"
                 ),
-                'property_target': list(target_props.keys())[0] if target_props else 'stability',
+                'property_target': list(target_props.keys())[0] if target_props else 'screening_quality',
                 'structural_motif': '+'.join(elements[:3]) if elements else 'mixed',
                 'confidence': 0.45
             })

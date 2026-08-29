@@ -27,6 +27,20 @@ import subprocess
 import sys
 from typing import Any, Dict, List, Optional, Tuple, Union
 
+from agents.integrity import (
+    FORCE_KEY,
+    LEGACY_SCHEMA_VERSION,
+    SCHEMA_VERSION,
+    SCREENING_ENERGY_KEY,
+    STRESS_KEY,
+    VALIDATION_ENERGY_KEY,
+    LegacySchemaError,
+    ScientificValidity,
+    canonicalize_screening_predictions,
+    canonicalize_validation_properties,
+    is_schema_v2,
+)
+
 # Optional chemical and computational libraries
 try:
     from pymatgen.core import Composition, Structure
@@ -244,9 +258,13 @@ class SoftwareEnvironment:
 class CandidateRecord:
     """
     Versioned record schema representing the complete lifecycle of a single material candidate.
-    Schema Version: 1.0.0
+    Schema Version: 2.0.0
     """
-    schema_version: str = "1.0.0"
+    schema_version: str = SCHEMA_VERSION
+    scientific_validity: str = ScientificValidity.DEMO_ONLY.value
+    run_mode: str = "development"
+    requested_backends: Dict[str, Any] = field(default_factory=dict)
+    actual_backends: Dict[str, Any] = field(default_factory=dict)
 
     # Identity
     candidate_id: str = ""
@@ -311,6 +329,18 @@ class CandidateRecord:
     strategy_influence: Optional[str] = None
     decision_timestamp_iso: Optional[str] = None
 
+    def __post_init__(self) -> None:
+        """Normalize direct v2 construction to the unambiguous vocabulary."""
+        if self.schema_version == SCHEMA_VERSION:
+            self.screening_predictions = canonicalize_screening_predictions(
+                self.screening_predictions,
+                backend=self.screening_backend or self.actual_backends.get("screening", "heuristic"),
+            )
+            self.validation_properties = canonicalize_validation_properties(
+                self.validation_properties,
+                calculator=self.validation_calculator or self.actual_backends.get("validation", "mock"),
+            )
+
     def to_dict(self) -> Dict[str, Any]:
         """Export as structured dictionary."""
         return asdict(self)
@@ -320,7 +350,11 @@ class CandidateRecord:
         """Construct CandidateRecord from dictionary."""
         known_fields = cls.__dataclass_fields__.keys()
         filtered = {k: v for k, v in data.items() if k in known_fields}
-        return cls(**filtered)
+        record = cls(**filtered)
+        if not is_schema_v2(data):
+            record.schema_version = str(data.get("schema_version", LEGACY_SCHEMA_VERSION))
+            record.scientific_validity = ScientificValidity.LEGACY_INVALID_ENERGY_SEMANTICS.value
+        return record
 
     def to_flat_dict(self) -> Dict[str, Any]:
         """
@@ -352,17 +386,17 @@ class CandidateRecord:
             "passes_screening_filters": self.passes_screening_filters if self.passes_screening_filters is not None else "",
             "screening_filter_reasons": "; ".join(self.screening_filter_reasons),
             "screening_rank": self.screening_rank if self.screening_rank is not None else "",
-            "screening_formation_energy": self.screening_predictions.get("formation_energy", ""),
-            "screening_forces": self.screening_predictions.get("forces", ""),
-            "screening_stress": self.screening_predictions.get("stress", ""),
-            "screening_stability": self.screening_predictions.get("stability", ""),
+            "screening_predicted_energy_per_atom_ev": self.screening_predictions.get(SCREENING_ENERGY_KEY, self.screening_predictions.get("mock_predicted_energy_per_atom_ev", "")),
+            "screening_max_force_ev_per_angstrom": self.screening_predictions.get(FORCE_KEY, ""),
+            "screening_max_stress_gpa": self.screening_predictions.get(STRESS_KEY, ""),
             "screening_timestamp_iso": self.screening_timestamp_iso or "",
             # Validation
             "validation_calculator": self.validation_calculator or "",
             "validation_converged": self.validation_converged if self.validation_converged is not None else "",
             "validation_cost_hours": self.validation_cost_hours if self.validation_cost_hours is not None else "",
-            "validation_energy_per_atom": self.validation_properties.get("energy_per_atom", ""),
-            "validation_stability": self.validation_properties.get("stability", ""),
+            "validation_energy_per_atom_ev": self.validation_properties.get(VALIDATION_ENERGY_KEY, self.validation_properties.get("mock_energy_per_atom_ev", "")),
+            "validation_max_force_ev_per_angstrom": self.validation_properties.get(FORCE_KEY, ""),
+            "validation_max_stress_gpa": self.validation_properties.get(STRESS_KEY, ""),
             "validation_band_gap": self.validation_properties.get("band_gap", ""),
             "validation_bulk_modulus": self.validation_properties.get("bulk_modulus", ""),
             "validation_error_message": self.validation_error_message or "",
@@ -385,16 +419,24 @@ class CandidateRecord:
             "stored_in_memory": self.stored_in_memory,
             "strategy_influence": self.strategy_influence or "",
             "decision_timestamp_iso": self.decision_timestamp_iso or "",
+            "scientific_validity": self.scientific_validity,
+            "run_mode": self.run_mode,
+            "requested_backends": json.dumps(self.requested_backends, sort_keys=True, default=str),
+            "actual_backends": json.dumps(self.actual_backends, sort_keys=True, default=str),
         }
 
 
 @dataclass
 class RunManifest:
     """
-    Campaign execution manifest ("1.0.0").
+    Campaign execution manifest ("2.0.0").
     Records startup configuration, environment, seeds, and planning strategies.
     """
-    schema_version: str = "1.0.0"
+    schema_version: str = SCHEMA_VERSION
+    scientific_validity: str = ScientificValidity.DEMO_ONLY.value
+    run_mode: str = "development"
+    requested_backends: Dict[str, Any] = field(default_factory=dict)
+    actual_backends: Dict[str, Any] = field(default_factory=dict)
     campaign_id: str = ""
     campaign_name: str = ""
     domain: str = ""
@@ -422,7 +464,15 @@ class RunManifest:
     def from_dict(cls, data: Dict[str, Any]) -> RunManifest:
         known_fields = cls.__dataclass_fields__.keys()
         filtered = {k: v for k, v in data.items() if k in known_fields}
-        return cls(**filtered)
+        manifest = cls(**filtered)
+        # Loading is intentionally permissive for audit tooling.  The caller
+        # must use assert_schema_v2_compatible before scientific retrieval or
+        # execution; v1 is never upgraded in place.
+        if not is_schema_v2(data):
+            manifest.schema_version = str(data.get("schema_version", LEGACY_SCHEMA_VERSION))
+            manifest.scientific_validity = ScientificValidity.LEGACY_INVALID_ENERGY_SEMANTICS.value
+            manifest.run_mode = str(data.get("run_mode", "development"))
+        return manifest
 
     def save(self, path: Path) -> Path:
         path = Path(path)
@@ -480,6 +530,10 @@ class ProvenanceTracker:
         config: Optional[Dict[str, Any]] = None,
         objective: Optional[Dict[str, Any]] = None,
         constraints: Optional[Dict[str, Any]] = None,
+        run_mode: str = "development",
+        scientific_validity: Optional[str] = None,
+        requested_backends: Optional[Dict[str, Any]] = None,
+        actual_backends: Optional[Dict[str, Any]] = None,
     ):
         self.campaign_id = campaign_id
         self.campaign_name = campaign_name
@@ -489,6 +543,14 @@ class ProvenanceTracker:
         self.config_dict = config or {}
         self.objective_dict = objective or {}
         self.constraints_dict = constraints or {}
+        self.run_mode = str(run_mode)
+        self.scientific_validity = scientific_validity or (
+            ScientificValidity.RESEARCH_VALID.value
+            if self.run_mode == "research"
+            else ScientificValidity.DEMO_ONLY.value
+        )
+        self.requested_backends = dict(requested_backends or {})
+        self.actual_backends = dict(actual_backends or {})
 
         self.structures_dir = self.output_dir / "structures"
         self.structures_dir.mkdir(parents=True, exist_ok=True)
@@ -504,6 +566,10 @@ class ProvenanceTracker:
             campaign_id=self.campaign_id,
             campaign_name=self.campaign_name,
             domain=self.domain,
+            scientific_validity=self.scientific_validity,
+            run_mode=self.run_mode,
+            requested_backends=self.requested_backends,
+            actual_backends=self.actual_backends,
             git_commit_sha=self.environment.git_commit_sha,
             environment=self.environment.to_dict(),
             master_seed=self.master_seed,
@@ -668,6 +734,10 @@ class ProvenanceTracker:
             record = CandidateRecord(
                 candidate_id=cand_id,
                 campaign_id=self.campaign_id,
+                scientific_validity=self.scientific_validity,
+                run_mode=self.run_mode,
+                requested_backends=dict(self.requested_backends),
+                actual_backends=dict(self.actual_backends),
                 iteration=iteration,
                 created_at_iso=now_iso,
                 composition=formula,
@@ -718,6 +788,10 @@ class ProvenanceTracker:
                 record = CandidateRecord(
                     candidate_id=cand_id,
                     campaign_id=self.campaign_id,
+                    scientific_validity=self.scientific_validity,
+                    run_mode=self.run_mode,
+                    requested_backends=dict(self.requested_backends),
+                    actual_backends=dict(self.actual_backends),
                     iteration=iteration,
                     composition=formula,
                     chemical_system=chem_sys,
@@ -729,7 +803,9 @@ class ProvenanceTracker:
                 self.records[cand_id] = record
 
             record.screening_backend = backend
-            record.screening_predictions = getattr(res, "predictions", {}) or {}
+            record.screening_predictions = canonicalize_screening_predictions(
+                getattr(res, "predictions", {}) or {}, backend=backend
+            )
             record.screening_score = getattr(res, "score", None)
             record.screening_score_components = getattr(res, "score_components", {}) or {}
             record.passes_screening_filters = getattr(res, "passes_filters", True)
@@ -774,7 +850,10 @@ class ProvenanceTracker:
 
             record.validation_calculator = getattr(v, "calculator", "mock")
             record.validation_converged = getattr(v, "converged", False)
-            record.validation_properties = getattr(v, "properties", {}) or {}
+            record.validation_properties = canonicalize_validation_properties(
+                getattr(v, "properties", {}) or {},
+                calculator=str(getattr(v, "calculator", "mock")),
+            )
             record.validation_cost_hours = getattr(v, "cost_hours", 0.0)
             record.validation_error_message = getattr(v, "error_message", "") or None
             record.validation_timestamp_iso = now_iso
@@ -924,7 +1003,11 @@ class ProvenanceTracker:
     def save_campaign_provenance(self) -> Path:
         """Write consolidated campaign JSON provenance record."""
         payload = {
-            "schema_version": "1.0.0",
+            "schema_version": SCHEMA_VERSION,
+            "scientific_validity": self.scientific_validity,
+            "run_mode": self.run_mode,
+            "requested_backends": dict(self.requested_backends),
+            "actual_backends": dict(self.actual_backends),
             "campaign_id": self.campaign_id,
             "campaign_name": self.campaign_name,
             "domain": self.domain,
@@ -990,13 +1073,9 @@ class ProvenanceTracker:
         scores = [r.screening_score for r in screened if r.screening_score is not None]
         best_score = max(scores) if scores else 0.0
 
-        val_stabilities = [
-            r.validation_properties.get("stability")
-            for r in validated
-            if "stability" in r.validation_properties
-        ]
-        best_validated_stability = max(val_stabilities) if val_stabilities else 0.0
-
+        # Energies are raw model/calculator outputs.  Keep them on each
+        # candidate, but do not aggregate/rank across compositions until a
+        # reference-set thermodynamic result is available (Sprint 3).
         synth_scores = [
             r.synthesis_feasibility_score
             for r in synthesis_assessed
@@ -1026,7 +1105,6 @@ class ProvenanceTracker:
             "total_synthesis_feasible": len(synthesis_feasible),
             "synthesis_feasibility_rate": len(synthesis_feasible) / len(synthesis_assessed) if len(synthesis_assessed) > 0 else 0.0,
             "best_score_ever": best_score,
-            "best_validated_stability_ever": best_validated_stability,
             "best_synthesis_feasibility_ever": best_synthesis_feasibility,
             "generation_backend_counts": backend_counts,
         }

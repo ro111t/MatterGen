@@ -29,7 +29,7 @@ def test_update_and_ucb_selection():
     insights = {
         "num_passed": 2, "num_screened": 10,
         "num_validated": 2, "num_converged": 2, "num_synthesis_feasible": 2,
-        "best_score": 70.0, "best_validated_stability": -1.0,
+        "best_score": 70.0,
         "best_synthesis_feasibility": 0.6, "validation_cost_hours": 5.0,
     }
 
@@ -49,7 +49,7 @@ def test_batch_size_adaptation():
             {
                 "num_passed": 0, "num_screened": 20,
                 "num_validated": 0, "num_converged": 0, "num_synthesis_feasible": 0,
-                "best_score": 0.0, "best_validated_stability": 0.0,
+                "best_score": 0.0,
                 "best_synthesis_feasibility": 0.0, "validation_cost_hours": 0.0,
             },
         )

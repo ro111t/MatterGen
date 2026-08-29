@@ -28,10 +28,10 @@ Every candidate progresses through an explicit 7-stage lifecycle (`CandidateStat
       │  • Fractional coordinates computed and SHA256 checksum calculated
       ▼
 [2. SCREENED]
-      │  • CHGNet / ML energy, forces, stress, and stability computed
+      │  • CHGNet raw energy, force, and stress diagnostics recorded with units
       │  • Multi-objective composite score evaluated
-      │  • Filter thresholds applied (formation energy, force limits)
-      ├──► [REJECTED (Screening)] (e.g. formation_energy -0.31 > -0.50 eV/atom)
+      │  • Geometry/property thresholds applied (raw energy is diagnostic-only)
+      ├──► [REJECTED (Screening)] (e.g. max_force_ev_per_angstrom exceeds threshold)
       ▼
 [3. VALIDATED]
       │  • High-fidelity DFT / mock relaxation executed on top candidates
@@ -60,11 +60,13 @@ Every candidate progresses through an explicit 7-stage lifecycle (`CandidateStat
 
 ## 3. Schemas & Specifications
 
-### CandidateRecord Schema (`schema_version: "1.0.0"`)
+### CandidateRecord Schema (`schema_version: "2.0.0"`)
 
 | Category | Field | Type | Description |
 | :--- | :--- | :--- | :--- |
-| **Metadata** | `schema_version` | `string` | Version of the schema (`"1.0.0"`). |
+| **Metadata** | `schema_version` | `string` | Version of the schema (`"2.0.0"`). |
+| | `scientific_validity` | `string` | `demo_only`, `research_valid`, or `legacy_invalid_energy_semantics`. |
+| | `run_mode` | `string` | `development` or fail-closed `research`. |
 | **Identity** | `candidate_id` | `string` | Canonical candidate ID (e.g. `"MAT-000137"`). |
 | | `campaign_id` | `string` | ID of the discovery campaign. |
 | | `iteration` | `integer` | Iteration number (0-indexed). |
@@ -81,14 +83,14 @@ Every candidate progresses through an explicit 7-stage lifecycle (`CandidateStat
 | | `generation_seed` | `integer` | Random seed used for generation. |
 | | `target_elements` | `list[str]` | Target element subspace requested. |
 | **Screening** | `screening_backend` | `string` | Predictor used (`"chgnet"` or `"heuristic"`). |
-| | `screening_predictions` | `dict` | ML predicted properties (`formation_energy`, `stability`, `forces`, `stress`). |
+| | `screening_predictions` | `dict` | Raw diagnostics: `predicted_energy_per_atom_ev`, `max_force_ev_per_angstrom`, `max_stress_gpa`. |
 | | `screening_score` | `float` | Multi-objective composite score (0-100). |
 | | `passes_screening_filters` | `bool` | Whether candidate satisfied all screening criteria. |
 | | `screening_filter_reasons` | `list[str]` | Detailed filter outcomes / rejection thresholds. |
 | | `screening_rank` | `integer` | Rank within screening batch. |
 | **Validation**| `validation_calculator` | `string` | Calculator backend (`"vasp"`, `"gpaw"`, `"ase"`, `"mock"`). |
 | | `validation_converged` | `bool` | Whether electronic/ionic relaxation converged. |
-| | `validation_properties` | `dict` | Validated properties (`energy_per_atom`, `stability`, `band_gap`, `bulk_modulus`). |
+| | `validation_properties` | `dict` | Validated properties (`energy_per_atom_ev`, unit-bearing force/stress keys, `band_gap`, `bulk_modulus`). |
 | | `validation_cost_hours` | `float` | Computational cost in CPU/GPU core hours. |
 | | `validation_error_message` | `string?` | Error description if relaxation failed. |
 | **Synthesis** | `synthesis_mode` | `string` | Synthesis agent mode (`"mock"` or `"mp"`). |
@@ -112,7 +114,9 @@ Every candidate progresses through an explicit 7-stage lifecycle (`CandidateStat
 Frozen at campaign initialization, dynamically tracks per-iteration strategies, and finalizes upon completion:
 ```json
 {
-  "schema_version": "1.0.0",
+  "schema_version": "2.0.0",
+  "scientific_validity": "demo_only",
+  "run_mode": "development",
   "campaign_id": "camp_1787446952",
   "campaign_name": "li_solid_electrolyte_campaign",
   "domain": "li_solid_electrolyte",
@@ -130,8 +134,7 @@ Frozen at campaign initialization, dynamically tracks per-iteration strategies, 
   "master_seed": 42,
   "iteration_seeds": [42, 43],
   "objective": {
-    "stability": -0.1,
-    "formation_energy": -2.0
+    "band_gap": 2.0
   },
   "constraints": {
     "elements": ["Li", "P", "S", "O", "Cl"],
@@ -142,8 +145,8 @@ Frozen at campaign initialization, dynamically tracks per-iteration strategies, 
       "iteration": 0,
       "elements": ["Li", "P", "S", "O"],
       "num_candidates": 15,
-      "screening_criteria": {"max_formation_energy": 5.0},
-      "hypothesis": "Li-P-S compositions with low formation energy will pass screening."
+      "screening_criteria": {"max_force_ev_per_angstrom": 100.0},
+      "hypothesis": "Li-P-S structures with low residual force will pass screening."
     }
   ],
   "start_time_iso": "2026-08-23T01:02:32.336955+00:00",
@@ -216,10 +219,10 @@ df = pd.read_csv("campaigns/li_solid_electrolyte/candidates_provenance.csv")
 # 1. Inspect acceptance / rejection breakdown
 print(df["status"].value_counts())
 
-# 2. Query accepted candidates with high stability
+# 2. Query accepted candidates with low residual force
 promising = df[
     (df["status"] == "accepted") &
-    (df["screening_formation_energy"] < -1.5)
+    (df["screening_max_force_ev_per_angstrom"] < 1.5)
 ][["candidate_id", "composition", "screening_score", "synthesis_route", "structure_path"]]
 print(promising.head())
 

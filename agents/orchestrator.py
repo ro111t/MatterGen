@@ -72,7 +72,7 @@ class OrchestratorAgent:
             principles = self.career_memory.get_relevant_principles(
                 domain=objective.domain,
                 property_target=list(objective.target_properties.keys())[0]
-                    if objective.target_properties else 'stability'
+                    if objective.target_properties else 'screening_quality'
             )
             cross_domain = self.career_memory.get_cross_domain_insights(
                 target_domain=objective.domain
@@ -113,17 +113,17 @@ Based on this, design the generation strategy for the next batch.
 Respond ONLY with JSON with these keys:
 - elements: list of element symbols to focus on (3-5 elements)
 - num_candidates: integer (suggest 10-30 for local testing)
-- screening_criteria: dict with max_formation_energy, max_forces, min_stability
+- screening_criteria: dict with max_force_ev_per_angstrom and optional max_stress_gpa
 - diversity_weight: float 0-1
 - rationale: one sentence explanation
 - hypothesis: one testable scientific hypothesis for this iteration
 
 Example:
 {{"elements": ["Li", "P", "S", "Cl"], "num_candidates": 20,
-  "screening_criteria": {{"max_formation_energy": 2.0, "max_forces": 1.0}},
+  "screening_criteria": {{"max_force_ev_per_angstrom": 1.0, "max_stress_gpa": 5.0}},
   "diversity_weight": 0.4,
   "rationale": "Argyrodite Li-P-S-Cl space has strong literature support.",
-  "hypothesis": "Cl substitution in Li6PS5X improves stability scores above 15."}}"""
+  "hypothesis": "Cl substitution changes the fraction of geometrically plausible generated structures."}}"""
 
         strategy = self._call_llm_for_strategy(prompt)
         strategy = self._validate_strategy(strategy, objective, recommendations=recommendations)
@@ -156,14 +156,13 @@ Example:
             rate = batch_results.get('screening_rate', batch_results.get('success_rate', 0.0))
             return (
                 f"Generated {n_gen} candidates, {n_scr} passed screening "
-                f"({rate:.1%} pass rate). "
-                f"Avg stability: {batch_results.get('avg_stability', 0):.3f} eV/atom."
+                f"({rate:.1%} pass rate). Thermodynamic metrics are unavailable."
             )
 
         prompt = f"""Analyze these materials discovery results briefly (2-3 sentences):
 - Generated: {batch_results.get('num_generated', 0)} candidates
 - Passed screening: {batch_results.get('num_passed', batch_results.get('num_screened', 0))} ({batch_results.get('screening_rate', batch_results.get('success_rate', 0.0)):.1%})
-- Avg stability: {batch_results.get('avg_stability', 0):.3f} eV/atom
+- Thermodynamic metrics: unavailable until a reference-set calculation is configured
 - Successful: {batch_results.get('num_successful', 0)}
 
 Focus on: what worked, what failed, one concrete recommendation."""
@@ -217,7 +216,7 @@ Focus on: what worked, what failed, one concrete recommendation."""
         principles = self.career_memory.get_relevant_principles(
             domain=objective.domain,
             property_target=list(objective.target_properties.keys())[0]
-                if objective.target_properties else 'stability'
+                if objective.target_properties else 'screening_quality'
         )
         if principles:
             context += "Known principles:\n"
@@ -294,13 +293,11 @@ Respond ONLY with JSON with keys:
             'elements': ['Li', 'P', 'S', 'O'],
             'num_candidates': 15,
             'screening_criteria': {
-                'max_formation_energy': 5.0,
-                'max_forces': 500.0,
-                'min_stability': -20.0,
+                'max_force_ev_per_angstrom': 500.0,
             },
             'diversity_weight': 0.4,
             'rationale': 'Default Li-P-S-O space for solid electrolytes.',
-            'hypothesis': 'Li-P-S compositions with low formation energy will pass screening.'
+            'hypothesis': 'Li-P-S compositions will produce distinct geometric screening yields.'
         }
         
     def _validate_strategy(self, strategy: Dict[str, Any],
@@ -325,9 +322,12 @@ Respond ONLY with JSON with keys:
         # Generated structures are unrelaxed, so CHGNet will report large forces.
         # Enforce lenient screening defaults so candidates reach validation.
         criteria = strategy.get('screening_criteria', {})
-        criteria['max_formation_energy'] = max(float(criteria.get('max_formation_energy', 5.0)), 5.0)
-        criteria['max_forces'] = max(float(criteria.get('max_forces', 500.0)), 100.0)
-        criteria['min_stability'] = min(float(criteria.get('min_stability', -20.0)), -10.0)
+        # Raw model energy is diagnostic-only until a thermodynamic reference
+        # set is configured; never inject an energy threshold into screening.
+        criteria.pop('max_predicted_energy_per_atom_ev', None)
+        criteria['max_force_ev_per_angstrom'] = max(
+            float(criteria.get('max_force_ev_per_angstrom', 500.0)), 100.0
+        )
         strategy['screening_criteria'] = criteria
 
         return strategy

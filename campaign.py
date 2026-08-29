@@ -33,6 +33,16 @@ from agents.provenance import (
     RunManifest,
     extract_candidate_id,
 )
+from agents.integrity import (
+    SCREENING_ENERGY_KEY,
+    VALIDATION_ENERGY_KEY,
+    RunMode,
+    ScientificValidity,
+    ScientificPreflightError,
+    build_scientific_preflight,
+    normalize_run_mode,
+    assert_schema_v2_compatible,
+)
 
 
 @dataclass
@@ -57,6 +67,18 @@ class CampaignConfig:
     mattergen_batch_size: int = 16
     mattergen_sampling_config_path: Optional[str] = None
     mattergen_sampling_config_name: str = "default"
+    # Scientific execution boundary.  Development remains the backwards-
+    # compatible default; research is fail-closed until all capabilities are
+    # explicitly configured.
+    run_mode: RunMode = RunMode.DEVELOPMENT
+    validation_calculator: Any = "mock"
+    synthesis_mode: str = "mock"
+    require_thermodynamics: bool = True
+    thermodynamics_backend: Optional[str] = None
+    thermodynamics_available: bool = False
+
+    def __post_init__(self) -> None:
+        self.run_mode = normalize_run_mode(self.run_mode)
 
 
 class MaterialsDiscoveryCampaign:
@@ -66,9 +88,26 @@ class MaterialsDiscoveryCampaign:
 
     def __init__(self, config: CampaignConfig):
         self.config = config
+        self.config.run_mode = normalize_run_mode(self.config.run_mode)
         self.iteration = 0
         self.results_history = []
         self.campaign_id = ""
+
+        # Build the execution boundary before opening persistent memory or
+        # creating output artifacts.  In research mode each component is
+        # initialized strictly and all failures are reported together.
+        if self.config.run_mode == RunMode.RESEARCH:
+            self._initialize_components_research()
+            self._run_research_preflight()
+        else:
+            self.generator = self._init_generator()
+            self.screener = self._init_screener()
+            self.validator = self._init_validator()
+            self.synthesis = self._init_synthesis_agent()
+            self.analyzer = self._init_analysis_agent()
+            self.strategy = self._init_strategy_agent()
+            self.requested_backends = self._requested_backend_metadata()
+            self.actual_backends = self._actual_backend_metadata()
 
         # Career memory — persists across ALL campaigns
         if config.use_career_memory:
@@ -80,12 +119,6 @@ class MaterialsDiscoveryCampaign:
             career_memory=self.career_memory,
             api_key=os.environ.get('OPENAI_API_KEY')
         )
-        self.generator = self._init_generator()
-        self.screener = self._init_screener()
-        self.validator = self._init_validator()
-        self.synthesis = self._init_synthesis_agent()
-        self.analyzer = self._init_analysis_agent()
-        self.strategy = self._init_strategy_agent()
         self.current_recommendations: Optional[Dict[str, Any]] = None
         self.distiller = ExperienceDistiller(
             career_memory=self.career_memory,
@@ -109,6 +142,11 @@ class MaterialsDiscoveryCampaign:
                 'mattergen_model_path': self.config.mattergen_model_path,
                 'mattergen_sampling_config_path': self.config.mattergen_sampling_config_path,
                 'mattergen_sampling_config_name': self.config.mattergen_sampling_config_name,
+                'run_mode': self.config.run_mode.value,
+                'validation_calculator': self._requested_validation_backend(),
+                'synthesis_mode': self.config.synthesis_mode,
+                'require_thermodynamics': self.config.require_thermodynamics,
+                'thermodynamics_backend': self.config.thermodynamics_backend,
                 'use_validation': self.config.use_validation,
                 'validation_top_k': self.config.validation_top_k,
                 'use_synthesis': self.config.use_synthesis,
@@ -117,7 +155,96 @@ class MaterialsDiscoveryCampaign:
             },
             objective=self.config.objective.target_properties,
             constraints=self.config.objective.constraints,
+            run_mode=self.config.run_mode.value,
+            scientific_validity=(
+                ScientificValidity.RESEARCH_VALID.value
+                if self.config.run_mode == RunMode.RESEARCH
+                else ScientificValidity.DEMO_ONLY.value
+            ),
+            requested_backends=self.requested_backends,
+            actual_backends=self.actual_backends,
         )
+
+    def _requested_validation_backend(self) -> str:
+        """Stable metadata label for a configured validation backend."""
+        calculator = self.config.validation_calculator
+        return str(calculator) if isinstance(calculator, str) else "ase_calculator_object"
+
+    def _requested_backend_metadata(self) -> Dict[str, Any]:
+        """Describe requested scientific components before initialization."""
+        return {
+            "generation": "mattergen" if self.config.use_mattergen else "pymatgen_mock",
+            "screening": "chgnet",
+            "validation": self._requested_validation_backend() if self.config.use_validation else "disabled",
+            "synthesis": self.config.synthesis_mode if self.config.use_synthesis else "disabled",
+            "thermodynamics": (
+                self.config.thermodynamics_backend
+                if self.config.thermodynamics_backend
+                else ("required" if self.config.require_thermodynamics else "not_required")
+            ),
+        }
+
+    def _actual_backend_metadata(self) -> Dict[str, Any]:
+        """Read actual component identities without inferring scientific validity."""
+        generator_backend = getattr(self.generator, "backend_name", None)
+        screener_backend = getattr(self.screener, "last_backend_used", None)
+        if screener_backend in {None, "uninitialized"}:
+            screener_backend = "chgnet" if getattr(self.screener, "chgnet", None) is not None else "heuristic"
+        validator_info = self.validator.get_backend_info() if hasattr(self.validator, "get_backend_info") else {}
+        validation_backend = (
+            "disabled" if not self.config.use_validation
+            else validator_info.get("backend_type") or getattr(self.validator, "calculator_name", None)
+        )
+        synthesis_backend = "disabled" if not self.config.use_synthesis else getattr(self.synthesis, "mode", self.config.synthesis_mode)
+        return {
+            "generation": generator_backend or "unavailable",
+            "screening": screener_backend or "unavailable",
+            "validation": validation_backend or "unavailable",
+            "synthesis": synthesis_backend,
+            "thermodynamics": "configured" if self.config.thermodynamics_available else "not_configured",
+        }
+
+    def _initialize_components_research(self) -> None:
+        """Initialize all research components while collecting failures."""
+        self.requested_backends = self._requested_backend_metadata()
+        self._component_init_errors: List[str] = []
+
+        def init(name: str, factory: Any, fallback: Any = None) -> Any:
+            try:
+                return factory()
+            except Exception as exc:
+                self._component_init_errors.append(f"{name}: {exc}")
+                return fallback
+
+        self.generator = init("generation", self._init_generator)
+        self.screener = init("screening", self._init_screener)
+        self.validator = (
+            init("validation", self._init_validator)
+            if self.config.use_validation else None
+        )
+        self.synthesis = (
+            init("synthesis", self._init_synthesis_agent)
+            if self.config.use_synthesis else None
+        )
+        # Analysis and strategy do not provide scientific evidence, but keep
+        # construction consistent for future successful research runs.
+        self.analyzer = self._init_analysis_agent()
+        self.strategy = self._init_strategy_agent()
+        self.actual_backends = self._actual_backend_metadata()
+
+    def _run_research_preflight(self) -> None:
+        """Apply the reusable fail-closed research gate."""
+        report = build_scientific_preflight(
+            run_mode=self.config.run_mode,
+            requested_backends=self.requested_backends,
+            actual_backends=self.actual_backends,
+            require_thermodynamics=self.config.require_thermodynamics,
+            thermodynamics_available=self.config.thermodynamics_available,
+        )
+        if self._component_init_errors:
+            report.errors = self._component_init_errors + report.errors
+        if not report.valid:
+            raise ScientificPreflightError(report)
         
     def run_campaign(self) -> Dict[str, Any]:
         """Execute the full discovery campaign with career memory and provenance tracking."""
@@ -241,7 +368,9 @@ class MaterialsDiscoveryCampaign:
             target_properties=self.config.objective.target_properties,
             deduplicate=False,
         )
-        screener_backend = "chgnet" if getattr(self.screener, "chgnet", None) is not None else "heuristic"
+        screener_backend = getattr(self.screener, "last_backend_used", None)
+        if not screener_backend or screener_backend == "uninitialized":
+            screener_backend = "chgnet" if getattr(self.screener, "chgnet", None) is not None else "heuristic"
         self.provenance.record_screening(
             screening_results=screened,
             criteria=screening_criteria,
@@ -251,7 +380,7 @@ class MaterialsDiscoveryCampaign:
         n_pass = sum(1 for _, r in screened if r.passes_filters)
         scores = [r.score for _, r in screened]
         best_score = max(scores) if scores else 0.0
-        avg_stability = sum(r.predictions.get('stability', 0) for _, r in screened) / max(len(screened), 1)
+        # Raw per-atom model energy is retained in provenance for audit only.
         self._log(f"  Screened: {len(screened)} total, {n_pass} passed filters")
         self._log(f"  Best score: {best_score:.3f}")
 
@@ -268,13 +397,8 @@ class MaterialsDiscoveryCampaign:
                 self.provenance.record_validation(validation_results, iteration=self.iteration)
                 n_converged = sum(1 for v in validation_results if v.converged)
                 total_cost = sum(v.cost_hours for v in validation_results)
-                best_validated = max(
-                    (v.properties.get('stability', float('-inf')) for v in validation_results),
-                    default=0.0
-                )
                 self._log(f"  Validated: {len(validation_results)} structures, {n_converged} converged")
                 self._log(f"  Validation cost: {total_cost:.1f} compute-hours")
-                self._log(f"  Best validated stability: {best_validated:.3f} eV/atom")
             else:
                 self._log("  No candidates passed screening filters; skipping validation.")
         else:
@@ -402,11 +526,6 @@ class MaterialsDiscoveryCampaign:
 
         n_converged = sum(1 for v in validation_results if v.converged)
         total_cost = sum(v.cost_hours for v in validation_results)
-        best_validated = max(
-            (v.properties.get('stability', float('-inf')) for v in validation_results),
-            default=0.0
-        )
-
         n_synthesis_feasible = sum(1 for s in synthesis_results if s.feasible)
         avg_synthesis_feasibility = sum(s.feasibility_score for s in synthesis_results) / max(len(synthesis_results), 1)
         best_synthesis = max(
@@ -422,11 +541,10 @@ class MaterialsDiscoveryCampaign:
             'success_rate': n_pass / max(len(screened), 1),
             'screening_rate': n_pass / max(len(screened), 1),
             'best_score': best_score,
-            'avg_stability': avg_stability,
+            'thermodynamics_metrics_available': False,
             'num_validated': len(validation_results),
             'num_converged': n_converged,
             'validation_cost_hours': total_cost,
-            'best_validated_stability': best_validated,
             'num_synthesis_assessed': len(synthesis_results),
             'num_synthesis_feasible': n_synthesis_feasible,
             'avg_synthesis_feasibility': avg_synthesis_feasibility,
@@ -564,6 +682,15 @@ class MaterialsDiscoveryCampaign:
             'elapsed_time_seconds': elapsed_time,
             'generation_backend': backend_name,
             'generation_backend_counts': backend_counts,
+            'run_mode': self.config.run_mode.value,
+            'scientific_validity': (
+                ScientificValidity.RESEARCH_VALID.value
+                if self.config.run_mode == RunMode.RESEARCH
+                else ScientificValidity.DEMO_ONLY.value
+            ),
+            'thermodynamics_metrics_available': False,
+            'requested_backends': self.requested_backends,
+            'actual_backends': self.actual_backends,
             'mattergen_pretrained': (
                 self.config.mattergen_pretrained if 'mattergen' in backend_counts else None
             ),
@@ -576,7 +703,6 @@ class MaterialsDiscoveryCampaign:
             'total_synthesis_assessed': stats['total_synthesis_assessed'],
             'total_synthesis_feasible': stats['total_synthesis_feasible'],
             'best_score_ever': stats['best_score_ever'],
-            'best_validated_stability_ever': stats['best_validated_stability_ever'],
             'best_synthesis_feasibility_ever': stats['best_synthesis_feasibility_ever'],
             'principles_written_to_career': total_principles,
             'top_candidates': top_candidates,
@@ -620,6 +746,10 @@ class MaterialsDiscoveryCampaign:
             data = json.load(f)
 
         manifest = RunManifest.from_dict(data)
+        # A v1 manifest may be parsed for audit, but cannot be executed as a
+        # v2 scientific campaign.  This preserves the original artifact and
+        # prevents legacy energy semantics entering new retrieval/statistics.
+        assert_schema_v2_compatible(data, context="reproduction manifest")
         out_dir = Path(output_dir).resolve() if output_dir else manifest_file.parent / "reproduced"
 
         # Verify manifest integrity hash if present
@@ -658,6 +788,12 @@ class MaterialsDiscoveryCampaign:
             mattergen_batch_size=cfg_data.get('mattergen_batch_size', 16),
             mattergen_sampling_config_path=cfg_data.get('mattergen_sampling_config_path', None),
             mattergen_sampling_config_name=cfg_data.get('mattergen_sampling_config_name', 'default'),
+            run_mode=cfg_data.get('run_mode', manifest.run_mode),
+            validation_calculator=cfg_data.get('validation_calculator', 'mock'),
+            synthesis_mode=cfg_data.get('synthesis_mode', 'mock'),
+            require_thermodynamics=cfg_data.get('require_thermodynamics', True),
+            thermodynamics_backend=cfg_data.get('thermodynamics_backend'),
+            thermodynamics_available=cfg_data.get('thermodynamics_available', False),
             verbose=True,
         )
 
@@ -697,19 +833,27 @@ class MaterialsDiscoveryCampaign:
             mattergen_batch_size=self.config.mattergen_batch_size,
             mattergen_sampling_config_path=self.config.mattergen_sampling_config_path,
             mattergen_sampling_config_name=self.config.mattergen_sampling_config_name,
+            run_mode=self.config.run_mode,
         )
 
     def _init_screener(self):
         """Initialize screening agent with real CHGNet."""
-        return ScreeningAgent()
+        return ScreeningAgent(run_mode=self.config.run_mode)
 
     def _init_validator(self):
         """Initialize validation agent (mock DFT by default)."""
-        return ValidationAgent(calculator="mock", n_workers=1)
+        return ValidationAgent(
+            calculator=self.config.validation_calculator,
+            n_workers=1,
+            run_mode=self.config.run_mode,
+        )
 
     def _init_synthesis_agent(self):
         """Initialize synthesis feasibility agent."""
-        return SynthesisFeasibilityAgent(mode="mock")
+        return SynthesisFeasibilityAgent(
+            mode=self.config.synthesis_mode,
+            run_mode=self.config.run_mode,
+        )
 
     def _init_strategy_agent(self):
         """Initialize adaptive strategy agent."""
@@ -717,7 +861,11 @@ class MaterialsDiscoveryCampaign:
 
     def _init_analysis_agent(self):
         """Initialize ML-vs-DFT analysis agent."""
-        return AnalysisAgent(properties_to_compare=["formation_energy", "energy", "stability", "forces"])
+        return AnalysisAgent(properties_to_compare=[
+            "predicted_energy_per_atom_ev",
+            "energy_per_atom_ev",
+            "max_force_ev_per_angstrom",
+        ])
 
 
 def main():
@@ -735,8 +883,10 @@ def main():
     parser.add_argument('--no-validation', action='store_true')
     parser.add_argument('--validation-top-k', type=int, default=5)
     parser.add_argument('--no-synthesis', action='store_true')
+    parser.add_argument('--run-mode', choices=[mode.value for mode in RunMode], default=RunMode.DEVELOPMENT.value,
+                        help='Execution boundary: development permits deterministic mocks; research fails closed on missing scientific backends')
     parser.add_argument('--use-mattergen', action='store_true',
-                        help='Use the Microsoft MatterGen diffusion model for generation (falls back to mock if unavailable)')
+                        help='Use the Microsoft MatterGen diffusion model for generation')
     parser.add_argument('--mattergen-pretrained', type=str, default='mattergen_base',
                         help='MatterGen pretrained checkpoint name or "chemical_system" for element-conditioned generation')
     parser.add_argument('--mattergen-model-path', type=str, default=None,
@@ -759,7 +909,7 @@ def main():
         return
 
     objective = CampaignObjective(
-        target_properties={'stability': -0.1, 'formation_energy': -2.0},
+        target_properties={},
         constraints={'elements': ['Li', 'P', 'S', 'O', 'Cl'], 'max_atoms': 20},
         success_criteria={'min_score': 999.0},
         domain=args.domain,
@@ -785,6 +935,7 @@ def main():
         mattergen_batch_size=args.mattergen_batch_size,
         mattergen_sampling_config_path=args.mattergen_sampling_config_path,
         mattergen_sampling_config_name=args.mattergen_sampling_config_name,
+        run_mode=args.run_mode,
     )
 
     campaign = MaterialsDiscoveryCampaign(config)
