@@ -70,16 +70,20 @@ def test_research_components_fail_closed():
     with pytest.raises(RuntimeError, match="Synthesis|development-only"):
         SynthesisFeasibilityAgent(mode="mock", run_mode="research")
 
-    # CHGNet may be installed in some test environments, but a non-pymatgen
-    # candidate still cannot be heuristically substituted in research mode.
+    # CHGNet may be installed in some test environments.  A composition-only
+    # dictionary is not a periodic structure and must fail geometry validation
+    # before prediction, rather than being heuristically substituted.
     if ScreeningAgent.__module__:
         try:
             screener = ScreeningAgent(run_mode="research")
         except RuntimeError:
             pass
         else:
-            with pytest.raises(RuntimeError, match="CHGNet"):
-                screener.screen_batch([{"composition": "LiPS"}], criteria={})
+            calls = []
+            screener._predict = lambda *args: calls.append(args)
+            results = screener.screen_batch([{"composition": "LiPS"}], criteria={})
+            assert calls == []
+            assert results[0][1].geometry_failure_code == "INVALID_GEOMETRY"
 
 
 def test_campaign_research_preflight_reports_missing_components_without_artifacts(tmp_path):
@@ -90,6 +94,8 @@ def test_campaign_research_preflight_reports_missing_components_without_artifact
                 objective=_objective(),
                 output_dir=tmp_path,
                 run_mode="research",
+                proposal_budget=1,
+                oracle_budget=1,
                 use_mattergen=False,
                 use_validation=False,
                 use_synthesis=False,

@@ -55,6 +55,17 @@ with st.sidebar:
     candidates_per_iteration = st.number_input(
         "Candidates per iteration", value=15, min_value=1, step=1
     )
+    proposal_budget = st.number_input(
+        "Proposal budget (paper default 400)", value=400, min_value=1, step=1,
+        help="Every generated candidate consumes one proposal slot.",
+    )
+    oracle_budget = st.number_input(
+        "Oracle budget (paper default 200)", value=200, min_value=1, step=1,
+        help="Every geometrically valid candidate submitted to CHGNet consumes one oracle slot, including cache hits.",
+    )
+    geometry_min_distance = st.number_input(
+        "Minimum periodic distance (Å)", value=0.8, min_value=0.001, step=0.1,
+    )
     use_career_memory = st.checkbox("Use career memory", value=True)
     run_mode = st.selectbox(
         "Run mode", options=["development", "research"], index=0,
@@ -116,6 +127,9 @@ def _run_campaign_ui(
     max_atoms: int,
     iterations: int,
     candidates_per_iteration: int,
+    proposal_budget: int,
+    oracle_budget: int,
+    geometry_min_distance: float,
     use_career_memory: bool,
     run_mode: str,
     use_validation: bool,
@@ -150,6 +164,9 @@ def _run_campaign_ui(
         validation_top_k=validation_top_k,
         use_synthesis=use_synthesis,
         num_candidates=candidates_per_iteration,
+        proposal_budget=proposal_budget,
+        oracle_budget=oracle_budget,
+        geometry_min_distance=geometry_min_distance,
         use_mattergen=use_mattergen,
         mattergen_pretrained=mattergen_pretrained,
         mattergen_sampling_config_name=mattergen_sampling_config_name,
@@ -174,6 +191,9 @@ if run_button:
             max_atoms=max_atoms,
             iterations=iterations,
             candidates_per_iteration=candidates_per_iteration,
+            proposal_budget=proposal_budget,
+            oracle_budget=oracle_budget,
+            geometry_min_distance=geometry_min_distance,
             use_career_memory=use_career_memory,
             run_mode=run_mode,
             use_validation=use_validation,
@@ -208,6 +228,17 @@ if run_button:
     col6.metric("Converged", results.get("total_converged", 0))
     col7.metric("Synthesis Feasible", results.get("total_synthesis_feasible", 0))
     col8.metric("Thermodynamics", "pending hull oracle")
+
+    st.subheader("Geometry and Oracle Budget")
+    budget_cols = st.columns(6)
+    budget_cols[0].metric("Proposals", results.get("proposals_generated", results.get("total_generated", 0)))
+    budget_cols[1].metric("Geometry valid", results.get("geometry_valid", 0))
+    budget_cols[2].metric("Invalid geometry", results.get("invalid_geometry", 0))
+    budget_cols[3].metric("Oracle evaluations", results.get("oracle_evaluations", 0))
+    budget_cols[4].metric("Proposal remaining", results.get("proposal_budget_remaining", "unlimited"))
+    budget_cols[5].metric("Oracle remaining", results.get("oracle_budget_remaining", "unlimited"))
+    if results.get("termination_reason"):
+        st.caption(f"Termination: {results['termination_reason']}")
 
     # Load the latest checkpoint for per-iteration details
     output_dir = Path(f"./campaigns/{domain}")

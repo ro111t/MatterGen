@@ -43,6 +43,8 @@ from agents.integrity import (
     normalize_run_mode,
     assert_schema_v2_compatible,
 )
+from agents.geometry import DEFAULT_MIN_DISTANCE_ANGSTROM, GeometryValidator
+from agents.budget import DualBudgetTracker
 
 
 @dataclass
@@ -76,9 +78,40 @@ class CampaignConfig:
     require_thermodynamics: bool = True
     thermodynamics_backend: Optional[str] = None
     thermodynamics_available: bool = False
+    # Resource accounting.  ``None`` keeps the existing unlimited development
+    # behavior; research runs must provide explicit positive limits.
+    proposal_budget: Optional[int] = None
+    oracle_budget: Optional[int] = None
+    geometry_min_distance: float = DEFAULT_MIN_DISTANCE_ANGSTROM
+    geometry_minimum_distance: Optional[float] = None
+    # Common aliases accepted for JSON/CLI-era callers.
+    min_distance: Optional[float] = None
+    minimum_distance: Optional[float] = None
+    min_distance_angstrom: Optional[float] = None
 
     def __post_init__(self) -> None:
         self.run_mode = normalize_run_mode(self.run_mode)
+        for name in ("proposal_budget", "oracle_budget"):
+            value = getattr(self, name)
+            if value is not None and (isinstance(value, bool) or not isinstance(value, int) or value <= 0):
+                raise ValueError(f"{name} must be a positive integer when supplied")
+        if self.run_mode == RunMode.RESEARCH:
+            missing = [name for name in ("proposal_budget", "oracle_budget") if getattr(self, name) is None]
+            if missing:
+                raise ValueError("Research mode requires explicit positive proposal_budget and oracle_budget")
+        selected_distance = self.minimum_distance if self.minimum_distance is not None else self.min_distance
+        if self.min_distance_angstrom is not None:
+            selected_distance = self.min_distance_angstrom
+        if self.geometry_minimum_distance is not None:
+            selected_distance = self.geometry_minimum_distance
+        if selected_distance is not None:
+            self.geometry_min_distance = selected_distance
+        try:
+            self.geometry_min_distance = float(self.geometry_min_distance)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("geometry_min_distance must be finite and positive") from exc
+        if not __import__("math").isfinite(self.geometry_min_distance) or self.geometry_min_distance <= 0:
+            raise ValueError("geometry_min_distance must be finite and positive")
 
 
 class MaterialsDiscoveryCampaign:
@@ -89,9 +122,17 @@ class MaterialsDiscoveryCampaign:
     def __init__(self, config: CampaignConfig):
         self.config = config
         self.config.run_mode = normalize_run_mode(self.config.run_mode)
+        self.budget_tracker = DualBudgetTracker(
+            proposal_budget=self.config.proposal_budget,
+            oracle_budget=self.config.oracle_budget,
+        )
+        self.geometry_validator = GeometryValidator(
+            min_distance=self.config.geometry_min_distance,
+        )
         self.iteration = 0
         self.results_history = []
         self.campaign_id = ""
+        self.termination_reason: Optional[str] = None
 
         # Build the execution boundary before opening persistent memory or
         # creating output artifacts.  In research mode each component is
@@ -152,6 +193,9 @@ class MaterialsDiscoveryCampaign:
                 'use_synthesis': self.config.use_synthesis,
                 'num_candidates': self.config.num_candidates,
                 'master_seed': getattr(self.config, "master_seed", 42),
+                'proposal_budget': self.config.proposal_budget,
+                'oracle_budget': self.config.oracle_budget,
+                'geometry_min_distance': self.config.geometry_min_distance,
             },
             objective=self.config.objective.target_properties,
             constraints=self.config.objective.constraints,
@@ -163,6 +207,8 @@ class MaterialsDiscoveryCampaign:
             ),
             requested_backends=self.requested_backends,
             actual_backends=self.actual_backends,
+            proposal_budget=self.config.proposal_budget,
+            oracle_budget=self.config.oracle_budget,
         )
 
     def _requested_validation_backend(self) -> str:
@@ -268,6 +314,7 @@ class MaterialsDiscoveryCampaign:
 
         self.provenance.campaign_id = self.campaign_id
         self.provenance.manifest.campaign_id = self.campaign_id
+        self.provenance.sync_budget(self.budget_tracker)
         self.provenance.write_manifest()
 
         self._log(f"\nStarting campaign: {self.config.name}  [id={self.campaign_id}]")
@@ -277,6 +324,14 @@ class MaterialsDiscoveryCampaign:
         start_time = time.time()
 
         while self.iteration < objective.max_iterations:
+            if self.budget_tracker.proposal_budget_remaining == 0:
+                self.termination_reason = "PROPOSAL_BUDGET_EXHAUSTED"
+                self.budget_tracker.set_termination(self.termination_reason)
+                break
+            if self.budget_tracker.oracle_budget_remaining == 0:
+                self.termination_reason = "ORACLE_BUDGET_EXHAUSTED"
+                self.budget_tracker.set_termination(self.termination_reason)
+                break
             self._log(f"\n{'='*60}")
             self._log(f"ITERATION {self.iteration}")
             self._log(f"{'='*60}")
@@ -286,6 +341,9 @@ class MaterialsDiscoveryCampaign:
 
             should_stop, reason = self._check_termination(iteration_result)
             if should_stop:
+                self.termination_reason = reason
+                self.budget_tracker.set_termination(reason)
+                self.provenance.sync_budget(self.budget_tracker, iteration=self.iteration, termination_reason=reason)
                 self._log(f"\nCampaign terminated: {reason}")
                 break
 
@@ -293,6 +351,12 @@ class MaterialsDiscoveryCampaign:
                 self._save_checkpoint()
 
             self.iteration += 1
+
+        if self.termination_reason is None:
+            # Reaching max_iterations is a clean, explicit termination state.
+            self.termination_reason = "MAX_ITERATIONS_REACHED"
+            self.budget_tracker.set_termination(self.termination_reason)
+        self.provenance.sync_budget(self.budget_tracker, termination_reason=self.termination_reason)
 
         elapsed_time = time.time() - start_time
         final_results = self._generate_final_report(elapsed_time)
@@ -305,6 +369,7 @@ class MaterialsDiscoveryCampaign:
         
     def _run_iteration(self) -> Dict[str, Any]:
         """Execute one iteration: plan → generate → screen → validate → synthesize → distill → report."""
+        budget_before = self.budget_tracker.to_dict()
 
         # 1. Plan with career memory warm-start and strategy-agent recommendations
         self._log("\n[1/6] Planning...")
@@ -336,12 +401,28 @@ class MaterialsDiscoveryCampaign:
             iter_seed = self.provenance.manifest.iteration_seeds[self.iteration]
         else:
             iter_seed = getattr(self.config, "master_seed", 42) + self.iteration
-        num_to_gen = strategy.get('num_candidates', self.config.num_candidates)
+        requested_num_to_gen = strategy.get('num_candidates', self.config.num_candidates)
+        try:
+            requested_num_to_gen = max(0, int(requested_num_to_gen))
+        except (TypeError, ValueError):
+            requested_num_to_gen = max(0, int(self.config.num_candidates))
+        num_to_gen = self.budget_tracker.generation_capacity(requested_num_to_gen)
         candidates = self.generator.generate_batch(
             elements=strategy.get('elements', ['Li', 'P', 'S', 'O']),
             num_candidates=num_to_gen,
             seed=iter_seed,
         )
+        # A backend that overproduces has already consumed proposal resources,
+        # so silently slicing would make the accounting non-auditable.  Abort
+        # explicitly; callers can inspect the backend error and retry with a
+        # corrected adapter.
+        candidates = list(candidates or [])
+        if len(candidates) > num_to_gen:
+            raise RuntimeError(
+                f"Generation backend returned {len(candidates)} candidates for a request of {num_to_gen}; "
+                "overproduction cannot be silently discarded under the proposal budget."
+            )
+        self.budget_tracker.record_proposals(len(candidates))
         generation_backend = self.generator.last_generation_backend or getattr(self.generator, "backend_name", "stub")
         self.provenance.register_generation(
             candidates=candidates,
@@ -352,12 +433,21 @@ class MaterialsDiscoveryCampaign:
             parameters={
                 'elements': strategy.get('elements', []),
                 'num_candidates': len(candidates),
+                'requested_num_candidates': requested_num_to_gen,
+                'proposal_budget_remaining': self.budget_tracker.proposal_budget_remaining,
             },
             model_name_or_path=self.config.mattergen_model_path if generation_backend == "mattergen" else None,
             checkpoint=self.config.mattergen_pretrained if generation_backend == "mattergen" else None,
         )
         self._log(f"  Generated: {len(candidates)} structures")
         self._log(f"  Generation backend: {generation_backend}")
+
+        if not candidates:
+            # Preserve a valid iteration record for an empty backend response;
+            # no screening/oracle call is made and the campaign can terminate
+            # deterministically.
+            self.provenance.sync_budget(self.budget_tracker, iteration=self.iteration)
+            return self._empty_iteration_result(generation_backend, strategy)
 
         # 3. Screen with CHGNet/M3GNet
         self._log("\n[3/6] Screening with ML Models...")
@@ -367,7 +457,9 @@ class MaterialsDiscoveryCampaign:
             criteria=screening_criteria,
             target_properties=self.config.objective.target_properties,
             deduplicate=False,
+            budget_tracker=self.budget_tracker,
         )
+        self.provenance.sync_budget(self.budget_tracker, iteration=self.iteration)
         screener_backend = getattr(self.screener, "last_backend_used", None)
         if not screener_backend or screener_backend == "uninitialized":
             screener_backend = "chgnet" if getattr(self.screener, "chgnet", None) is not None else "heuristic"
@@ -554,6 +646,18 @@ class MaterialsDiscoveryCampaign:
             'ml_dft_mae': analysis_result.ml_vs_dft_mae if analysis_result else {},
             'principles_written': distill_result['principles_written'],
         }
+        budget_after = self.budget_tracker.to_dict()
+        budget_iteration = {
+            key: (
+                budget_after[key] - budget_before[key]
+                if key in {"proposals_generated", "geometry_valid", "invalid_geometry", "oracle_evaluations", "oracle_cache_hits"}
+                else budget_after[key]
+            )
+            for key in budget_after
+        }
+        # Iteration counters are deltas; remaining capacities are post-iteration state.
+        insights.update(budget_iteration)
+        self.provenance.sync_budget(self.budget_tracker, iteration=self.iteration)
 
         # LLM interpretation
         report = self.orchestrator.interpret_results(insights)
@@ -612,13 +716,52 @@ class MaterialsDiscoveryCampaign:
                 'insights': analysis_result.insights if analysis_result else [],
             },
             'insights': insights,
-            'strategy': strategy
+            'strategy': strategy,
+            **budget_iteration,
+        }
+
+    def _empty_iteration_result(self, generation_backend: str, strategy: Dict[str, Any]) -> Dict[str, Any]:
+        """Return a schema-compatible iteration result for an empty generation batch."""
+        snapshot = self.budget_tracker.to_dict()
+        insights = {
+            "generation_backend": generation_backend,
+            "num_generated": 0,
+            "num_screened": 0,
+            "num_passed": 0,
+            "best_score": 0.0,
+            "thermodynamics_metrics_available": False,
+            "num_validated": 0,
+            "num_converged": 0,
+            "num_synthesis_feasible": 0,
+            "principles_written": 0,
+            **snapshot,
+        }
+        self.provenance.sync_budget(self.budget_tracker, iteration=self.iteration)
+        return {
+            "iteration": self.iteration,
+            "generation_backend": generation_backend,
+            "num_generated": 0,
+            "num_screened": 0,
+            "num_validated": 0,
+            "validation_results": [],
+            "synthesis_results": [],
+            "analysis": {},
+            "insights": insights,
+            "strategy": strategy,
+            **snapshot,
         }
 
     def _check_termination(self, iteration_result: Dict[str, Any]) -> tuple:
         """Check if campaign should stop."""
         insights = iteration_result.get('insights', {})
         best_score = insights.get('best_score', 0)
+
+        if self.budget_tracker.proposal_budget_remaining == 0:
+            return True, "PROPOSAL_BUDGET_EXHAUSTED"
+        if self.budget_tracker.oracle_budget_remaining == 0:
+            return True, "ORACLE_BUDGET_EXHAUSTED"
+        if iteration_result.get("num_generated", 0) == 0:
+            return True, "NO_CANDIDATES_GENERATED"
 
         min_score = self.config.objective.success_criteria.get('min_score', float('inf'))
         if best_score >= min_score:
@@ -641,7 +784,11 @@ class MaterialsDiscoveryCampaign:
             'config': {
                 'name': self.config.name,
                 'domain': self.config.objective.domain,
-            }
+                'proposal_budget': self.config.proposal_budget,
+                'oracle_budget': self.config.oracle_budget,
+                'geometry_min_distance': self.config.geometry_min_distance,
+            },
+            'budget': self.budget_tracker.to_dict(termination_reason=self.termination_reason),
         }
         checkpoint_path = self.config.output_dir / f"checkpoint_{self.iteration}.json"
         with open(checkpoint_path, 'w') as f:
@@ -650,6 +797,7 @@ class MaterialsDiscoveryCampaign:
 
     def _generate_final_report(self, elapsed_time: float) -> Dict[str, Any]:
         """Generate final report and persist to disk using ProvenanceTracker as single source of truth."""
+        self.provenance.sync_budget(self.budget_tracker, termination_reason=self.termination_reason)
         stats = self.provenance.finalize(status="completed")
         total_principles = sum(r['insights'].get('principles_written', 0) for r in self.results_history)
 
@@ -706,6 +854,16 @@ class MaterialsDiscoveryCampaign:
             'best_synthesis_feasibility_ever': stats['best_synthesis_feasibility_ever'],
             'principles_written_to_career': total_principles,
             'top_candidates': top_candidates,
+            'proposals_generated': self.budget_tracker.proposals_generated,
+            'geometry_valid': self.budget_tracker.geometry_valid,
+            'invalid_geometry': self.budget_tracker.invalid_geometry,
+            'oracle_evaluations': self.budget_tracker.oracle_evaluations,
+            'oracle_cache_hits': self.budget_tracker.oracle_cache_hits,
+            'proposal_budget': self.budget_tracker.proposal_budget,
+            'oracle_budget': self.budget_tracker.oracle_budget,
+            'proposal_budget_remaining': self.budget_tracker.proposal_budget_remaining,
+            'oracle_budget_remaining': self.budget_tracker.oracle_budget_remaining,
+            'termination_reason': self.termination_reason,
         }
 
         report_path = self.config.output_dir / f"report_{self.campaign_id}.json"
@@ -794,6 +952,12 @@ class MaterialsDiscoveryCampaign:
             require_thermodynamics=cfg_data.get('require_thermodynamics', True),
             thermodynamics_backend=cfg_data.get('thermodynamics_backend'),
             thermodynamics_available=cfg_data.get('thermodynamics_available', False),
+            proposal_budget=cfg_data.get('proposal_budget', manifest.proposal_budget),
+            oracle_budget=cfg_data.get('oracle_budget', manifest.oracle_budget),
+            geometry_min_distance=cfg_data.get(
+                'geometry_min_distance',
+                cfg_data.get('min_distance', DEFAULT_MIN_DISTANCE_ANGSTROM),
+            ),
             verbose=True,
         )
 
@@ -838,7 +1002,10 @@ class MaterialsDiscoveryCampaign:
 
     def _init_screener(self):
         """Initialize screening agent with real CHGNet."""
-        return ScreeningAgent(run_mode=self.config.run_mode)
+        return ScreeningAgent(
+            run_mode=self.config.run_mode,
+            geometry_validator=self.geometry_validator,
+        )
 
     def _init_validator(self):
         """Initialize validation agent (mock DFT by default)."""
@@ -878,6 +1045,12 @@ def main():
     parser.add_argument('--domain', default='li_solid_electrolyte')
     parser.add_argument('--iterations', type=int, default=3)
     parser.add_argument('--candidates', type=int, default=15)
+    parser.add_argument('--proposal-budget', type=int, default=None,
+                        help='Maximum generated proposals (paper default: 400; omitted means unlimited in development)')
+    parser.add_argument('--oracle-budget', type=int, default=None,
+                        help='Maximum geometrically valid oracle evaluations (paper default: 200; omitted means unlimited in development)')
+    parser.add_argument('--geometry-min-distance', '--min-distance', dest='geometry_min_distance', type=float, default=DEFAULT_MIN_DISTANCE_ANGSTROM,
+                        help='Absolute periodic minimum-distance threshold in Angstrom (default: 0.8)')
     parser.add_argument('--master-seed', type=int, default=42)
     parser.add_argument('--no-career-memory', action='store_true')
     parser.add_argument('--no-validation', action='store_true')
@@ -936,6 +1109,9 @@ def main():
         mattergen_sampling_config_path=args.mattergen_sampling_config_path,
         mattergen_sampling_config_name=args.mattergen_sampling_config_name,
         run_mode=args.run_mode,
+        proposal_budget=args.proposal_budget,
+        oracle_budget=args.oracle_budget,
+        geometry_min_distance=args.geometry_min_distance,
     )
 
     campaign = MaterialsDiscoveryCampaign(config)

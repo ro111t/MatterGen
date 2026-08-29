@@ -21,6 +21,12 @@ from agents.integrity import (
     normalize_run_mode,
     canonicalize_screening_predictions,
 )
+from agents.geometry import (
+    DEFAULT_MIN_DISTANCE_ANGSTROM,
+    GeometryValidationResult,
+    GeometryValidator,
+)
+from agents.budget import DualBudgetTracker
 
 try:
     from chgnet.model import CHGNet
@@ -55,12 +61,35 @@ class ScreeningResult:
     score_components: Dict[str, float] = field(default_factory=dict)
     backend: str = ""
     scientific_validity: str = "demo_only"
+    # Geometry/provenance fields are additive to schema-v2 and intentionally
+    # default to the historical screening behavior for direct callers.
+    geometry_valid: Optional[bool] = None
+    geometry_failure_code: Optional[str] = None
+    geometry_details: Dict[str, Any] = field(default_factory=dict)
+    provenance_stage: str = "screening"
+    oracle_evaluated: Optional[bool] = None
+    oracle_cache_hit: Optional[bool] = None
 
     def __post_init__(self) -> None:
         # Ensure explicitly constructed results use schema-v2 vocabulary.
-        self.predictions = canonicalize_screening_predictions(
-            self.predictions, backend=self.backend or "heuristic"
-        )
+        # Invalid geometry and budget-exhausted candidates must contain no
+        # synthetic energy/heuristic prediction at all.
+        if self.geometry_valid is False or self.geometry_failure_code in {
+            "INVALID_GEOMETRY", "ORACLE_BUDGET_EXHAUSTED", "PREDICTION_FAILED"
+        }:
+            self.predictions = {}
+        else:
+            self.predictions = canonicalize_screening_predictions(
+                self.predictions, backend=self.backend or "heuristic"
+            )
+
+    @property
+    def failure_code(self) -> Optional[str]:
+        return self.geometry_failure_code
+
+    @property
+    def details(self) -> Dict[str, Any]:
+        return self.geometry_details
 
 
 class ScreeningAgent:
@@ -69,11 +98,19 @@ class ScreeningAgent:
     Score is normalized 0-100; higher = better candidate.
     """
 
-    def __init__(self, run_mode: RunMode | str = RunMode.DEVELOPMENT, mode: Optional[str] = None):
+    def __init__(self, run_mode: RunMode | str = RunMode.DEVELOPMENT, mode: Optional[str] = None,
+                 min_distance: float = DEFAULT_MIN_DISTANCE_ANGSTROM,
+                 geometry_validator: Optional[GeometryValidator] = None,
+                 minimum_distance: Optional[float] = None):
         self.run_mode = normalize_run_mode(mode if mode is not None else run_mode)
         self.chgnet = None
         self.last_backend_used: str = "uninitialized"
         self.prediction_cache: Dict[str, Dict[str, float]] = {}
+        self.geometry_validator = geometry_validator or GeometryValidator(
+            min_distance=(minimum_distance if minimum_distance is not None else min_distance)
+        )
+        self.last_geometry_results: Dict[str, GeometryValidationResult] = {}
+        self.last_budget_snapshot: Dict[str, Any] = {}
         self._init_models()
 
     def _init_models(self):
@@ -104,6 +141,9 @@ class ScreeningAgent:
         target_properties: Optional[Dict[str, float]] = None,
         weights: Optional[Dict[str, float]] = None,
         deduplicate: bool = True,
+        budget_tracker: Optional[Any] = None,
+        oracle_budget_tracker: Optional[Any] = None,
+        oracle_budget: Optional[int] = None,
     ) -> List[Tuple[Any, ScreeningResult]]:
         """
         Screen all structures; return all results sorted by score (best first).
@@ -122,10 +162,93 @@ class ScreeningAgent:
         target_properties = target_properties or {}
         weights = dict(weights or DEFAULT_SCREENING_WEIGHTS)
 
+        # ``oracle_budget_tracker`` is a readable alias for integrations that
+        # pass only the oracle accounting object.  A campaign passes the dual
+        # tracker through ``budget_tracker``.
+        budget_tracker = budget_tracker or oracle_budget_tracker
+        if budget_tracker is None and oracle_budget is not None:
+            budget_tracker = DualBudgetTracker(oracle_budget=oracle_budget)
         raw_results = []
         for i, struct in enumerate(structures):
             struct_id = self._get_struct_id(struct, i)
-            predictions = self._predict(struct, struct_id)
+            geometry = self.geometry_validator.validate(struct)
+            self.last_geometry_results[struct_id] = geometry
+            if budget_tracker is not None:
+                budget_tracker.record_geometry(geometry.valid)
+
+            if not geometry.valid:
+                details = dict(geometry.details)
+                details.setdefault("geometry_code", geometry.code)
+                if geometry.minimum_distance is not None:
+                    details.setdefault("minimum_distance", geometry.minimum_distance)
+                if geometry.offending_pair is not None:
+                    details.setdefault("offending_pair", list(geometry.offending_pair))
+                reason = "INVALID_GEOMETRY"
+                if details:
+                    reason = f"{reason}: {details}"
+                raw_results.append((struct, ScreeningResult(
+                    structure_id=struct_id,
+                    predictions={},
+                    score=0.0,
+                    passes_filters=False,
+                    filter_reasons=["INVALID_GEOMETRY", reason],
+                    score_components={},
+                    backend="geometry_validation",
+                    scientific_validity=("research_valid" if self.run_mode == RunMode.RESEARCH else "demo_only"),
+                    geometry_valid=False,
+                    geometry_failure_code="INVALID_GEOMETRY",
+                    geometry_details=details,
+                    provenance_stage="geometry_validation",
+                    oracle_evaluated=False,
+                )))
+                continue
+
+            cache_hit = struct_id in self.prediction_cache
+            if budget_tracker is not None and not budget_tracker.admit_oracle(cache_hit=cache_hit):
+                raw_results.append((struct, ScreeningResult(
+                    structure_id=struct_id,
+                    predictions={},
+                    score=0.0,
+                    passes_filters=False,
+                    filter_reasons=["ORACLE_BUDGET_EXHAUSTED"],
+                    score_components={},
+                    backend="oracle_budget",
+                    scientific_validity=("research_valid" if self.run_mode == RunMode.RESEARCH else "demo_only"),
+                    geometry_valid=True,
+                    geometry_failure_code="ORACLE_BUDGET_EXHAUSTED",
+                    geometry_details={"oracle_budget_remaining": budget_tracker.oracle_budget_remaining},
+                    provenance_stage="oracle_budget",
+                    oracle_evaluated=False,
+                    oracle_cache_hit=cache_hit,
+                )))
+                continue
+
+            try:
+                predictions = self._predict(struct, struct_id)
+            except Exception as exc:
+                # Research mode remains fail-closed (the underlying _predict
+                # exception is part of Sprint 1's execution boundary).  In
+                # development, preserve candidate provenance without inventing
+                # a score when a caller's oracle actually fails.
+                if self.run_mode == RunMode.RESEARCH:
+                    raise
+                raw_results.append((struct, ScreeningResult(
+                    structure_id=struct_id,
+                    predictions={},
+                    score=0.0,
+                    passes_filters=False,
+                    filter_reasons=["PREDICTION_FAILED", str(exc)],
+                    score_components={},
+                    backend="prediction_failure",
+                    scientific_validity="demo_only",
+                    geometry_valid=True,
+                    geometry_failure_code="PREDICTION_FAILED",
+                    geometry_details={"error": str(exc)},
+                    provenance_stage="screening",
+                    oracle_evaluated=True,
+                    oracle_cache_hit=cache_hit,
+                )))
+                continue
             passes, reasons = self._apply_filters(predictions, criteria)
             score, components = self._calculate_score(predictions, target_properties, weights)
             raw_results.append((struct, ScreeningResult(
@@ -137,6 +260,11 @@ class ScreeningAgent:
                 score_components=components,
                 backend=self.last_backend_used,
                 scientific_validity=("research_valid" if self.run_mode == RunMode.RESEARCH else "demo_only"),
+                geometry_valid=True,
+                geometry_details=geometry.details,
+                provenance_stage="screening",
+                oracle_evaluated=True,
+                oracle_cache_hit=cache_hit,
             )))
 
         if deduplicate:
@@ -147,6 +275,9 @@ class ScreeningAgent:
         raw_results.sort(key=lambda x: x[1].score, reverse=True)
         for rank, (_, result) in enumerate(raw_results, start=1):
             result.rank = rank
+
+        if budget_tracker is not None and hasattr(budget_tracker, "to_dict"):
+            self.last_budget_snapshot = budget_tracker.to_dict()
 
         return raw_results
 
@@ -359,6 +490,10 @@ class ScreeningAgent:
 
         max_count = max(counts.values()) if counts else 1
         for struct, result in results:
+            # Invalid geometry and candidates denied an oracle slot retain an
+            # explicit score of zero; novelty must never resurrect them.
+            if result.geometry_valid is False or result.provenance_stage == "oracle_budget":
+                continue
             formula = self._get_composition_key(struct)
             rarity = 1.0 - (counts[formula] - 1) / max_count
             result.score_components['composition_novelty'] = round(rarity * 100.0, 3)

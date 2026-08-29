@@ -298,6 +298,15 @@ class CandidateRecord:
     screening_filter_reasons: List[str] = field(default_factory=list)
     screening_rank: Optional[int] = None
     screening_timestamp_iso: Optional[str] = None
+    # Geometry gate and oracle accounting (additive fields within schema 2.0.0)
+    geometry_valid: Optional[bool] = None
+    geometry_failure_code: Optional[str] = None
+    geometry_validation_details: Dict[str, Any] = field(default_factory=dict)
+    geometry_minimum_distance: Optional[float] = None
+    geometry_offending_pair: Optional[List[int]] = None
+    provenance_stage: Optional[str] = None
+    oracle_evaluated: Optional[bool] = None
+    oracle_cache_hit: Optional[bool] = None
 
     # Validation
     validation_calculator: Optional[str] = None
@@ -390,6 +399,14 @@ class CandidateRecord:
             "screening_max_force_ev_per_angstrom": self.screening_predictions.get(FORCE_KEY, ""),
             "screening_max_stress_gpa": self.screening_predictions.get(STRESS_KEY, ""),
             "screening_timestamp_iso": self.screening_timestamp_iso or "",
+            "geometry_valid": self.geometry_valid if self.geometry_valid is not None else "",
+            "geometry_failure_code": self.geometry_failure_code or "",
+            "geometry_validation_details": json.dumps(self.geometry_validation_details, sort_keys=True, default=str),
+            "geometry_minimum_distance": self.geometry_minimum_distance if self.geometry_minimum_distance is not None else "",
+            "geometry_offending_pair": ";".join(str(i) for i in (self.geometry_offending_pair or [])),
+            "provenance_stage": self.provenance_stage or "",
+            "oracle_evaluated": self.oracle_evaluated if self.oracle_evaluated is not None else "",
+            "oracle_cache_hit": self.oracle_cache_hit if self.oracle_cache_hit is not None else "",
             # Validation
             "validation_calculator": self.validation_calculator or "",
             "validation_converged": self.validation_converged if self.validation_converged is not None else "",
@@ -456,6 +473,19 @@ class RunManifest:
     total_candidates_generated: int = 0
     total_candidates_accepted: int = 0
     total_candidates_rejected: int = 0
+    # Campaign resource limits and deterministic event counters.  ``None``
+    # means unlimited, preserving development behavior from earlier sprints.
+    proposal_budget: Optional[int] = None
+    oracle_budget: Optional[int] = None
+    proposals_generated: int = 0
+    geometry_valid: int = 0
+    invalid_geometry: int = 0
+    oracle_evaluations: int = 0
+    oracle_cache_hits: int = 0
+    proposal_budget_remaining: Optional[int] = None
+    oracle_budget_remaining: Optional[int] = None
+    iteration_budget_counters: List[Dict[str, Any]] = field(default_factory=list)
+    termination_reason: Optional[str] = None
 
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)
@@ -534,6 +564,8 @@ class ProvenanceTracker:
         scientific_validity: Optional[str] = None,
         requested_backends: Optional[Dict[str, Any]] = None,
         actual_backends: Optional[Dict[str, Any]] = None,
+        proposal_budget: Optional[int] = None,
+        oracle_budget: Optional[int] = None,
     ):
         self.campaign_id = campaign_id
         self.campaign_name = campaign_name
@@ -580,12 +612,50 @@ class ProvenanceTracker:
             strategies=[],
             start_time_iso=_get_utc_now_iso(),
             status="running",
+            proposal_budget=proposal_budget,
+            oracle_budget=oracle_budget,
+            proposal_budget_remaining=proposal_budget,
+            oracle_budget_remaining=oracle_budget,
         )
 
     def write_manifest(self) -> Path:
         """Write current manifest state to manifest.json."""
         self.manifest.manifest_hash = self.manifest.compute_manifest_hash()
         return self.manifest.save(self.manifest_path)
+
+    def sync_budget(self, tracker: Any, *, iteration: Optional[int] = None,
+                    termination_reason: Optional[str] = None) -> Dict[str, Any]:
+        """Copy deterministic dual-budget counters into the manifest.
+
+        Keeping this update in the provenance owner ensures checkpoints and the
+        final manifest agree even when a screening backend is replaced in a
+        development test.
+        """
+        if tracker is None:
+            return {}
+        snapshot = tracker.to_dict(termination_reason=termination_reason) if hasattr(tracker, "to_dict") else dict(tracker)
+        for field_name in (
+            "proposal_budget", "oracle_budget", "proposals_generated", "geometry_valid",
+            "invalid_geometry", "oracle_evaluations", "oracle_cache_hits",
+            "proposal_budget_remaining", "oracle_budget_remaining",
+        ):
+            if field_name in snapshot:
+                setattr(self.manifest, field_name, snapshot[field_name])
+        if termination_reason is not None:
+            self.manifest.termination_reason = termination_reason
+        if iteration is not None:
+            entry = dict(snapshot)
+            entry["iteration"] = iteration
+            # A checkpoint/replay should contain one canonical snapshot per
+            # iteration, rather than duplicate updates from a caller.
+            self.manifest.iteration_budget_counters = [
+                e for e in self.manifest.iteration_budget_counters
+                if e.get("iteration") != iteration
+            ]
+            self.manifest.iteration_budget_counters.append(entry)
+            self.manifest.iteration_budget_counters.sort(key=lambda e: e.get("iteration", 0))
+        self.write_manifest()
+        return snapshot
 
     def record_strategy(self, iteration: int, strategy: Dict[str, Any]) -> None:
         """Record planned strategy for the iteration to ensure deterministic replay."""
@@ -803,21 +873,51 @@ class ProvenanceTracker:
                 self.records[cand_id] = record
 
             record.screening_backend = backend
-            record.screening_predictions = canonicalize_screening_predictions(
-                getattr(res, "predictions", {}) or {}, backend=backend
+            res_failure_code = (
+                getattr(res, "geometry_failure_code", None)
+                or getattr(res, "failure_code", None)
             )
+            if res_failure_code in {"INVALID_GEOMETRY", "ORACLE_BUDGET_EXHAUSTED", "PREDICTION_FAILED"}:
+                record.screening_predictions = {}
+            else:
+                record.screening_predictions = canonicalize_screening_predictions(
+                    getattr(res, "predictions", {}) or {}, backend=backend
+                )
             record.screening_score = getattr(res, "score", None)
             record.screening_score_components = getattr(res, "score_components", {}) or {}
             record.passes_screening_filters = getattr(res, "passes_filters", True)
             record.screening_filter_reasons = getattr(res, "filter_reasons", []) or []
             record.screening_rank = getattr(res, "rank", rank_idx)
             record.screening_timestamp_iso = now_iso
+            record.geometry_valid = getattr(res, "geometry_valid", None)
+            record.geometry_failure_code = (
+                res_failure_code
+            )
+            record.geometry_validation_details = (
+                getattr(res, "geometry_details", None)
+                or getattr(res, "details", None)
+                or {}
+            )
+            record.geometry_minimum_distance = record.geometry_validation_details.get("minimum_distance")
+            offending_pair = record.geometry_validation_details.get("offending_pair")
+            record.geometry_offending_pair = list(offending_pair) if offending_pair is not None else None
+            record.provenance_stage = getattr(res, "provenance_stage", "screening")
+            record.oracle_evaluated = getattr(res, "oracle_evaluated", None)
+            record.oracle_cache_hit = getattr(res, "oracle_cache_hit", None)
 
             if not record.passes_screening_filters:
                 record.status = CandidateStatus.REJECTED.value
-                record.rejection_stage = "screening"
+                if record.geometry_failure_code == "INVALID_GEOMETRY" or record.provenance_stage == "geometry_validation":
+                    record.rejection_stage = "geometry_validation"
+                elif record.geometry_failure_code == "ORACLE_BUDGET_EXHAUSTED" or record.provenance_stage == "oracle_budget":
+                    record.rejection_stage = "oracle_budget"
+                else:
+                    record.rejection_stage = "screening"
                 reasons_str = "; ".join(record.screening_filter_reasons) if record.screening_filter_reasons else "Failed screening criteria"
-                record.rejection_reason = f"Screening filter failed: {reasons_str}"
+                if record.geometry_failure_code in {"INVALID_GEOMETRY", "ORACLE_BUDGET_EXHAUSTED", "PREDICTION_FAILED"}:
+                    record.rejection_reason = f"{record.geometry_failure_code}: {reasons_str}"
+                else:
+                    record.rejection_reason = f"Screening filter failed: {reasons_str}"
                 record.decision_timestamp_iso = now_iso
             elif record.status != CandidateStatus.REJECTED.value:
                 record.status = CandidateStatus.SCREENED.value
@@ -1107,4 +1207,14 @@ class ProvenanceTracker:
             "best_score_ever": best_score,
             "best_synthesis_feasibility_ever": best_synthesis_feasibility,
             "generation_backend_counts": backend_counts,
+            "proposals_generated": self.manifest.proposals_generated or total_generated,
+            "geometry_valid": self.manifest.geometry_valid,
+            "invalid_geometry": self.manifest.invalid_geometry,
+            "oracle_evaluations": self.manifest.oracle_evaluations,
+            "oracle_cache_hits": self.manifest.oracle_cache_hits,
+            "proposal_budget": self.manifest.proposal_budget,
+            "oracle_budget": self.manifest.oracle_budget,
+            "proposal_budget_remaining": self.manifest.proposal_budget_remaining,
+            "oracle_budget_remaining": self.manifest.oracle_budget_remaining,
+            "termination_reason": self.manifest.termination_reason,
         }

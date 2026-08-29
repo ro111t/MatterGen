@@ -61,6 +61,8 @@ All agents below are implemented. Heavy external backends (Mattergen API, VASP/Q
 - **Orchestrator Agent**: High-level strategic planning using LLM; falls back to deterministic strategy when no API key is available.
 - **Generation Agent**: Generates candidate structures using Microsoft MatterGen when available, with a pymatgen-based mock fallback.
 - **Screening Agent**: Fast ML-based filtering with CHGNet/M3GNet/ALIGNN (currently CHGNet enabled by default).
+
+- **Geometry and budget gate**: Every generated candidate is retained in provenance, but only finite, nondegenerate 3-D periodic structures with a minimum periodic separation of at least 0.8 Å reach the oracle. Proposal and oracle budgets are independently auditable; the paper defaults are 400 proposals and 200 oracle evaluations. Development ``CampaignConfig`` instances may omit either limit for unlimited operation.
 - **Validation Agent**: DFT relaxation and property calculation via ASE; supports VASP, Quantum ESPRESSO, GPAW, and a deterministic `mock` backend.
 - **Analysis Agent**: Compares ML screening predictions against DFT validation and reports MAE, RMSE, bias, Pearson r, failure modes, and top candidates.
 - **Synthesis Feasibility Agent**: Estimates precursor difficulty, synthesis route, and experimental cost from composition heuristics.
@@ -202,6 +204,9 @@ Flags:
 - `--mattergen-pretrained`: MatterGen checkpoint name (e.g. `mattergen_base`, `chemical_system`)
 - `--mattergen-model-path`: path to a local MatterGen checkpoint directory
 - `--mattergen-batch-size`: batch size for MatterGen generation
+- `--proposal-budget`: maximum generated proposals (paper default: 400; omitted is unlimited in development)
+- `--oracle-budget`: maximum geometrically valid oracle evaluations (paper default: 200; omitted is unlimited in development)
+- `--geometry-min-distance`: absolute periodic minimum distance in Å (default: 0.8)
 - `--mattergen-sampling-config-name`: name of the sampling config YAML file to use (`default` or `csp`)
 - `--mattergen-sampling-config-path`: path to a MatterGen sampling config directory (defaults to bundled configs)
 

@@ -38,9 +38,16 @@ class _FakeComposition:
 
 
 def _make_stub(formula: str, generation_id: str = "") -> dict:
+    # Screening now has a strict geometry gate; keep these lightweight test
+    # records representative of a real periodic dictionary structure.
+    import re
+    n_sites = sum(int(count or 1) for _, count in re.findall(r"([A-Z][a-z]?)(\d*)", formula))
+    positions = [[(i * 0.37) % 0.8, (i * 0.23) % 0.8, (i * 0.41) % 0.8] for i in range(n_sites)]
     return {
         "composition": formula,
         "generation_id": generation_id or formula,
+        "lattice": [[8.0, 0.0, 0.0], [0.0, 8.0, 0.0], [0.0, 0.0, 8.0]],
+        "positions": positions,
     }
 
 
