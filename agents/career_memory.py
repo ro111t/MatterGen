@@ -12,7 +12,9 @@ scientific knowledge across every campaign and domain the agent has run:
   4. Hypothesis lineage       — every candidate traces back to the principle
                                  that motivated its generation.
 
-Persists to ~/.matagent_career.db (SQLite). Schema defined in db_schema.py.
+Persists to an explicitly supplied SQLite path.  A home-directory default is
+intentionally not provided: implicit global state can contaminate independent
+campaigns and invalidate scientific comparisons.
 """
 
 import sqlite3
@@ -20,6 +22,7 @@ import json
 import time
 import uuid
 import hashlib
+import re
 from pathlib import Path
 from typing import Dict, List, Any, Optional, Tuple
 
@@ -38,13 +41,79 @@ from agents.transferable_memory import (
 )
 
 
+# A transferable record may contain useful negative/unknown evidence, but only
+# labels emitted by a validated positive observation are allowed to reach the
+# planner.  Keep this allow-list deliberately small: treating an arbitrary
+# label such as ``success`` or ``accepted`` as positive would turn malformed
+# or stale records into executable scientific advice.
+DIRECTIVE_ELIGIBLE_OUTCOME_LABELS = frozenset({
+    "stable",
+    "retained",
+    "screening_pass",
+    "thermodynamically_stable",
+})
+_DIRECTIVE_NEGATIVE_OUTCOME_LABELS = frozenset({
+    "unstable",
+    "thermodynamically_unstable",
+    "instable",
+    "instability",
+    "rejected",
+    "rejection",
+    "screening_reject",
+    "screening_failed",
+    "failed",
+    "failure",
+    "error",
+})
+_DIRECTIVE_UNKNOWN_OUTCOME_LABELS = frozenset({
+    "",
+    "unknown",
+    "missing",
+    "none",
+    "null",
+    "na",
+    "n_a",
+    "not_available",
+    "unavailable",
+    "no_result",
+})
+
+
+def _normalize_outcome_label(label: Any) -> str:
+    """Canonicalize outcome labels before applying the directive gate."""
+    if label is None:
+        return ""
+    # Labels are persisted as user/backend data, so tolerate common spelling
+    # variants without ever expanding the positive allow-list implicitly.
+    return re.sub(r"_+", "_", re.sub(r"[\s-]+", "_", str(label).strip().casefold()))
+
+
+def _directive_outcome_rejection_reason(label: Any) -> Optional[str]:
+    """Return a stable audit reason, or ``None`` for an eligible outcome."""
+    normalized = _normalize_outcome_label(label)
+    if normalized in DIRECTIVE_ELIGIBLE_OUTCOME_LABELS:
+        return None
+    if normalized in _DIRECTIVE_NEGATIVE_OUTCOME_LABELS:
+        return "NEGATIVE_OUTCOME_NOT_A_DIRECTIVE"
+    if normalized in _DIRECTIVE_UNKNOWN_OUTCOME_LABELS:
+        return "OUTCOME_MISSING_OR_UNKNOWN"
+    return "OUTCOME_NOT_ELIGIBLE_FOR_DIRECTIVE"
+
+
 class CareerMemory:
     """
     Persistent knowledge store that accumulates scientific experience across
     all campaigns and domains. Survives process restarts via SQLite.
     """
 
-    def __init__(self, db_path: str = "~/.matagent_career.db"):
+    def __init__(self, db_path: str):
+        legacy_home_db = Path.home() / ".matagent_career.db"
+        if (
+            not db_path
+            or str(db_path).strip() == "~"
+            or Path(db_path).expanduser().resolve() == legacy_home_db.resolve()
+        ):
+            raise ValueError("CareerMemory requires an explicit run-local db_path")
         self.db_path = Path(db_path).expanduser()
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
         self.conn = sqlite3.connect(str(self.db_path), check_same_thread=False)
@@ -477,6 +546,11 @@ class CareerMemory:
             # Legacy records are accepted only for audit storage by callers;
             # this method is a v2 scientific boundary and must fail closed.
             raise ValueError("legacy/unknown transferable records are quarantined")
+        # The legacy SQLite column is NOT NULL.  Normalize a missing label to
+        # an explicit unknown value so malformed evidence can still be kept
+        # for audit without ever becoming directive-eligible.
+        if record.outcome_label is None:
+            record.outcome_label = "unknown"
         if isinstance(record.features, dict):
             record.features = TransferableFeatures.from_dict(record.features)
         if isinstance(record.applicability, dict):
@@ -716,10 +790,12 @@ class CareerMemory:
                     "record": record.to_dict(),
                 })
                 continue
-            if record.outcome_label in {"rejected", "unstable", "screening_reject"}:
-                # Negative evidence remains in memory and is reported below,
-                # but cannot become a positive generation directive.
-                ok, reasons = False, ["NEGATIVE_OUTCOME_NOT_A_DIRECTIVE"]
+            outcome_reason = _directive_outcome_rejection_reason(record.outcome_label)
+            if outcome_reason == "NEGATIVE_OUTCOME_NOT_A_DIRECTIVE":
+                # Preserve the existing negative-evidence audit contract.
+                # Unknown/malformed records are handled by the directive
+                # wrapper below, where the executable-policy boundary lives.
+                ok, reasons = False, [outcome_reason]
             else:
                 ok, reasons = applicability_check(
                     record, target_features, target_domain=target_domain, target_elements=target_elements
@@ -733,8 +809,21 @@ class CareerMemory:
         selection = self.get_applicable_transferable_memories(**kwargs)
         directives = []
         unsupported = []
+        eligible_items = []
         for item in selection["applied"]:
             record = TransferableMemoryRecord.from_dict(item["record"])
+            outcome_reason = _directive_outcome_rejection_reason(record.outcome_label)
+            if outcome_reason is not None:
+                # ``get_applicable_transferable_memories`` remains useful for
+                # querying/auditing unknown observations, but this wrapper is
+                # the executable planner boundary and is strictly positive-
+                # allow-listed.  Reclassify the item here so callers cannot
+                # mistake it for a directive-ready record.
+                rejected_item = dict(item)
+                rejected_item["reasons"] = [outcome_reason]
+                selection["rejected"].append(rejected_item)
+                continue
+            eligible_items.append(item)
             directive = make_directive(record)
             directives.append(directive)
             if directive.get("unsupported_policy_effects"):
@@ -742,6 +831,7 @@ class CareerMemory:
                     "record_id": record.record_id,
                     "reasons": [f"UNSUPPORTED_EFFECT:{name}" for name in directive["unsupported_policy_effects"]],
                 })
+        selection["applied"] = eligible_items
         selection["directives"] = directives
         selection["unsupported"] = unsupported
         return selection

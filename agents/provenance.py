@@ -72,6 +72,52 @@ def _get_utc_now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
+def _canonical_manifest_value(value: Any) -> Any:
+    """Return a deterministic JSON-safe representation for manifest hashing.
+
+    Audit payloads are assembled by several agents and may contain tuples,
+    sets, paths, enum values, or non-finite numbers.  ``json.dumps(...,
+    default=str)`` is not sufficient here: set stringification can depend on
+    insertion/hash order and JSON permits non-finite values by default.  Keep
+    the canonicalization local to manifest hashing so persisted report/schema
+    formats remain backward compatible.
+    """
+    if isinstance(value, dict):
+        return {
+            str(key): _canonical_manifest_value(item)
+            for key, item in sorted(value.items(), key=lambda pair: str(pair[0]))
+        }
+    if isinstance(value, (list, tuple)):
+        return [_canonical_manifest_value(item) for item in value]
+    if isinstance(value, (set, frozenset)):
+        items = [_canonical_manifest_value(item) for item in value]
+        return sorted(items, key=lambda item: json.dumps(
+            item, sort_keys=True, separators=(",", ":"), ensure_ascii=False,
+        ))
+    if isinstance(value, Enum):
+        return _canonical_manifest_value(value.value)
+    if isinstance(value, Path):
+        return str(value)
+    if isinstance(value, bytes):
+        return value.hex()
+    if isinstance(value, float) and not math.isfinite(value):
+        return str(value)
+    if value is None or isinstance(value, (bool, int, float, str)):
+        return value
+    return str(value)
+
+
+def _canonical_manifest_json(value: Any) -> str:
+    """Serialize a manifest hash payload without representation ambiguity."""
+    return json.dumps(
+        _canonical_manifest_value(value),
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=False,
+        allow_nan=False,
+    )
+
+
 def extract_candidate_id(struct: Any, fallback_idx: Optional[int] = None) -> str:
     """Extract canonical candidate ID (MAT-xxxxxx) from pymatgen Structure, dict stub, or Atoms."""
     if isinstance(struct, dict):
@@ -307,6 +353,7 @@ class CandidateRecord:
     provenance_stage: Optional[str] = None
     oracle_evaluated: Optional[bool] = None
     oracle_cache_hit: Optional[bool] = None
+    oracle_call_index: Optional[int] = None
 
     # Validation
     validation_calculator: Optional[str] = None
@@ -407,6 +454,7 @@ class CandidateRecord:
             "provenance_stage": self.provenance_stage or "",
             "oracle_evaluated": self.oracle_evaluated if self.oracle_evaluated is not None else "",
             "oracle_cache_hit": self.oracle_cache_hit if self.oracle_cache_hit is not None else "",
+            "oracle_call_index": self.oracle_call_index if self.oracle_call_index is not None else "",
             # Validation
             "validation_calculator": self.validation_calculator or "",
             "validation_converged": self.validation_converged if self.validation_converged is not None else "",
@@ -536,9 +584,10 @@ class RunManifest:
             "memory_directives_applied": self.memory_directives_applied,
             "memory_directives_rejected": self.memory_directives_rejected,
             "memory_priority_audit": self.memory_priority_audit,
+            "memory_extraction_failures": self.memory_extraction_failures,
             "memory_shuffle_audit": self.memory_shuffle_audit,
         }
-        return hashlib.sha256(json.dumps(content, sort_keys=True, default=str).encode("utf-8")).hexdigest()
+        return hashlib.sha256(_canonical_manifest_json(content).encode("utf-8")).hexdigest()
 
     def is_consistent_with(self, other: RunManifest) -> Tuple[bool, List[str]]:
         """Verify configuration consistency between an original and a reproduced run."""
@@ -972,6 +1021,7 @@ class ProvenanceTracker:
             record.provenance_stage = getattr(res, "provenance_stage", "screening")
             record.oracle_evaluated = getattr(res, "oracle_evaluated", None)
             record.oracle_cache_hit = getattr(res, "oracle_cache_hit", None)
+            record.oracle_call_index = getattr(res, "oracle_call_index", None)
 
             if not record.passes_screening_filters:
                 record.status = CandidateStatus.REJECTED.value

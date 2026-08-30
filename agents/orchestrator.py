@@ -322,6 +322,7 @@ Focus on: what worked, what failed, one concrete recommendation."""
         empty = {
             "applied": [], "rejected": [], "directives": [], "record_count": 0,
             "scientific_decision_support": self.memory_mode != "shuffled_control",
+            "control_only": self.memory_mode == "shuffled_control",
             "unsupported": [], "shuffle_audit": None,
         }
         if not self.career_memory or self.memory_mode == "none":
@@ -343,13 +344,23 @@ Focus on: what worked, what failed, one concrete recommendation."""
         if self.memory_mode == "shuffled_control":
             view = self.career_memory.memory_view(self.memory_mode, seed=self.memory_seed, target_campaign_id=target_campaign_id)
             empty["memory_view"] = view
-            empty["shuffle_audit"] = view.get("shuffle_audit")
+            audit = view.get("shuffle_audit")
+            empty["shuffle_audit"] = audit
             empty["rejected"] = view.get("chronology_rejected", [])
-            if view.get("records"):
+            valid_derangement = bool(
+                isinstance(audit, dict) and audit.get("valid") is True
+                and int(audit.get("fixed_points", -1)) == 0
+            )
+            if view.get("records") and valid_derangement:
                 from agents.transferable_memory import TransferableMemoryRecord, make_directive
                 empty["directives"] = [make_directive(TransferableMemoryRecord.from_dict(item)) for item in view["records"]]
                 empty["applied"] = [{"record_id": d["record_id"], "reasons": ["SHUFFLED_CONTROL_POLICY_ONLY"]} for d in empty["directives"]]
-                empty["unsupported"] = [{"record_id": d["record_id"], "reasons": ["SHUFFLED_CONTROL_INVALID_FOR_SCIENTIFIC_DECISION_SUPPORT"]} for d in empty["directives"]]
+                empty["unsupported"] = [{"record_id": d["record_id"], "reasons": ["CONTROL_ONLY_NOT_SCIENTIFIC_DECISION_SUPPORT"]} for d in empty["directives"]]
+            elif view.get("records"):
+                empty["rejected"].append({
+                    "record_id": "SHUFFLED_CONTROL",
+                    "reasons": ["INVALID_OR_NON_DERANGED_SHUFFLE_AUDIT"],
+                })
             return empty
         result = self.career_memory.get_transferable_directives(
             target_features=target_features,
@@ -364,11 +375,20 @@ Focus on: what worked, what failed, one concrete recommendation."""
     def _apply_transfer_policy(strategy: Dict[str, Any], transfer: Dict[str, Any]) -> Dict[str, Any]:
         """Apply only bounded exploration/exploitation hints to planning."""
         directives = transfer.get("directives", [])
+        control_only = bool(transfer.get("control_only", False))
+        if control_only:
+            audit = transfer.get("shuffle_audit")
+            if not (
+                isinstance(audit, dict) and audit.get("valid") is True
+                and int(audit.get("fixed_points", -1)) == 0
+            ):
+                directives = []
         usable = [d for d in directives if d.get("exploration_weight") is not None or d.get("exploitation_weight") is not None]
         if not usable:
             strategy["memory_policy"] = {
                 "applied": [], "supported_effects": [],
                 "unsupported_effects": transfer.get("unsupported", []),
+                "control_only": control_only,
             }
             return strategy
         exploration = sum(float(d.get("exploration_weight") or 0.0) for d in usable) / len(usable)
@@ -383,6 +403,11 @@ Focus on: what worked, what failed, one concrete recommendation."""
             "exploration_weight": min(0.8, max(0.0, exploration)),
             "exploitation_weight": min(1.0, max(0.0, exploitation)),
             "unsupported_effects": transfer.get("unsupported", []),
+            # A valid shuffled arm deliberately exercises the same bounded
+            # policy surface with deranged record/response pairings.  It is a
+            # negative experimental control, never scientific decision support.
+            "control_only": control_only,
+            "scientific_decision_support": not control_only,
             "bounded": True,
             "bypasses_geometry_gate": False,
             "bypasses_thermodynamic_gate": False,

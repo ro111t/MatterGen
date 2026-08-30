@@ -61,7 +61,11 @@ class CampaignConfig:
     objective: CampaignObjective
     output_dir: Path
     master_seed: int = 42
-    career_db_path: str = "~/.matagent_career.db"
+    # A persistent home-directory database silently couples otherwise
+    # independent campaigns.  Experimental runners provide an explicit,
+    # run-local path; the campaign itself derives the same path when the
+    # caller intentionally leaves it unset.
+    career_db_path: Optional[str] = None
     checkpoint_interval: int = 5
     verbose: bool = True
     use_career_memory: bool = True
@@ -178,7 +182,10 @@ class MaterialsDiscoveryCampaign:
 
         # Career memory — persists across ALL campaigns
         if config.use_career_memory:
-            self.career_memory = CareerMemory(db_path=config.career_db_path)
+            memory_path = config.career_db_path
+            if not memory_path:
+                memory_path = str(Path(config.output_dir) / "career_memory.db")
+            self.career_memory = CareerMemory(db_path=memory_path)
         else:
             self.career_memory = None
 

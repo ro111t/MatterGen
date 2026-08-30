@@ -1045,15 +1045,41 @@ def view_records(
                 shift = 1
                 permutation = [(i + shift) % n for i in range(n)]
 
+            # Never expose a partially shuffled control.  In addition to the
+            # no-fixed-point requirement, the mapping must be a true
+            # permutation; this protects the control if the random backend is
+            # replaced or returns malformed state.
+            permutation_valid = (
+                len(permutation) == n
+                and sorted(permutation) == list(range(n))
+                and all(i != permutation[i] for i in range(n))
+            )
+            if not permutation_valid:
+                base.update({
+                    "records": [],
+                    "shuffle_audit": {
+                        "seed": int(seed), "permutation": list(permutation),
+                        "mapping": [],
+                        "input_hash": _stable_hash(normalized),
+                        "output_hash": _stable_hash([]),
+                        "fixed_points": sum(
+                            i == permutation[i]
+                            for i in range(min(n, len(permutation)))
+                        ),
+                        "valid": False,
+                        "reason": "SHUFFLE_CONTROL_INVALID_DERANGEMENT",
+                    },
+                })
+                return base
+
             # Keep descriptor/query-side fields from row i and response-side
             # evidence/directive/provenance from row permutation[i].  This
             # preserves both marginals while severing the pairing.
-            descriptor_fields = {"features"}
             response_fields = {
                 "outcome_label", "outcome_value", "directive", "principle_id",
                 "evidence_ids", "campaign_ids", "source_candidate_ids",
                 "source_formulas", "source_domain", "evidence_hash",
-                "applicability", "finalized", "created_at",
+                "applicability", "finalized", "created_at", "provenance",
             }
             shown = []
             for i, descriptor in enumerate(normalized):

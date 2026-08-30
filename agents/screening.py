@@ -70,6 +70,7 @@ class ScreeningResult:
     provenance_stage: str = "screening"
     oracle_evaluated: Optional[bool] = None
     oracle_cache_hit: Optional[bool] = None
+    oracle_call_index: Optional[int] = None
 
     def __post_init__(self) -> None:
         # Ensure explicitly constructed results use schema-v2 vocabulary.
@@ -182,6 +183,7 @@ class ScreeningAgent:
         if budget_tracker is None and oracle_budget is not None:
             budget_tracker = DualBudgetTracker(oracle_budget=oracle_budget)
         raw_results = []
+        local_oracle_call_index = 0
         for i, struct in enumerate(structures):
             struct_id = self._get_struct_id(struct, i)
             geometry = self.geometry_validator.validate(struct)
@@ -239,6 +241,11 @@ class ScreeningAgent:
                     oracle_cache_hit=cache_hit,
                 )))
                 continue
+            if budget_tracker is not None:
+                oracle_call_index = int(budget_tracker.oracle_evaluations)
+            else:
+                local_oracle_call_index += 1
+                oracle_call_index = local_oracle_call_index
 
             try:
                 if self.thermodynamic_oracle is not None:
@@ -255,6 +262,7 @@ class ScreeningAgent:
                                               "failure_message": thermo_result.failure_message},
                             provenance_stage="thermodynamics", oracle_evaluated=True,
                             oracle_cache_hit=cache_hit,
+                            oracle_call_index=oracle_call_index,
                         )))
                         continue
                     predictions = thermo_result.scientific_values()
@@ -283,6 +291,7 @@ class ScreeningAgent:
                     provenance_stage="screening",
                     oracle_evaluated=True,
                     oracle_cache_hit=cache_hit,
+                    oracle_call_index=oracle_call_index,
                 )))
                 continue
             passes, reasons = self._apply_filters(predictions, criteria)
@@ -301,6 +310,7 @@ class ScreeningAgent:
                 provenance_stage=("thermodynamics" if self.thermodynamic_oracle is not None else "screening"),
                 oracle_evaluated=True,
                 oracle_cache_hit=cache_hit,
+                oracle_call_index=oracle_call_index,
             )))
 
         if deduplicate:
