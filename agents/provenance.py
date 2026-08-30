@@ -486,6 +486,15 @@ class RunManifest:
     oracle_budget_remaining: Optional[int] = None
     iteration_budget_counters: List[Dict[str, Any]] = field(default_factory=list)
     termination_reason: Optional[str] = None
+    # CareerMemory view configuration and directive application audit.
+    memory_mode: str = "structured_provenance"
+    memory_seed: int = 0
+    memory_transfer_declaration: Dict[str, Any] = field(default_factory=dict)
+    memory_directives_applied: List[Dict[str, Any]] = field(default_factory=list)
+    memory_directives_rejected: List[Dict[str, Any]] = field(default_factory=list)
+    memory_priority_audit: List[Dict[str, Any]] = field(default_factory=list)
+    memory_extraction_failures: List[Dict[str, Any]] = field(default_factory=list)
+    memory_shuffle_audit: List[Dict[str, Any]] = field(default_factory=list)
 
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)
@@ -521,6 +530,13 @@ class RunManifest:
             "constraints": self.constraints,
             "config": self.config,
             "strategies": self.strategies,
+            "memory_mode": self.memory_mode,
+            "memory_seed": self.memory_seed,
+            "memory_transfer_declaration": self.memory_transfer_declaration,
+            "memory_directives_applied": self.memory_directives_applied,
+            "memory_directives_rejected": self.memory_directives_rejected,
+            "memory_priority_audit": self.memory_priority_audit,
+            "memory_shuffle_audit": self.memory_shuffle_audit,
         }
         return hashlib.sha256(json.dumps(content, sort_keys=True, default=str).encode("utf-8")).hexdigest()
 
@@ -541,6 +557,10 @@ class RunManifest:
             discrepancies.append(f"Config mismatch: {self.config} != {other.config}")
         if json.dumps(self.strategies, sort_keys=True, default=str) != json.dumps(other.strategies, sort_keys=True, default=str):
             discrepancies.append(f"Strategies mismatch: {self.strategies} != {other.strategies}")
+        if self.memory_mode != other.memory_mode or self.memory_seed != other.memory_seed:
+            discrepancies.append(f"Memory view mismatch: {self.memory_mode}/{self.memory_seed} != {other.memory_mode}/{other.memory_seed}")
+        if json.dumps(self.memory_transfer_declaration, sort_keys=True, default=str) != json.dumps(other.memory_transfer_declaration, sort_keys=True, default=str):
+            discrepancies.append("Memory transfer declaration mismatch")
         return (len(discrepancies) == 0, discrepancies)
 
 
@@ -616,6 +636,15 @@ class ProvenanceTracker:
             oracle_budget=oracle_budget,
             proposal_budget_remaining=proposal_budget,
             oracle_budget_remaining=oracle_budget,
+            memory_mode=str(self.config_dict.get("memory_mode", "structured_provenance")),
+            memory_seed=int(self.config_dict.get("memory_seed", 0)),
+            memory_transfer_declaration=dict(
+                self.config_dict.get("memory_transfer_declaration")
+                or self.constraints_dict.get("memory_transfer_declaration")
+                or self.constraints_dict.get("transferability")
+                or self.constraints_dict.get("memory_transfer")
+                or {}
+            ),
         )
 
     def write_manifest(self) -> Path:
@@ -667,8 +696,47 @@ class ProvenanceTracker:
             "diversity_weight": strategy.get("diversity_weight", 0.3),
             "rationale": strategy.get("rationale", ""),
             "hypothesis": strategy.get("hypothesis", ""),
+            "memory_directives": strategy.get("memory_directives", []),
+            "memory_directive_audit": strategy.get("memory_directive_audit", {}),
+            "memory_policy": strategy.get("memory_policy", {}),
+            "memory_transfer_declaration": strategy.get("memory_transfer_declaration", {}),
         }
         self.manifest.strategies.append(clean_strat)
+        audit = clean_strat["memory_directive_audit"] or {}
+        if audit.get("shuffle_audit"):
+            shuffle = dict(audit["shuffle_audit"])
+            shuffle["iteration"] = iteration
+            if shuffle not in self.manifest.memory_shuffle_audit:
+                self.manifest.memory_shuffle_audit.append(shuffle)
+        for record_id in audit.get("applied", []):
+            if record_id not in [x.get("record_id") for x in self.manifest.memory_directives_applied]:
+                self.manifest.memory_directives_applied.append({
+                    "record_id": record_id, "iteration": iteration,
+                    "mode": self.manifest.memory_mode,
+                })
+        for rejected in audit.get("rejected", []):
+            item = dict(rejected)
+            item["iteration"] = iteration
+            if item not in self.manifest.memory_directives_rejected:
+                self.manifest.memory_directives_rejected.append(item)
+        self.write_manifest()
+
+    def record_memory_prioritization(self, entries: List[Dict[str, Any]], iteration: int) -> None:
+        """Persist pre-oracle memory priority scores and their citations."""
+        for entry in entries:
+            item = dict(entry)
+            item["iteration"] = iteration
+            if item not in self.manifest.memory_priority_audit:
+                self.manifest.memory_priority_audit.append(item)
+        self.write_manifest()
+
+    def record_memory_extraction_audit(self, entries: List[Dict[str, Any]], iteration: int) -> None:
+        """Persist structured feature-extraction failures for audit/replay."""
+        for entry in entries:
+            item = dict(entry)
+            item["iteration"] = iteration
+            if item not in self.manifest.memory_extraction_failures:
+                self.manifest.memory_extraction_failures.append(item)
         self.write_manifest()
 
     # -------------------------------------------------------------------------

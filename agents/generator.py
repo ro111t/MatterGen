@@ -250,6 +250,9 @@ class GenerationAgent:
         self._mattergen: Optional[MattergenGenerator] = None
         self.last_generation_backend: Optional[str] = None
         self._generation_batch_backends: List[str] = []
+        # Last applied CareerMemory directives are retained for provenance and
+        # audit only; they do not bypass geometry or thermodynamic gates.
+        self.last_memory_directives: List[Dict[str, Any]] = []
 
         if self.run_mode == RunMode.RESEARCH and not self.use_mattergen:
             raise RuntimeError(
@@ -292,6 +295,8 @@ class GenerationAgent:
         num_candidates: int = 15,
         seed: int = 42,
         domain: str = "",
+        memory_directives: Optional[List[Dict[str, Any]]] = None,
+        directives: Optional[List[Dict[str, Any]]] = None,
     ) -> List[Any]:
         """
         Generate num_candidates structures using the given elements.
@@ -306,6 +311,7 @@ class GenerationAgent:
             List of pymatgen Structure objects (or stub dicts if pymatgen unavailable)
         """
         start_idx = self._total_generated
+        self.last_memory_directives = list(memory_directives or directives or [])
         backend = "pymatgen_mock" if HAS_PYMATGEN else "stub"
         if self.use_mattergen and self._mattergen is not None:
             try:

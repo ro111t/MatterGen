@@ -115,6 +115,7 @@ class ScreeningAgent:
         )
         self.last_geometry_results: Dict[str, GeometryValidationResult] = {}
         self.last_budget_snapshot: Dict[str, Any] = {}
+        self.last_memory_directives: List[Dict[str, Any]] = []
         if self.thermodynamic_oracle is not None:
             self.last_backend_used = "chgnet_thermodynamic_oracle"
         else:
@@ -151,6 +152,8 @@ class ScreeningAgent:
         budget_tracker: Optional[Any] = None,
         oracle_budget_tracker: Optional[Any] = None,
         oracle_budget: Optional[int] = None,
+        memory_directives: Optional[List[Dict[str, Any]]] = None,
+        directives: Optional[List[Dict[str, Any]]] = None,
     ) -> List[Tuple[Any, ScreeningResult]]:
         """
         Screen all structures; return all results sorted by score (best first).
@@ -168,6 +171,9 @@ class ScreeningAgent:
         """
         target_properties = target_properties or {}
         weights = dict(weights or DEFAULT_SCREENING_WEIGHTS)
+        # Directives are screening context/audit inputs only.  Existing
+        # geometry, oracle, and threshold gates remain authoritative.
+        self.last_memory_directives = list(memory_directives or directives or [])
 
         # ``oracle_budget_tracker`` is a readable alias for integrations that
         # pass only the oracle accounting object.  A campaign passes the dual
@@ -292,7 +298,7 @@ class ScreeningAgent:
                 scientific_validity=("research_valid" if self.run_mode == RunMode.RESEARCH else "demo_only"),
                 geometry_valid=True,
                 geometry_details=geometry.details,
-                provenance_stage="screening",
+                provenance_stage=("thermodynamics" if self.thermodynamic_oracle is not None else "screening"),
                 oracle_evaluated=True,
                 oracle_cache_hit=cache_hit,
             )))

@@ -18,6 +18,7 @@ from pathlib import Path
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Protocol, Sequence, Tuple
 
 from agents.geometry import GeometryValidator
+from agents.integrity import SCHEMA_VERSION
 
 try:
     from pymatgen.analysis.phase_diagram import PDEntry, PhaseDiagram
@@ -166,10 +167,18 @@ class ThermodynamicResult:
     def scientific_values(self) -> Dict[str, Any]:
         if not self.success:
             return {}
-        return {
+        values = {
             key: value for key, value in asdict(self).items()
             if value is not None and key not in {"success", "failure_code", "failure_message", "relaxed_structure"}
         }
+        # Explicit provenance contract consumed by schema-v2 CareerMemory.
+        # A hull label without this identity is not scientific evidence.
+        values["provenance_schema_version"] = SCHEMA_VERSION
+        values["thermodynamic_schema_version"] = THERMODYNAMICS_SCHEMA_VERSION
+        values["thermodynamics_certified"] = bool(
+            self.reference_set_id and self.reference_set_hash and self.model and self.relaxation_settings
+        )
+        return values
 
 
 class StructureEvaluator(Protocol):

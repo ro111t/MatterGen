@@ -79,6 +79,14 @@ with st.sidebar:
         "Minimum periodic distance (Å)", value=0.8, min_value=0.001, step=0.1,
     )
     use_career_memory = st.checkbox("Use career memory", value=True)
+    memory_mode = st.selectbox(
+        "Career memory view",
+        options=["none", "text_summary", "structured_provenance", "shuffled_control"],
+        index=2,
+        disabled=not use_career_memory,
+        help="Shuffled control preserves marginals but is invalid for scientific decision support.",
+    )
+    memory_seed = st.number_input("Career memory seed", value=0, step=1, disabled=not use_career_memory)
     run_mode = st.selectbox(
         "Run mode", options=["development", "research"], index=0,
         help="Research mode fails closed unless MatterGen, CHGNet, scientific validation, and required thermodynamics are configured.",
@@ -143,6 +151,8 @@ def _run_campaign_ui(
     oracle_budget: int,
     geometry_min_distance: float,
     use_career_memory: bool,
+    memory_mode: str,
+    memory_seed: int,
     run_mode: str,
     use_validation: bool,
     validation_top_k: int,
@@ -173,6 +183,8 @@ def _run_campaign_ui(
         objective=objective,
         output_dir=Path(f"./campaigns/{domain}"),
         use_career_memory=use_career_memory,
+        memory_mode=memory_mode,
+        memory_seed=memory_seed,
         run_mode=run_mode,
         verbose=False,  # streamlit captures its own output
         use_validation=use_validation,
@@ -213,6 +225,8 @@ if run_button:
             oracle_budget=oracle_budget,
             geometry_min_distance=geometry_min_distance,
             use_career_memory=use_career_memory,
+            memory_mode=memory_mode,
+            memory_seed=memory_seed,
             run_mode=run_mode,
             use_validation=use_validation,
             validation_top_k=validation_top_k,

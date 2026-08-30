@@ -51,6 +51,7 @@ from agents.thermodynamics import (
     load_frozen_reference_set,
     threshold_sensitivity,
 )
+from agents.transferable_memory import MEMORY_MODES, prioritize_candidates
 
 
 @dataclass
@@ -64,6 +65,10 @@ class CampaignConfig:
     checkpoint_interval: int = 5
     verbose: bool = True
     use_career_memory: bool = True
+    # Experimental memory view controls.  ``shuffled_control`` is explicitly
+    # invalid for scientific decision support and exists only for controls.
+    memory_mode: str = "structured_provenance"
+    memory_seed: int = 0
     use_validation: bool = True
     validation_top_k: int = 5
     use_synthesis: bool = True
@@ -101,6 +106,11 @@ class CampaignConfig:
 
     def __post_init__(self) -> None:
         self.run_mode = normalize_run_mode(self.run_mode)
+        if self.memory_mode not in MEMORY_MODES:
+            raise ValueError(f"memory_mode must be one of {MEMORY_MODES}")
+        if isinstance(self.memory_seed, bool):
+            raise ValueError("memory_seed must be an integer")
+        self.memory_seed = int(self.memory_seed)
         for name in ("proposal_budget", "oracle_budget"):
             value = getattr(self, name)
             if value is not None and (isinstance(value, bool) or not isinstance(value, int) or value <= 0):
@@ -174,7 +184,9 @@ class MaterialsDiscoveryCampaign:
 
         self.orchestrator = OrchestratorAgent(
             career_memory=self.career_memory,
-            api_key=os.environ.get('OPENAI_API_KEY')
+            api_key=os.environ.get('OPENAI_API_KEY'),
+            memory_mode=self.config.memory_mode,
+            memory_seed=self.config.memory_seed,
         )
         self.current_recommendations: Optional[Dict[str, Any]] = None
         self.distiller = ExperienceDistiller(
@@ -215,6 +227,13 @@ class MaterialsDiscoveryCampaign:
                 'proposal_budget': self.config.proposal_budget,
                 'oracle_budget': self.config.oracle_budget,
                 'geometry_min_distance': self.config.geometry_min_distance,
+                'memory_mode': self.config.memory_mode,
+                'memory_seed': self.config.memory_seed,
+                'memory_transfer_declaration': (
+                    self.config.objective.constraints.get('memory_transfer_declaration')
+                    or self.config.objective.constraints.get('transferability')
+                    or self.config.objective.constraints.get('memory_transfer')
+                ),
             },
             objective=self.config.objective.target_properties,
             constraints=self.config.objective.constraints,
@@ -439,6 +458,8 @@ class MaterialsDiscoveryCampaign:
             elements=strategy.get('elements', ['Li', 'P', 'S', 'O']),
             num_candidates=num_to_gen,
             seed=iter_seed,
+            domain=self.config.objective.domain,
+            memory_directives=strategy.get('memory_directives', []),
         )
         # A backend that overproduces has already consumed proposal resources,
         # so silently slicing would make the accounting non-auditable.  Abort
@@ -463,10 +484,20 @@ class MaterialsDiscoveryCampaign:
                 'num_candidates': len(candidates),
                 'requested_num_candidates': requested_num_to_gen,
                 'proposal_budget_remaining': self.budget_tracker.proposal_budget_remaining,
+                'memory_directive_ids': [
+                    d.get('record_id') for d in strategy.get('memory_directives', [])
+                    if d.get('record_id')
+                ],
             },
             model_name_or_path=self.config.mattergen_model_path if generation_backend == "mattergen" else None,
             checkpoint=self.config.mattergen_pretrained if generation_backend == "mattergen" else None,
         )
+        # Memory affects only deterministic pre-oracle prioritization after all
+        # proposals are counted.  Geometry and thermodynamic gates still own
+        # validity, and every oracle admission remains one budget slot.
+        memory_directives = strategy.get('memory_directives', [])
+        candidates, memory_priority_audit = prioritize_candidates(candidates, memory_directives)
+        self.provenance.record_memory_prioritization(memory_priority_audit, iteration=self.iteration)
         self._log(f"  Generated: {len(candidates)} structures")
         self._log(f"  Generation backend: {generation_backend}")
 
@@ -486,6 +517,7 @@ class MaterialsDiscoveryCampaign:
             target_properties=self.config.objective.target_properties,
             deduplicate=False,
             budget_tracker=self.budget_tracker,
+            memory_directives=strategy.get('memory_directives', []),
         )
         self.provenance.sync_budget(self.budget_tracker, iteration=self.iteration)
         screener_backend = getattr(self.screener, "last_backend_used", None)
@@ -579,7 +611,11 @@ class MaterialsDiscoveryCampaign:
             iteration=self.iteration,
             candidates=candidates,
             screening_results=screened,
-            strategy=strategy
+            strategy=strategy,
+            fail_closed=self.config.run_mode == RunMode.RESEARCH,
+        )
+        self.provenance.record_memory_extraction_audit(
+            distill_result.get("transferable_memory_failures", []), iteration=self.iteration
         )
         self._log(f"  Principles written: {distill_result['principles_written']}")
         self._log(f"  Failures recorded: {distill_result['failures_recorded']}")
@@ -824,8 +860,29 @@ class MaterialsDiscoveryCampaign:
                 'thermodynamics_reference_set_path': self.config.thermodynamics_reference_set_path,
                 'thermodynamics_retain_threshold_ev_per_atom': self.config.thermodynamics_retain_threshold_ev_per_atom,
                 'thermodynamics_stable_threshold_ev_per_atom': self.config.thermodynamics_stable_threshold_ev_per_atom,
+                'memory_mode': self.config.memory_mode,
+                'memory_seed': self.config.memory_seed,
+                'memory_transfer_declaration': (
+                    self.config.objective.constraints.get('memory_transfer_declaration')
+                    or self.config.objective.constraints.get('transferability')
+                    or self.config.objective.constraints.get('memory_transfer')
+                ),
             },
             'budget': self.budget_tracker.to_dict(termination_reason=self.termination_reason),
+            'memory': {
+                'mode': self.config.memory_mode,
+                'seed': self.config.memory_seed,
+                'transfer_declaration': self.provenance.manifest.memory_transfer_declaration,
+                'applied_directives': self.provenance.manifest.memory_directives_applied,
+                'rejected_directives': self.provenance.manifest.memory_directives_rejected,
+                'unsupported_directives': [
+                    item for strategy in self.provenance.manifest.strategies
+                    for item in (strategy.get('memory_directive_audit', {}) or {}).get('unsupported', [])
+                ],
+                'shuffle_audit': self.provenance.manifest.memory_shuffle_audit,
+                'extraction_failures': self.provenance.manifest.memory_extraction_failures,
+                'priority_audit': self.provenance.manifest.memory_priority_audit,
+            },
         }
         checkpoint_path = self.config.output_dir / f"checkpoint_{self.iteration}.json"
         with open(checkpoint_path, 'w') as f:
@@ -893,6 +950,12 @@ class MaterialsDiscoveryCampaign:
             'best_score_ever': stats['best_score_ever'],
             'best_synthesis_feasibility_ever': stats['best_synthesis_feasibility_ever'],
             'principles_written_to_career': total_principles,
+            'memory_mode': self.config.memory_mode,
+            'memory_seed': self.config.memory_seed,
+            'memory_transfer_declaration': self.provenance.manifest.memory_transfer_declaration,
+            'memory_directives_applied': self.provenance.manifest.memory_directives_applied,
+            'memory_directives_rejected': self.provenance.manifest.memory_directives_rejected,
+            'memory_priority_audit': self.provenance.manifest.memory_priority_audit,
             'top_candidates': top_candidates,
             'proposals_generated': self.budget_tracker.proposals_generated,
             'geometry_valid': self.budget_tracker.geometry_valid,
@@ -976,6 +1039,8 @@ class MaterialsDiscoveryCampaign:
             output_dir=out_dir,
             master_seed=manifest.master_seed,
             use_career_memory=cfg_data.get('use_career_memory', False),
+            memory_mode=cfg_data.get('memory_mode', 'structured_provenance'),
+            memory_seed=cfg_data.get('memory_seed', 0),
             use_validation=cfg_data.get('use_validation', True),
             validation_top_k=cfg_data.get('validation_top_k', 5),
             use_synthesis=cfg_data.get('use_synthesis', True),
@@ -1136,6 +1201,10 @@ def main():
                         help='Predicted-stable energy-above-hull threshold, eV/atom (default: 0.03)')
     parser.add_argument('--master-seed', type=int, default=42)
     parser.add_argument('--no-career-memory', action='store_true')
+    parser.add_argument('--memory-mode', choices=list(MEMORY_MODES), default='structured_provenance',
+                        help='CareerMemory view: none, text_summary, structured_provenance, or shuffled_control')
+    parser.add_argument('--memory-seed', type=int, default=0,
+                        help='Seed for deterministic CareerMemory control views')
     parser.add_argument('--no-validation', action='store_true')
     parser.add_argument('--validation-top-k', type=int, default=5)
     parser.add_argument('--no-synthesis', action='store_true')
@@ -1180,6 +1249,8 @@ def main():
         output_dir=out_dir,
         master_seed=args.master_seed,
         use_career_memory=not args.no_career_memory,
+        memory_mode=args.memory_mode,
+        memory_seed=args.memory_seed,
         verbose=True,
         use_validation=not args.no_validation,
         validation_top_k=args.validation_top_k,
