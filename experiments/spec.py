@@ -35,9 +35,70 @@ STANDARD_TASKS = ("Li-P-S", "Li-P-Se", "Na-P-S")
 SOURCE_TASK = "Li-P-S"
 TARGET_TASKS = ("Li-P-Se", "Na-P-S")
 
+DEFAULT_FAMILY_WISE_ALPHA = 0.05
+CONFIRMATORY_CONTROLS = (
+    "adaptive_no_memory",
+    "text_summary_memory",
+    "shuffled_memory_control",
+)
+CONFIRMATORY_METRICS = (
+    "oracle_calls_to_first_candidate_at_or_below_0_10",
+    "fraction_at_or_below_0_10",
+)
+DEFAULT_MASTER_SEEDS = (42, 137, 2024, 777, 999, 31415, 27182, 16180, 104729)
+
+CANONICAL_RESEARCH_PREFLIGHT_CHECKS = (
+    "schema_version_ok",
+    "base_commit_ok",
+    "conditions_valid",
+    "master_seeds_valid",
+    "budgets_valid",
+    "reference_sets_ok",
+    "research_tree_clean",
+    "pinned_chgnet_ok",
+    "mattergen_checkpoint_ok",
+    "sssp_manifest_ok",
+    "qe_executable_ok",
+    "mattergen_sampling_config_ok",
+    "no_research_mocks",
+    "research_backend_ok",
+    "environment_ok",
+)
+
 
 class ExperimentSpecError(ValueError):
     """Raised when an experiment specification is invalid or malformed."""
+
+
+MAX_EXACT_PERMUTATION_SAMPLE_SIZE = 16
+
+
+def calculate_minimum_exact_test_sample_size(
+    target_tasks_count: int,
+    confirmatory_controls_count: int = len(CONFIRMATORY_CONTROLS),
+    confirmatory_endpoints_count: int = len(CONFIRMATORY_METRICS),
+    alpha: float = DEFAULT_FAMILY_WISE_ALPHA,
+) -> int:
+    """Calculate minimum paired sample size n for exact randomization test under Holm correction.
+
+    For n nonzero paired differences, the minimum possible two-sided exact p-value is 2^(1 - n).
+    In a family of m = target_tasks * confirmatory_controls * confirmatory_endpoints tests,
+    the most favorable Holm-adjusted p-value is m * 2^(1 - n).
+    The smallest n satisfying m * 2^(1 - n) <= alpha is ceil(1 + log2(m / alpha)).
+    """
+    if target_tasks_count <= 0 or confirmatory_controls_count <= 0 or confirmatory_endpoints_count <= 0 or alpha <= 0:
+        raise ValueError("All task/control/endpoint counts and alpha must be positive")
+    family_size = int(target_tasks_count * confirmatory_controls_count * confirmatory_endpoints_count)
+    n = 1
+    while family_size * (2.0 ** (1 - n)) > alpha + 1e-15:
+        n += 1
+    if n > MAX_EXACT_PERMUTATION_SAMPLE_SIZE:
+        max_tasks = int((alpha * (2.0 ** (MAX_EXACT_PERMUTATION_SAMPLE_SIZE - 1))) / (confirmatory_controls_count * confirmatory_endpoints_count))
+        raise ExperimentSpecError(
+            f"Calculated sample size n={n} exceeds exact permutation enumeration boundary (n <= {MAX_EXACT_PERMUTATION_SAMPLE_SIZE}). "
+            f"Reduce target_tasks_count (max supported: {max_tasks})."
+        )
+    return n
 
 
 def _canonical_json(data: Any) -> str:
@@ -267,7 +328,7 @@ class ExperimentSpec:
         ]
     )
     conditions: List[str] = field(default_factory=lambda: list(FIVE_CONDITIONS))
-    master_seeds: List[int] = field(default_factory=lambda: [42, 137, 2024, 777, 999])
+    master_seeds: List[int] = field(default_factory=lambda: list(DEFAULT_MASTER_SEEDS))
     proposals_per_run: int = 200
     oracle_budget_per_run: int = 100
     iterations_per_run: int = 5
@@ -364,6 +425,21 @@ class ExperimentSpec:
                 raise ExperimentSpecError("research mode is incompatible with mock validation")
             if str(self.synthesis_mode).lower() in {"mock", "fake", "stub"}:
                 raise ExperimentSpecError("research mode is incompatible with mock synthesis")
+            try:
+                min_seeds = calculate_minimum_exact_test_sample_size(len(self.target_tasks))
+            except ValueError as exc:
+                raise ExperimentSpecError(str(exc)) from exc
+            unique_seeds_count = len(set(self.master_seeds))
+            if unique_seeds_count < min_seeds:
+                raise ExperimentSpecError(
+                    f"research mode requires at least {min_seeds} unique master seeds for {len(self.target_tasks)} "
+                    f"target tasks to be statistically feasible under Holm-Bonferroni exact testing; got {unique_seeds_count}"
+                )
+            if unique_seeds_count > MAX_EXACT_PERMUTATION_SAMPLE_SIZE:
+                raise ExperimentSpecError(
+                    f"research mode supports at most {MAX_EXACT_PERMUTATION_SAMPLE_SIZE} unique master seeds "
+                    f"to remain within exact permutation enumeration; got {unique_seeds_count}"
+                )
 
     @property
     def spec_hash(self) -> str:

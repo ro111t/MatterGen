@@ -28,6 +28,7 @@ from experiments.report import ReportGenerator
 from experiments.runner import CampaignRunner
 from experiments.spec import (
     BASE_COMMIT_SHA,
+    calculate_minimum_exact_test_sample_size,
     ExperimentSpec,
     FIVE_CONDITIONS,
     RunSpec,
@@ -210,7 +211,14 @@ def run_preflight_check(spec: ExperimentSpec) -> Dict[str, Any]:
             or (spec.run_mode != "research" and spec.code_commit == BASE_COMMIT_SHA)
         ),
         "conditions_valid": len(spec.conditions) == 5 and len(set(spec.conditions)) == 5 and set(spec.conditions) == set(FIVE_CONDITIONS),
-        "master_seeds_valid": len(spec.master_seeds) >= 1 and len(set(spec.master_seeds)) == len(spec.master_seeds),
+        "master_seeds_valid": (
+            len(spec.master_seeds) >= 1
+            and len(set(spec.master_seeds)) == len(spec.master_seeds)
+            and (
+                spec.run_mode != "research"
+                or len(set(spec.master_seeds)) >= calculate_minimum_exact_test_sample_size(len(spec.target_tasks))
+            )
+        ),
         "budgets_valid": spec.proposals_per_run > 0 and 0 < spec.oracle_budget_per_run <= spec.proposals_per_run,
         "reference_sets_ok": references_ok,
         "research_tree_clean": not research_dirty,
@@ -633,8 +641,10 @@ def execute_full_experiment_pipeline(
                     "analysis_version": spec.analysis_version,
                     "output_dir": stats_dir,
                     "expected_seeds": spec.master_seeds,
+                    "expected_tasks": [task.task_id for task in spec.target_tasks],
+                    "experiment_id": spec.experiment_id,
+                    "spec_hash": spec.spec_hash,
                 }
-                stats_kwargs["expected_tasks"] = [task.task_id for task in spec.target_tasks]
                 run_statistical_analysis_pipeline(**stats_kwargs)
 
             elif node.node_type == NodeType.QE_AUDIT_SELECTION:
@@ -666,7 +676,21 @@ def execute_full_experiment_pipeline(
 
             elif node.node_type == NodeType.REPORT_GENERATION:
                 rep = ReportGenerator(experiment_root=output_root); stats_dir = output_root / "statistics"; qe_dir = output_root / "qe_audit"
-                stats_results_list = json.loads((stats_dir / "analysis_manifest.json").read_text()).get("results", []) if (stats_dir / "analysis_manifest.json").exists() else []
+                stats_manifest: Dict[str, Any] = {}
+                stats_manifest_path = stats_dir / "analysis_manifest.json"
+                if stats_manifest_path.exists():
+                    try:
+                        loaded_stats_manifest = json.loads(stats_manifest_path.read_text(encoding="utf-8"))
+                        if isinstance(loaded_stats_manifest, dict):
+                            stats_manifest = loaded_stats_manifest
+                    except (OSError, ValueError):
+                        stats_manifest = {}
+                stats_results_list = stats_manifest.get("results", []) if stats_manifest else []
+                if not stats_results_list and (stats_dir / "results.json").exists():
+                    try:
+                        stats_results_list = json.loads((stats_dir / "results.json").read_text(encoding="utf-8"))
+                    except (OSError, ValueError):
+                        stats_results_list = []
                 qe_results_list = list(csv.DictReader((qe_dir / "results.csv").open("r", encoding="utf-8"))) if (qe_dir / "results.csv").exists() else []
                 qe_manifest: Dict[str, Any] = {}
                 qe_manifest_path = qe_dir / "audit_manifest.json"
@@ -707,6 +731,10 @@ def execute_full_experiment_pipeline(
                         "preflight": preflight,
                         "required_preflight_checks": required_names,
                         "required_preflight_results": required_results,
+                        "spec": spec.to_dict(),
+                        "spec_hash": spec.spec_hash,
+                        "analysis_manifest": stats_manifest,
+                        "statistics": stats_manifest,
                         "expected_target_task_ids": [task.task_id for task in spec.target_tasks],
                         "expected_seeds": list(spec.master_seeds),
                         "expected_conditions": list(spec.conditions),

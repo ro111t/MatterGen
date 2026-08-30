@@ -10,11 +10,37 @@ from __future__ import annotations
 
 import csv
 from dataclasses import asdict, dataclass, field
+import hashlib
 import json
 import math
+import os
 from pathlib import Path
 import random
 from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
+
+from experiments.spec import (
+    calculate_minimum_exact_test_sample_size,
+    CONFIRMATORY_CONTROLS,
+    CONFIRMATORY_METRICS,
+    DEFAULT_FAMILY_WISE_ALPHA,
+)
+
+CONFIRMATORY_FAMILY_NAME = "primary_endpoint_and_threshold_yield_family"
+PRIMARY_CENSORED_ENDPOINT_NAME = "oracle_calls_to_first_candidate_at_or_below_0_10"
+PRIMARY_CENSORED_METHOD_NAME = "paired_censored_RMST_within_seed_randomization"
+THRESHOLD_YIELD_ENDPOINT_NAME = "fraction_at_or_below_0_10"
+THRESHOLD_YIELD_METHOD_NAME = "paired_sign_flip"
+HOLM_ADJUSTMENT_METHOD_NAME = "Holm-Bonferroni"
+
+
+def _atomic_write_file(path: Path, content: bytes | str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temp = path.with_name(f".{path.name}.tmp-{os.getpid()}-{random.randint(1000, 9999)}")
+    if isinstance(content, str):
+        temp.write_text(content, encoding="utf-8")
+    else:
+        temp.write_bytes(content)
+    os.replace(temp, path)
 
 
 @dataclass
@@ -91,7 +117,7 @@ def paired_permutation_test_pvalue(
     observed = abs(sum(differences) / n)
     if observed == 0.0:
         return 1.0
-    if n <= 10:
+    if n <= 16:
         total = 1 << n
         extreme = 0
         for mask in range(total):
@@ -369,9 +395,13 @@ def _get(obj: Any, name: str, default: Any = None) -> Any:
 
 
 def run_statistical_analysis_pipeline(
-    run_metrics_list: Sequence[Any], analysis_version: str = "1.0.0",
-    output_dir: Optional[Path] = None, expected_seeds: Optional[Sequence[int]] = None,
+    run_metrics_list: Sequence[Any],
+    analysis_version: str = "1.0.0",
+    output_dir: Optional[Path] = None,
+    expected_seeds: Optional[Sequence[int]] = None,
     expected_tasks: Optional[Sequence[str]] = None,
+    experiment_id: Optional[str] = None,
+    spec_hash: Optional[str] = None,
 ) -> Tuple[List[PairedComparisonResult], Dict[str, Any]]:
     """Run the preregistered paired family without silently dropping arms.
 
@@ -415,11 +445,11 @@ def run_statistical_analysis_pipeline(
         by.setdefault(str(task), {}).setdefault(str(cond), {})[seed_i] = rm
 
     confirmatory_metrics = {
-        "oracle_calls_to_first_candidate_at_or_below_0_10",
-        "fraction_at_or_below_0_10",
+        PRIMARY_CENSORED_ENDPOINT_NAME,
+        THRESHOLD_YIELD_ENDPOINT_NAME,
     }
     analyzed_metrics = [
-        "oracle_calls_to_first_candidate_at_or_below_0_10", "fraction_at_or_below_0_10",
+        PRIMARY_CENSORED_ENDPOINT_NAME, THRESHOLD_YIELD_ENDPOINT_NAME,
         "fraction_at_or_below_0_05", "fraction_at_or_below_0_03", "fraction_at_or_below_0_00",
         "geometry_yield", "oracle_success_rate", "unique_reduced_compositions_count",
     ]
@@ -434,7 +464,7 @@ def run_statistical_analysis_pipeline(
             for metric in analyzed_metrics:
                 a_map: Dict[int, Any] = {}
                 b_map: Dict[int, Any] = {}
-                if metric == "oracle_calls_to_first_candidate_at_or_below_0_10":
+                if metric == PRIMARY_CENSORED_ENDPOINT_NAME:
                     # Do not cast an endpoint until its raw value has passed
                     # the finite/positive/fixed-budget validation.  The
                     # helper repeats this check at the public API boundary so
@@ -466,28 +496,32 @@ def run_statistical_analysis_pipeline(
                     )
                     budget = common_budget
                     for s, rm in proposed.items():
-                        value = _get(rm, metric)
-                        row_budget = _budget_value(rm)
-                        if common_budget > 0.0 and row_budget == common_budget and _valid_censored_time(value, row_budget):
-                            a_map[s] = (float(value), not bool(_get(rm, "primary_endpoint_censored", not bool(_get(rm, "reached_0_10_threshold", False)))))
+                        if _get(rm, "provenance_complete") is True:
+                            value = _get(rm, metric)
+                            row_budget = _budget_value(rm)
+                            if common_budget > 0.0 and row_budget == common_budget and _valid_censored_time(value, row_budget):
+                                a_map[s] = (float(value), not bool(_get(rm, "primary_endpoint_censored", not bool(_get(rm, "reached_0_10_threshold", False)))))
                     for s, rm in arms.get(control, {}).items():
-                        value = _get(rm, metric)
-                        row_budget = _budget_value(rm)
-                        if common_budget > 0.0 and row_budget == common_budget and _valid_censored_time(value, row_budget):
-                            b_map[s] = (float(value), not bool(_get(rm, "primary_endpoint_censored", not bool(_get(rm, "reached_0_10_threshold", False)))))
+                        if _get(rm, "provenance_complete") is True:
+                            value = _get(rm, metric)
+                            row_budget = _budget_value(rm)
+                            if common_budget > 0.0 and row_budget == common_budget and _valid_censored_time(value, row_budget):
+                                b_map[s] = (float(value), not bool(_get(rm, "primary_endpoint_censored", not bool(_get(rm, "reached_0_10_threshold", False)))))
                     res = compute_paired_censored_comparison(task, metric, a_map, b_map, "structured_provenance_memory", control, budget, comp_type, analysis_version, all_seeds)
                 else:
                     for s, rm in proposed.items():
-                        value = _get(rm, metric)
-                        if _finite(value):
-                            a_map[s] = float(value)
+                        if _get(rm, "provenance_complete") is True:
+                            value = _get(rm, metric)
+                            if _finite(value):
+                                a_map[s] = float(value)
                     for s, rm in arms.get(control, {}).items():
-                        value = _get(rm, metric)
-                        if _finite(value):
-                            b_map[s] = float(value)
+                        if _get(rm, "provenance_complete") is True:
+                            value = _get(rm, metric)
+                            if _finite(value):
+                                b_map[s] = float(value)
                     res = compute_paired_comparison(task, metric, a_map, b_map, "structured_provenance_memory", control, comp_type, analysis_version, expected_seeds=all_seeds)
                 if metric in confirmatory_metrics and comp_type == "confirmatory":
-                    res.confirmatory_family = "primary_endpoint_and_threshold_yield_family"
+                    res.confirmatory_family = CONFIRMATORY_FAMILY_NAME
                 results.append(res)
 
                 # The comparison helpers report missing seeds, but an absent
@@ -506,13 +540,16 @@ def run_statistical_analysis_pipeline(
 
     for idx, adjusted in zip(confirmatory_indices, holm_bonferroni_adjust(confirmatory_p)):
         results[idx].p_value_adjusted = adjusted
-        results[idx].adjustment_method = "Holm-Bonferroni"
+        results[idx].adjustment_method = HOLM_ADJUSTMENT_METHOD_NAME
 
+    results_payload = [r.to_dict() for r in results]
     manifest = {
         "analysis_version": analysis_version,
-        "primary_endpoint": "oracle_calls_to_first_candidate_at_or_below_0_10",
+        "experiment_id": experiment_id,
+        "spec_hash": spec_hash,
+        "primary_endpoint": PRIMARY_CENSORED_ENDPOINT_NAME,
         "primary_endpoint_semantics": "right_censored_at_fixed_oracle_budget",
-        "confirmatory_family": "primary_endpoint_and_threshold_yield_family",
+        "confirmatory_family": CONFIRMATORY_FAMILY_NAME,
         "confirmatory_metrics": sorted(confirmatory_metrics),
         "confirmatory_controls": list(conditions[1:4]),
         "all_conditions": list(conditions),
@@ -520,25 +557,72 @@ def run_statistical_analysis_pipeline(
         "expected_tasks": tasks,
         "total_comparisons": len(results),
         "confirmatory_comparisons_count": len(confirmatory_indices),
-        "adjustment_method": "Holm-Bonferroni",
-        "results": [r.to_dict() for r in results],
+        "adjustment_method": HOLM_ADJUSTMENT_METHOD_NAME,
+        "results": results_payload,
     }
     if output_dir:
         output_dir = Path(output_dir)
         output_dir.mkdir(parents=True, exist_ok=True)
-        with (output_dir / "effects.csv").open("w", newline="", encoding="utf-8") as f:
-            fields = ["analysis_version", "target_task", "metric_name", "condition_a", "condition_b", "comparison_type", "sample_size_n", "missing_count", "mean_a", "mean_b", "mean_difference", "median_difference", "ci_95_lower", "ci_95_upper", "p_value_raw", "p_value_adjusted", "adjustment_method", "method", "status"]
-            writer = csv.DictWriter(f, fieldnames=fields)
-            writer.writeheader()
-            for result in results:
-                writer.writerow({k: result.to_dict().get(k, "") for k in fields})
-        (output_dir / "analysis_manifest.json").write_text(json.dumps(manifest, indent=2), encoding="utf-8")
-    return results, {"analysis_version": analysis_version, "total_comparisons": len(results), "confirmatory_comparisons": len(confirmatory_indices), "expected_seeds": all_seeds}
+
+        # 1. effects.csv
+        fields = [
+            "analysis_version", "target_task", "metric_name", "condition_a", "condition_b",
+            "comparison_type", "sample_size_n", "missing_count", "mean_a", "mean_b",
+            "mean_difference", "median_difference", "ci_95_lower", "ci_95_upper",
+            "p_value_raw", "p_value_adjusted", "adjustment_method", "method", "status",
+        ]
+        import io
+        csv_buffer = io.StringIO()
+        writer = csv.DictWriter(csv_buffer, fieldnames=fields, lineterminator="\n")
+        writer.writeheader()
+        for r in results:
+            writer.writerow({k: r.to_dict().get(k, "") for k in fields})
+        csv_bytes = csv_buffer.getvalue().encode("utf-8")
+        _atomic_write_file(output_dir / "effects.csv", csv_bytes)
+        effects_sha256 = hashlib.sha256(csv_bytes).hexdigest()
+
+        # 2. results.json (canonical structured results)
+        results_canonical_json = json.dumps(results_payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+        results_bytes = results_canonical_json.encode("utf-8")
+        _atomic_write_file(output_dir / "results.json", results_bytes)
+        results_sha256 = hashlib.sha256(results_bytes).hexdigest()
+        canonical_results_sha256 = hashlib.sha256(results_bytes).hexdigest()
+
+        # 3. analysis_manifest.json
+        manifest["artifacts"] = {
+            "effects.csv": effects_sha256,
+            "results.json": results_sha256,
+            "canonical_results_sha256": canonical_results_sha256,
+        }
+        manifest_json = json.dumps(manifest, indent=2, sort_keys=True)
+        _atomic_write_file(output_dir / "analysis_manifest.json", manifest_json.encode("utf-8"))
+
+    return results, {
+        "analysis_version": analysis_version,
+        "experiment_id": experiment_id,
+        "spec_hash": spec_hash,
+        "total_comparisons": len(results),
+        "confirmatory_comparisons": len(confirmatory_indices),
+        "expected_seeds": all_seeds,
+        "manifest": manifest,
+    }
 
 
 __all__ = [
-    "KaplanMeierEstimate", "PairedComparisonResult", "bootstrap_paired_ci",
-    "paired_permutation_test_pvalue", "holm_bonferroni_adjust", "kaplan_meier",
-    "compute_paired_comparison", "compute_paired_censored_comparison",
+    "CONFIRMATORY_FAMILY_NAME",
+    "PRIMARY_CENSORED_ENDPOINT_NAME",
+    "PRIMARY_CENSORED_METHOD_NAME",
+    "THRESHOLD_YIELD_ENDPOINT_NAME",
+    "THRESHOLD_YIELD_METHOD_NAME",
+    "HOLM_ADJUSTMENT_METHOD_NAME",
+    "KaplanMeierEstimate",
+    "PairedComparisonResult",
+    "bootstrap_paired_ci",
+    "calculate_minimum_exact_test_sample_size",
+    "paired_permutation_test_pvalue",
+    "holm_bonferroni_adjust",
+    "kaplan_meier",
+    "compute_paired_comparison",
+    "compute_paired_censored_comparison",
     "run_statistical_analysis_pipeline",
 ]

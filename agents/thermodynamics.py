@@ -32,6 +32,12 @@ DEFAULT_RETAIN_THRESHOLD_EV_PER_ATOM = 0.10
 DEFAULT_STABLE_THRESHOLD_EV_PER_ATOM = 0.03
 DEFAULT_SENSITIVITY_THRESHOLDS = (0.03, 0.05, 0.10)
 
+try:
+    import numpy as np
+    _BOOL_TYPES = (bool, np.bool_)
+except Exception:
+    _BOOL_TYPES = (bool,)
+
 
 class ThermodynamicFailureCode(str, Enum):
     RELAXATION_FAILED = "RELAXATION_FAILED"
@@ -276,8 +282,12 @@ def _composition_and_count(structure: Any) -> Tuple[str, float]:
         if not formula or Composition is None:
             raise ValueError("Structure composition is unavailable")
         composition = Composition(str(formula))
-        coords = structure.get("fractional_coordinates", structure.get("positions", structure.get("coordinates")))
-        count = float(len(coords)) if coords is not None else float(composition.num_atoms)
+        raw_frac = structure.get("fractional_coordinates")
+        if isinstance(raw_frac, _BOOL_TYPES) or raw_frac is None:
+            coords = structure.get("positions", structure.get("coordinates", structure.get("coords")))
+        else:
+            coords = raw_frac
+        count = float(len(coords)) if coords is not None and hasattr(coords, "__len__") else float(composition.num_atoms)
         # ``reduced_formula`` applies special molecular conventions (for
         # example O -> O2) that would corrupt total-energy normalization.
         # The explicit formula preserves the actual composition represented by

@@ -32,6 +32,13 @@ except Exception:  # pragma: no cover - exercised on minimal installations
     HAS_PYMATGEN = False
 
 
+try:
+    import numpy as np
+    _BOOL_TYPES = (bool, np.bool_)
+except Exception:
+    _BOOL_TYPES = (bool,)
+
+
 TRANSFERABLE_SCHEMA_VERSION = SCHEMA_VERSION
 MEMORY_MODES = ("none", "text_summary", "structured_provenance", "shuffled_control")
 RELATIONSHIPS = (
@@ -313,11 +320,48 @@ def _coordination_summary(structure: Any) -> Tuple[Optional[Dict[str, Any]], Opt
     # not depend on pymatgen.  Coordinates are treated as fractional when a
     # 3x3 lattice is supplied; this is intentionally a bounded distance count,
     # not a chemical-neighbour inference.
-    positions = _first_present(
-        _structure_value(structure, "fractional_coordinates"),
-        _structure_value(structure, "frac_coords"),
-        _structure_value(structure, "positions"),
-    )
+    raw_frac = _structure_value(structure, "fractional_coordinates")
+    coords_cart_flag = _structure_value(structure, "coords_are_cartesian")
+    cartesian_flag = _structure_value(structure, "cartesian")
+    explicit_frac = _structure_value(structure, "frac_coords")
+    explicit_cart = _structure_value(structure, "cart_coords")
+
+    if isinstance(raw_frac, _BOOL_TYPES):
+        if bool(raw_frac):
+            positions = _first_present(
+                explicit_frac,
+                _structure_value(structure, "positions"),
+                _structure_value(structure, "coordinates"),
+            )
+            is_fractional = True
+        else:
+            positions = _first_present(
+                explicit_cart,
+                _structure_value(structure, "positions"),
+                _structure_value(structure, "coordinates"),
+            )
+            is_fractional = False
+    elif raw_frac is not None:
+        positions = raw_frac
+        is_fractional = True
+    elif explicit_frac is not None:
+        positions = explicit_frac
+        is_fractional = True
+    elif explicit_cart is not None:
+        positions = explicit_cart
+        is_fractional = False
+    else:
+        positions = _first_present(
+            _structure_value(structure, "positions"),
+            _structure_value(structure, "coordinates"),
+        )
+        if isinstance(coords_cart_flag, _BOOL_TYPES) and bool(coords_cart_flag):
+            is_fractional = False
+        elif isinstance(cartesian_flag, _BOOL_TYPES) and bool(cartesian_flag):
+            is_fractional = False
+        else:
+            is_fractional = True
+
     lattice = _structure_value(structure, "lattice")
     matrix = lattice.get("matrix") if isinstance(lattice, Mapping) else lattice
     if isinstance(positions, (list, tuple)) and positions and isinstance(matrix, (list, tuple)) and len(matrix) == 3:
@@ -327,10 +371,15 @@ def _coordination_summary(structure: Any) -> Tuple[Optional[Dict[str, Any]], Opt
             # envelope, capped to avoid counting distant periodic shells.
             lengths = [sum(x * x for x in row) ** 0.5 for row in vectors]
             cutoff = min(3.0, max(min(lengths) * 0.55, 1e-8))
-            cart = []
-            for pos in positions:
-                frac = [float(x) for x in pos[:3]]
-                cart.append([sum(frac[k] * vectors[k][j] for k in range(3)) for j in range(3)])
+            if is_fractional:
+                cart = []
+                for pos in positions:
+                    frac = [float(x) for x in pos[:3]]
+                    cart.append([sum(frac[k] * vectors[k][j] for k in range(3)) for j in range(3)])
+                method_name = "provided_fractional_distance_v1"
+            else:
+                cart = [[float(x) for x in pos[:3]] for pos in positions]
+                method_name = "provided_cartesian_distance_v1"
             values = []
             for i, left in enumerate(cart):
                 n = 0
@@ -353,7 +402,7 @@ def _coordination_summary(structure: Any) -> Tuple[Optional[Dict[str, Any]], Opt
                 "coordination_number_min": min(values), "coordination_number_max": max(values),
                 "coordination_number_mean": sum(values) / len(values),
                 "coordination_number_counts": {str(n): values.count(n) for n in sorted(set(values))},
-                "method": "provided_fractional_distance_v1",
+                "method": method_name,
             }, None
         except (TypeError, ValueError, IndexError, ZeroDivisionError):
             return None, "COORDINATION_COMPUTATION_FAILED"

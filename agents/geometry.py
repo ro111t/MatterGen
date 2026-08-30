@@ -31,6 +31,7 @@ except Exception:  # pragma: no cover - exercised when ASE is unavailable
 
 
 DEFAULT_MIN_DISTANCE_ANGSTROM = 0.8
+_BOOL_TYPES = (bool, np.bool_)
 
 
 class GeometryFailureCode(str, Enum):
@@ -374,11 +375,15 @@ class GeometryValidator:
     def _validate_dict(self, structure: Dict[str, Any]) -> GeometryValidationResult:
         composition = structure.get("composition", structure.get("formula"))
         lattice = structure.get("lattice", structure.get("cell"))
-        coords = structure.get("positions", structure.get("coordinates"))
-        if "fractional_coordinates" in structure:
-            coords = structure.get("fractional_coordinates")
+        raw_frac = structure.get("fractional_coordinates")
+        if isinstance(raw_frac, _BOOL_TYPES):
+            coords = structure.get("positions", structure.get("coordinates", structure.get("coords")))
+            coords_are_cartesian = not bool(raw_frac)
+        elif raw_frac is not None:
+            coords = raw_frac
             coords_are_cartesian = False
         else:
+            coords = structure.get("positions", structure.get("coordinates", structure.get("coords")))
             coords_are_cartesian = bool(structure.get("coords_are_cartesian", structure.get("cartesian", False)))
         species = structure.get("species")
         if species is None:
