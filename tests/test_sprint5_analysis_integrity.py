@@ -185,7 +185,7 @@ def test_report_c5_binds_supplied_rows_to_qe_manifest_provenance(tmp_path):
     phase = {
         "status": "CONVERGED", "input_hash": "a" * 64, "result_hash": "b" * 64,
         "output_hash": "c" * 64, "executable": "pw.x", "executable_version": "qe-1",
-        "sssp_manifest_sha256": "d" * 64,
+        "qe_executable_sha256": "e" * 64, "sssp_manifest_sha256": "d" * 64,
     }
     row = {
         "candidate_id": "c", "target_task": "task", "condition": "structured_provenance_memory", "seed": 1,
@@ -196,7 +196,8 @@ def test_report_c5_binds_supplied_rows_to_qe_manifest_provenance(tmp_path):
         "margin_difference_ev_per_atom": 0.0, "reaction_equation": "Li -> Li", "reaction_balanced": True,
         "status": "VALIDATED", "candidate_input_hash": "a" * 64,
         "candidate_result_hash": "b" * 64, "candidate_output_hash": "c" * 64,
-        "qe_executable": "pw.x", "qe_executable_version": "qe-1", "sssp_manifest_sha256": "d" * 64,
+        "qe_executable": "pw.x", "qe_executable_version": "qe-1",
+        "qe_executable_sha256": "e" * 64, "sssp_manifest_sha256": "d" * 64,
         "participating_phase_results": [phase],
     }
     qe_dir = tmp_path / "qe_audit"
@@ -211,6 +212,10 @@ def test_report_c5_binds_supplied_rows_to_qe_manifest_provenance(tmp_path):
     manifest = {
         "run_mode": "research", "mock_execution": False, "selection_count": 1,
         "selection_insufficiency": None, "result_provenance": [row],
+        "config": {
+            "qe_executable_sha256": "e" * 64,
+            "sssp_manifest_sha256": "d" * 64,
+        },
     }
     manifest["artifacts"] = {
         "selection.json": hashlib.sha256((qe_dir / "selection.json").read_bytes()).hexdigest(),

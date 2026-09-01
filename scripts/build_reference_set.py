@@ -48,6 +48,7 @@ def main() -> int:
         reference_set_id=payload["reference_set_id"], chemical_system=payload["chemical_system"],
         inputs=inputs, evaluator=_load_evaluator(args.evaluator), output_path=args.output,
         created_at_iso=payload.get("created_at_iso"),
+        source_selection=payload.get("source_selection", payload.get("coverage_manifest")),
     )
     print(json.dumps({
         "reference_set_id": frozen.reference_set_id,

@@ -430,12 +430,10 @@ def compute_run_metrics(
                 first = min(oracle_budget, int(c.oracle_call_index or oracle_budget))
                 break
     reached = first is not None
-    # An incomplete order is missing endpoint evidence, not a censored
-    # endpoint observed at the budget.  This prevents downstream survival
-    # analysis from treating an unsequenced success as a valid censoring event.
-    endpoint_time = first if order_complete else None
-    if order_complete and not reached:
-        endpoint_time = oracle_budget
+    # If the threshold is reached, endpoint_time is the call at first achievement.
+    # If not reached, censoring time is the last actually observed oracle evaluation.
+    # Zero-call runs have no valid positive follow-up and remain missing (None).
+    endpoint_time = first if reached else (oracle_evals if (order_complete and oracle_evals > 0) else None)
 
     def count(threshold: float) -> int:
         return sum(
@@ -463,14 +461,13 @@ def compute_run_metrics(
         best_at[budget] = min(values) if values else None
     best_overall = min((v for _, v in trajectory), default=None)
     auc: Optional[float] = None
-    if trajectory:
+    if trajectory and order_complete:
         auc = 0.0
         prev_x = 0
         prev_y = trajectory[0][1]
         for x, y in trajectory:
             auc += max(0, x - prev_x) * prev_y
             prev_x, prev_y = x, y
-        auc += max(0, oracle_budget - prev_x) * prev_y
 
     unique_formulas = {c.reduced_formula for c in oracle_candidates if c.reduced_formula}
     unique_anon = {c.anonymous_stoichiometry for c in oracle_candidates if c.anonymous_stoichiometry}
@@ -484,6 +481,12 @@ def compute_run_metrics(
         missing_fields.append(proposal_discrepancy)
     if budget_discrepancy:
         missing_fields.append(budget_discrepancy)
+    meta = manifest.get("metadata") if isinstance(manifest.get("metadata"), Mapping) else source.get("metadata", {})
+    if not isinstance(meta, Mapping):
+        meta = {}
+    shortfall = meta.get("backend_generation_shortfall") or manifest.get("backend_generation_shortfall")
+    if shortfall and isinstance(shortfall, (int, float)) and shortfall > 0:
+        missing_fields.append("backend_generation_shortfall")
 
     metrics = RunMetrics(
         run_id=run_id,

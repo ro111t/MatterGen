@@ -55,6 +55,7 @@ class DAGNode:
     executed: bool = False
     success: bool = False
     result_hash: Optional[str] = None
+    result_artifacts: Dict[str, str] = field(default_factory=dict)
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -68,7 +69,77 @@ class DAGNode:
             "executed": self.executed,
             "success": self.success,
             "result_hash": self.result_hash,
+            "result_artifacts": dict(self.result_artifacts),
         }
+
+
+REQUIRED_NODE_ARTIFACTS: Dict[NodeType, Set[str]] = {
+    NodeType.AGGREGATION: {
+        "aggregates/runs.json",
+        "aggregates/candidates.json",
+        "aggregates/runs.parquet",
+        "aggregates/candidates.parquet",
+    },
+    NodeType.STATISTICAL_ANALYSIS: {
+        "statistics/effects.csv",
+        "statistics/results.json",
+        "statistics/analysis_manifest.json",
+    },
+    NodeType.QE_AUDIT_SELECTION: {
+        "qe_audit/selection.json",
+    },
+    NodeType.QE_AUDIT_EXECUTION: {
+        "qe_audit/results.csv",
+        "qe_audit/audit_manifest.json",
+        "qe_audit/selection.json",
+    },
+    NodeType.REPORT_GENERATION: {
+        "paper/claim_evidence_matrix.md",
+        "paper/reproducibility_checklist.md",
+        "paper/claim_status.json",
+        "figures/fig1_best_so_far_vs_oracle_calls.json",
+        "figures/fig2_time_to_threshold_censored.json",
+        "figures/fig3_paired_effect_sizes.json",
+        "figures/fig4_geometry_and_oracle_failures.json",
+        "figures/fig5_memory_directives_breakdown.json",
+        "figures/fig6_shuffled_control_validation.json",
+        "figures/fig7_chgnet_vs_qe_local_decomposition.json",
+        "tables/table_threshold_sensitivity.json",
+        "tables/table_threshold_sensitivity.csv",
+    },
+}
+
+
+def validate_and_normalize_artifact_map(node_id: str, artifacts: Any) -> Dict[str, str]:
+    """Validate and normalize a result_artifacts mapping for any node state."""
+    if not isinstance(artifacts, Mapping):
+        raise DAGValidationError(f"Node '{node_id}' result_artifacts must be a mapping, got {type(artifacts).__name__}")
+    cleaned: Dict[str, str] = {}
+    raw_key_by_normalized: Dict[str, str] = {}
+    for rel_path, digest in artifacts.items():
+        if not isinstance(rel_path, str) or not rel_path.strip():
+            raise DAGValidationError(f"Node '{node_id}' result_artifacts contains empty or non-string key: {rel_path!r}")
+        norm_k = rel_path.replace("\\", "/")
+        parts = norm_k.split("/")
+        if (
+            "\x00" in norm_k
+            or norm_k.startswith("/")
+            or ":" in norm_k
+            or any(part in {"", ".", ".."} for part in parts)
+        ):
+            raise DAGValidationError(
+                f"Node '{node_id}' result_artifacts key '{rel_path}' is a noncanonical, absolute, empty, or traversing path"
+            )
+        if norm_k in cleaned:
+            raise DAGValidationError(
+                f"Node '{node_id}' result_artifacts contains duplicate keys after path normalization: "
+                f"{raw_key_by_normalized[norm_k]!r} and {rel_path!r}"
+            )
+        if not isinstance(digest, str) or len(digest) != 64 or not all(c in "0123456789abcdefABCDEF" for c in digest):
+            raise DAGValidationError(f"Node '{node_id}' result_artifacts key '{rel_path}' has malformed digest: {digest!r}")
+        cleaned[norm_k] = digest.lower()
+        raw_key_by_normalized[norm_k] = rel_path
+    return cleaned
 
 
 class ExperimentDAG:
@@ -442,3 +513,155 @@ class ExperimentDAG:
             "total_runs": self.total_run_count,
             "nodes": {nid: n.to_dict() for nid, n in sorted(self.nodes.items())},
         }
+
+    @classmethod
+    def from_dict(cls, data: Mapping[str, Any], spec: ExperimentSpec) -> ExperimentDAG:
+        """Hydrate DAG from existing JSON dictionary while verifying identity, structure, and paths."""
+        if not isinstance(data, Mapping):
+            raise DAGValidationError("Existing DAG manifest must be a mapping dictionary")
+        stored_spec_hash = data.get("spec_hash")
+        if not stored_spec_hash or not isinstance(stored_spec_hash, str) or stored_spec_hash != spec.spec_hash:
+            raise DAGValidationError(
+                f"Existing DAG spec_hash mismatch or missing: expected {spec.spec_hash}, got {stored_spec_hash}"
+            )
+        stored_exp_id = data.get("experiment_id")
+        if not stored_exp_id or str(stored_exp_id) != str(spec.experiment_id):
+            raise DAGValidationError(
+                f"Existing DAG experiment_id mismatch: expected {spec.experiment_id}, got {stored_exp_id}"
+            )
+        dag = cls(spec)
+        nodes_data = data.get("nodes")
+        if not isinstance(nodes_data, Mapping):
+            raise DAGValidationError("Existing DAG missing valid 'nodes' mapping")
+        if set(nodes_data.keys()) != set(dag.nodes.keys()):
+            raise DAGValidationError(
+                f"Existing DAG node IDs mismatch: expected {sorted(dag.nodes.keys())}, got {sorted(nodes_data.keys())}"
+            )
+        if "total_nodes" in data:
+            try:
+                if int(data["total_nodes"]) != len(dag.nodes):
+                    raise DAGValidationError(
+                        f"Existing DAG total_nodes mismatch: expected {len(dag.nodes)}, got {data['total_nodes']}"
+                    )
+            except (TypeError, ValueError) as exc:
+                raise DAGValidationError(f"Invalid total_nodes in existing DAG: {data['total_nodes']}") from exc
+        if "total_runs" in data:
+            try:
+                if int(data["total_runs"]) != dag.total_run_count:
+                    raise DAGValidationError(
+                        f"Existing DAG total_runs mismatch: expected {dag.total_run_count}, got {data['total_runs']}"
+                    )
+            except (TypeError, ValueError) as exc:
+                raise DAGValidationError(f"Invalid total_runs in existing DAG: {data['total_runs']}") from exc
+
+        for node_id, node_dict in nodes_data.items():
+            if not isinstance(node_dict, Mapping):
+                raise DAGValidationError(f"Existing DAG node '{node_id}' is malformed")
+            if "node_id" in node_dict and str(node_dict["node_id"]) != str(node_id):
+                raise DAGValidationError(
+                    f"Existing DAG node key '{node_id}' does not match payload node_id '{node_dict['node_id']}'"
+                )
+            target_node = dag.nodes[node_id]
+            node_type = node_dict.get("node_type")
+            if node_type != target_node.node_type.value:
+                raise DAGValidationError(
+                    f"Node '{node_id}' node_type mismatch: expected {target_node.node_type.value}, got {node_type}"
+                )
+            persisted_deps = set(node_dict.get("dependencies", []))
+            if persisted_deps != target_node.dependencies:
+                raise DAGValidationError(
+                    f"Node '{node_id}' dependencies mismatch: expected {sorted(target_node.dependencies)}, got {sorted(persisted_deps)}"
+                )
+
+            persisted_executed = bool(node_dict.get("executed", False))
+            persisted_success = bool(node_dict.get("success", False))
+            if persisted_success and not persisted_executed:
+                raise DAGValidationError(f"Node '{node_id}' state inconsistent: success=True requires executed=True")
+            if not persisted_executed and persisted_success:
+                raise DAGValidationError(f"Node '{node_id}' state inconsistent: executed=False requires success=False")
+
+            persisted_path = node_dict.get("expected_output_path")
+            canonical_path = target_node.expected_output_path
+            if canonical_path is not None:
+                if persisted_success and not persisted_path:
+                    raise DAGValidationError(f"Node '{node_id}' is successful but missing expected_output_path")
+                if persisted_path:
+                    persisted_norm = str(persisted_path).replace("\\", "/")
+                    canonical_norm = str(canonical_path).replace("\\", "/")
+                    if target_node.node_type == NodeType.SOURCE_MEMORY_SNAPSHOT:
+                        placeholder_path = Path(canonical_path)
+                        expected_dir = str(placeholder_path.parent).replace("\\", "/")
+                        persisted_p = Path(persisted_norm)
+                        persisted_dir = str(persisted_p.parent).replace("\\", "/")
+                        if persisted_dir != expected_dir or persisted_p.suffix != ".db":
+                            raise DAGValidationError(
+                                f"Node '{node_id}' persisted snapshot path '{persisted_path}' is outside expected directory '{expected_dir}' or has invalid extension"
+                            )
+                        name = persisted_p.stem
+                        expected_prefix = placeholder_path.stem
+                        is_canonical = (name == expected_prefix)
+                        is_sibling = (
+                            name.startswith(expected_prefix + "_")
+                            and len(name) == len(expected_prefix) + 1 + 64
+                            and all(c in "0123456789abcdefABCDEF" for c in name[len(expected_prefix) + 1:])
+                        )
+                        if not (is_canonical or is_sibling):
+                            raise DAGValidationError(
+                                f"Node '{node_id}' persisted snapshot path '{persisted_path}' is not a valid content-addressed sibling of '{canonical_path}'"
+                            )
+                        target_node.expected_output_path = persisted_norm
+                    else:
+                        if persisted_norm != canonical_norm:
+                            raise DAGValidationError(
+                                f"Node '{node_id}' persisted output path '{persisted_path}' does not match canonical path '{canonical_path}'"
+                            )
+                        target_node.expected_output_path = canonical_path
+            else:
+                if persisted_path:
+                    raise DAGValidationError(f"Node '{node_id}' has unexpected persisted output path '{persisted_path}'")
+
+            res_hash = node_dict.get("result_hash")
+            if persisted_success and canonical_path is not None:
+                if not res_hash or not isinstance(res_hash, str) or len(res_hash) != 64 or not all(c in "0123456789abcdefABCDEF" for c in res_hash):
+                    raise DAGValidationError(
+                        f"Node '{node_id}' is successful with expected output path '{target_node.expected_output_path}', "
+                        f"but has missing or invalid 64-character hexadecimal result_hash: {res_hash}"
+                    )
+                res_hash = res_hash.lower()
+            elif res_hash is not None:
+                if not isinstance(res_hash, str) or len(res_hash) != 64 or not all(c in "0123456789abcdefABCDEF" for c in res_hash):
+                    raise DAGValidationError(f"Node '{node_id}' has malformed result_hash: {res_hash}")
+                res_hash = res_hash.lower()
+
+            persisted_artifacts = node_dict.get("result_artifacts")
+            if persisted_artifacts is not None:
+                cleaned_artifacts = validate_and_normalize_artifact_map(node_id, persisted_artifacts)
+            else:
+                cleaned_artifacts = {}
+
+            if target_node.node_type in REQUIRED_NODE_ARTIFACTS:
+                if persisted_success:
+                    if persisted_artifacts is None or not isinstance(persisted_artifacts, Mapping) or not persisted_artifacts:
+                        raise DAGValidationError(
+                            f"Node '{node_id}' ({target_node.node_type.value}) is successful but missing required result_artifacts contract"
+                        )
+                    req_keys = REQUIRED_NODE_ARTIFACTS[target_node.node_type]
+                    missing_keys = req_keys - set(cleaned_artifacts.keys())
+                    if missing_keys:
+                        raise DAGValidationError(
+                            f"Node '{node_id}' ({target_node.node_type.value}) result_artifacts missing required contract keys: {sorted(missing_keys)}"
+                        )
+                    if target_node.node_type == NodeType.AGGREGATION:
+                        extra_keys = set(cleaned_artifacts.keys()) - req_keys
+                        if extra_keys:
+                            raise DAGValidationError(
+                                f"Node '{node_id}' (aggregation) result_artifacts contains unexpected keys: {sorted(extra_keys)}"
+                            )
+                target_node.result_artifacts = cleaned_artifacts
+            else:
+                target_node.result_artifacts = cleaned_artifacts
+
+            target_node.executed = persisted_executed
+            target_node.success = persisted_success
+            target_node.result_hash = res_hash
+        return dag

@@ -202,7 +202,7 @@ def test_campaign_truncates_generation_and_preserves_budget_totals(tmp_path, mon
     monkeypatch.setattr("agents.screening.HAS_CHGNET", False)
     objective = CampaignObjective(
         target_properties={}, constraints={"elements": ["Li"]},
-        success_criteria={"min_score": 999}, domain="budget", max_iterations=3,
+        success_criteria={"min_score": 999}, domain="budget", max_iterations=1,
     )
     campaign = _BudgetCampaign(CampaignConfig(
         name="budget", objective=objective, output_dir=tmp_path,
@@ -254,7 +254,7 @@ def test_manifest_and_reproduction_preserve_budget_limits(tmp_path, monkeypatch)
     assert manifest["oracle_budget"] == 2
     assert manifest["config"]["proposal_budget"] == 4
     assert manifest["config"]["oracle_budget"] == 2
-    assert manifest["proposals_generated"] == 1
+    assert manifest["proposals_generated"] == 4
     assert manifest["iteration_budget_counters"]
 
     reproduced = MaterialsDiscoveryCampaign.reproduce_from_manifest(

@@ -126,6 +126,8 @@ class CertificationReport:
     other_succeeded: int
     other_success_fraction: float
     failures: List[Dict[str, str]] = field(default_factory=list)
+    compound_coverage_valid: bool = True
+    missing_expected_source_phases: List[str] = field(default_factory=list)
 
 
 @dataclass
@@ -139,10 +141,13 @@ class FrozenReferenceSet:
     created_at_iso: str
     schema_version: str = THERMODYNAMICS_SCHEMA_VERSION
     reference_set_hash: Optional[str] = None
+    source_selection: Optional[Dict[str, Any]] = None
 
     def payload(self) -> Dict[str, Any]:
         value = asdict(self)
         value.pop("reference_set_hash", None)
+        if value.get("source_selection") is None:
+            value.pop("source_selection", None)
         for phase in value["phases"]:
             phase["structure"] = serialize_structure(phase["structure"])
             phase["relaxed_structure"] = serialize_structure(phase["relaxed_structure"])
@@ -247,7 +252,7 @@ def canonical_json(payload: Mapping[str, Any]) -> str:
 
 
 def sha256_payload(payload: Mapping[str, Any]) -> str:
-    return hashlib.sha256(canonical_json(payload).encode("utf-8")).hexdigest()
+    return hashlib.sha256((canonical_json(payload) + "\n").encode("utf-8")).hexdigest()
 
 
 def serialize_structure(structure: Any) -> Any:
@@ -314,7 +319,7 @@ def _dedup_key(item: ReferencePhaseInput) -> str:
         "composition": _composition_and_count(item.structure)[0],
         "structure": structure_payload,
     }
-    return sha256_payload(payload)
+    return hashlib.sha256(canonical_json(payload).encode("utf-8")).hexdigest()
 
 
 def _finite_optional(value: Any) -> Optional[float]:
@@ -428,22 +433,33 @@ def _relax_record(item: ReferencePhaseInput, evaluator: StructureEvaluator,
     )
 
 
-def _certify(phases: Sequence[ReferencePhaseRecord], chemical_system: Sequence[str]) -> CertificationReport:
+def _certify(
+    phases: Sequence[ReferencePhaseRecord],
+    chemical_system: Sequence[str],
+    source_selection: Optional[Mapping[str, Any]] = None,
+) -> CertificationReport:
     endpoints = sorted(set(chemical_system))
     endpoint_status = {element: False for element in endpoints}
     near: List[ReferencePhaseRecord] = []
     other: List[ReferencePhaseRecord] = []
+    compound_phases: List[ReferencePhaseRecord] = []
+    present_source_ids: Set[str] = set()
+
     for phase in phases:
+        present_source_ids.add(phase.source_id)
         phase_elements = _elements(phase.composition)
         if len(phase_elements) == 1 and phase_elements[0] in endpoint_status:
             endpoint_status[phase_elements[0]] = endpoint_status[phase_elements[0]] or phase.success
             continue
+        if len(phase_elements) >= 2:
+            compound_phases.append(phase)
         source_hull = phase.source_energy_above_hull_ev_per_atom
         if source_hull is not None and float(source_hull) <= 0.05:
             near.append(phase)
         else:
             other.append(phase)
-    missing = sorted(element for element, success in endpoint_status.items() if not success)
+
+    missing_endpoints = sorted(element for element, success in endpoint_status.items() if not success)
     near_ok = sum(phase.success for phase in near)
     other_ok = sum(phase.success for phase in other)
     fraction = 1.0 if not other else other_ok / len(other)
@@ -451,14 +467,43 @@ def _certify(phases: Sequence[ReferencePhaseRecord], chemical_system: Sequence[s
         {"source_id": phase.source_id, "failure_code": phase.failure_code or "UNKNOWN"}
         for phase in phases if not phase.success
     ]
-    certified = not missing and near_ok == len(near) and fraction >= 0.95
+
+    # Multicomponent systems (len(chemical_system) >= 2) require non-vacuous compound coverage
+    # Elemental endpoints alone must never certify a multicomponent reference set.
+    compound_coverage_valid = True
+    if len(endpoints) >= 2:
+        if not compound_phases:
+            compound_coverage_valid = False
+
+    missing_expected: List[str] = []
+    if source_selection is not None:
+        expected_ids = source_selection.get("expected_source_phase_ids", [])
+        if isinstance(expected_ids, list):
+            missing_expected = sorted(pid for pid in expected_ids if pid not in present_source_ids)
+            if missing_expected:
+                compound_coverage_valid = False
+
+    certified = (
+        not missing_endpoints
+        and (near_ok == len(near))
+        and (fraction >= 0.95)
+        and compound_coverage_valid
+        and (not missing_expected)
+    )
+
     return CertificationReport(
-        certified=certified, chemical_system=endpoints,
+        certified=certified,
+        chemical_system=endpoints,
         required_elemental_endpoints=endpoints,
-        missing_or_failed_elemental_endpoints=missing,
-        near_hull_total=len(near), near_hull_succeeded=near_ok,
-        other_total=len(other), other_succeeded=other_ok,
-        other_success_fraction=fraction, failures=failures,
+        missing_or_failed_elemental_endpoints=missing_endpoints,
+        near_hull_total=len(near),
+        near_hull_succeeded=near_ok,
+        other_total=len(other),
+        other_succeeded=other_ok,
+        other_success_fraction=fraction,
+        failures=failures,
+        compound_coverage_valid=compound_coverage_valid,
+        missing_expected_source_phases=missing_expected,
     )
 
 
@@ -466,6 +511,7 @@ def build_frozen_reference_set(
     *, reference_set_id: str, chemical_system: Sequence[str], inputs: Iterable[ReferencePhaseInput],
     evaluator: StructureEvaluator, output_path: Path | str, created_at_iso: Optional[str] = None,
     geometry_min_distance: float = 0.8,
+    source_selection: Optional[Mapping[str, Any]] = None,
 ) -> FrozenReferenceSet:
     """Relax, certify, and freeze a local reference set without network access."""
     system = sorted(set(str(element) for element in chemical_system))
@@ -517,12 +563,14 @@ def build_frozen_reference_set(
         _relax_record(item, evaluator, validator, key, system)
         for key, item in sorted(unique.items())
     ]
-    certification = _certify(phases, system)
+    selection_dict = dict(source_selection) if source_selection is not None else None
+    certification = _certify(phases, system, selection_dict)
     frozen = FrozenReferenceSet(
         reference_set_id=reference_set_id, chemical_system=system,
         model=evaluator.model_identity, relaxation_settings=evaluator.relaxation_settings,
         phases=phases, certification=certification,
         created_at_iso=created_at_iso or datetime.now(timezone.utc).isoformat(),
+        source_selection=selection_dict,
     )
     write_frozen_reference_set(frozen, output_path)
     return frozen
@@ -532,16 +580,18 @@ def write_frozen_reference_set(reference_set: FrozenReferenceSet, output_path: P
     path = Path(output_path)
     path.parent.mkdir(parents=True, exist_ok=True)
     payload = reference_set.payload()
-    digest = sha256_payload(payload)
     canonical = canonical_json(payload) + "\n"
+    canonical_bytes = canonical.encode("utf-8")
+    digest = hashlib.sha256(canonical_bytes).hexdigest()
     checksum_path = path.with_suffix(path.suffix + ".sha256")
     if path.exists():
         # Frozen artifacts are immutable and must remain byte-canonical;
         # changing scientific content or formatting requires a new path/version.
         try:
-            existing_raw = path.read_text(encoding="utf-8")
+            existing_bytes = path.read_bytes()
+            existing_digest = hashlib.sha256(existing_bytes).hexdigest()
+            existing_raw = existing_bytes.decode("utf-8")
             existing_payload = json.loads(existing_raw)
-            existing_digest = sha256_payload(existing_payload)
         except Exception as exc:
             raise ReferenceSetError(f"Existing reference-set artifact is unreadable: {path}") from exc
         if existing_digest != digest:
@@ -555,7 +605,7 @@ def write_frozen_reference_set(reference_set: FrozenReferenceSet, output_path: P
         if not checksum_path.exists() or checksum_path.read_text(encoding="ascii").strip() != digest:
             raise ReferenceSetError(f"Existing reference-set checksum is missing or invalid: {checksum_path}")
     else:
-        path.write_text(canonical, encoding="utf-8")
+        path.write_bytes(canonical_bytes)
         checksum_path.write_text(digest + "\n", encoding="ascii")
     reference_set.reference_set_hash = digest
     return digest
@@ -570,6 +620,9 @@ def _frozen_from_payload(payload: Mapping[str, Any], digest: str) -> FrozenRefer
         value["structure"] = deserialize_structure(value.get("structure"))
         value["relaxed_structure"] = deserialize_structure(value.get("relaxed_structure"))
         phases.append(ReferencePhaseRecord(**value))
+    source_selection = payload.get("source_selection")
+    if source_selection is not None:
+        source_selection = dict(source_selection)
     return FrozenReferenceSet(
         reference_set_id=payload["reference_set_id"], chemical_system=list(payload["chemical_system"]),
         model=ModelIdentity(**payload["model"]),
@@ -577,6 +630,7 @@ def _frozen_from_payload(payload: Mapping[str, Any], digest: str) -> FrozenRefer
         phases=phases, certification=CertificationReport(**payload["certification"]),
         created_at_iso=payload["created_at_iso"], schema_version=payload["schema_version"],
         reference_set_hash=digest,
+        source_selection=source_selection,
     )
 
 
@@ -585,16 +639,18 @@ def load_frozen_reference_set(
     expected_settings: Optional[RelaxationSettings] = None,
     required_chemical_system: Optional[Sequence[str]] = None,
     require_certified: bool = True,
+    expected_sha256: Optional[str] = None,
 ) -> FrozenReferenceSet:
     path = Path(path)
     try:
-        raw = path.read_text(encoding="utf-8")
+        raw_bytes = path.read_bytes()
+        digest = hashlib.sha256(raw_bytes).hexdigest()
+        raw = raw_bytes.decode("utf-8")
         payload = json.loads(raw)
     except Exception as exc:
         raise ReferenceSetError(f"Reference-set artifact is unreadable: {path}") from exc
     if not isinstance(payload, Mapping):
         raise ReferenceSetError("Reference-set artifact root must be a JSON object")
-    digest = sha256_payload(payload)
     checksum_path = path.with_suffix(path.suffix + ".sha256")
     try:
         checksum = checksum_path.read_text(encoding="ascii").strip()
@@ -604,6 +660,8 @@ def load_frozen_reference_set(
         raise ReferenceSetError("Reference-set SHA256 verification failed")
     if raw != canonical_json(payload) + "\n":
         raise ReferenceSetError("Reference-set artifact is not canonical JSON")
+    if expected_sha256 is not None and digest != str(expected_sha256).strip().lower():
+        raise ReferenceSetError(f"Reference-set SHA256 mismatch: expected {expected_sha256}, got {digest}")
     try:
         frozen = _frozen_from_payload(payload, digest)
     except Exception as exc:
@@ -611,7 +669,7 @@ def load_frozen_reference_set(
             raise
         raise ReferenceSetError("Reference-set payload is invalid") from exc
     try:
-        recomputed_certification = _certify(frozen.phases, frozen.chemical_system)
+        recomputed_certification = _certify(frozen.phases, frozen.chemical_system, frozen.source_selection)
     except Exception as exc:
         raise ReferenceSetError("Reference-set certification cannot be recomputed") from exc
     if recomputed_certification != frozen.certification:

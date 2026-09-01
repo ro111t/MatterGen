@@ -180,7 +180,7 @@ def test_loader_recomputes_certification_even_when_sidecar_is_rewritten(tmp_path
     # An attacker who can rewrite both files must not be able to mark a
     # semantically invalid certification as valid by recomputing the digest.
     payload["certification"]["near_hull_succeeded"] = 999
-    path.write_text(canonical_json(payload) + "\n", encoding="utf-8")
+    path.write_bytes((canonical_json(payload) + "\n").encode("utf-8"))
     path.with_suffix(path.suffix + ".sha256").write_text(
         sha256_payload(payload) + "\n", encoding="ascii"
     )

@@ -9,13 +9,14 @@ max iteration count is reached or a success criterion is met.
 
 import argparse
 from collections import Counter
-import json
-import os
-import time
-import uuid
 from dataclasses import dataclass
+import json
+import math
+import os
 from pathlib import Path
+import time
 from typing import Any, Dict, List, Optional, Union
+import uuid
 
 from agents.orchestrator import OrchestratorAgent, CampaignObjective
 from agents.generator import GenerationAgent
@@ -148,6 +149,8 @@ class MaterialsDiscoveryCampaign:
     Autonomous materials discovery campaign with persistent CareerMemory and full Candidate Provenance.
     """
 
+    backend_generation_shortfall_debt: int = 0
+
     def __init__(self, config: CampaignConfig):
         self.config = config
         self.config.run_mode = normalize_run_mode(self.config.run_mode)
@@ -162,6 +165,7 @@ class MaterialsDiscoveryCampaign:
         self.results_history = []
         self.campaign_id = ""
         self.termination_reason: Optional[str] = None
+        self.backend_generation_shortfall_debt = 0
 
         # Build the execution boundary before opening persistent memory or
         # creating output artifacts.  In research mode each component is
@@ -376,13 +380,15 @@ class MaterialsDiscoveryCampaign:
         self._log(f"Target: {objective.target_properties}")
 
         start_time = time.time()
-
         while self.iteration < objective.max_iterations:
             if self.budget_tracker.proposal_budget_remaining == 0:
                 self.termination_reason = "PROPOSAL_BUDGET_EXHAUSTED"
                 self.budget_tracker.set_termination(self.termination_reason)
                 break
-            if self.budget_tracker.oracle_budget_remaining == 0:
+            if (
+                self.budget_tracker.oracle_budget_remaining == 0
+                and self.budget_tracker.proposal_budget_remaining is None
+            ):
                 self.termination_reason = "ORACLE_BUDGET_EXHAUSTED"
                 self.budget_tracker.set_termination(self.termination_reason)
                 break
@@ -407,8 +413,13 @@ class MaterialsDiscoveryCampaign:
             self.iteration += 1
 
         if self.termination_reason is None:
-            # Reaching max_iterations is a clean, explicit termination state.
-            self.termination_reason = "MAX_ITERATIONS_REACHED"
+            # Reaching max_iterations or budget exhaustion is a clean, explicit termination state.
+            if self.budget_tracker.proposal_budget_remaining == 0:
+                self.termination_reason = "PROPOSAL_BUDGET_EXHAUSTED"
+            elif self.budget_tracker.oracle_budget_remaining == 0:
+                self.termination_reason = "ORACLE_BUDGET_EXHAUSTED"
+            else:
+                self.termination_reason = "MAX_ITERATIONS_REACHED"
             self.budget_tracker.set_termination(self.termination_reason)
         self.provenance.sync_budget(self.budget_tracker, termination_reason=self.termination_reason)
 
@@ -438,6 +449,33 @@ class MaterialsDiscoveryCampaign:
             # Only set user-configured batch size on the first iteration if no recommendation exists
             if self.iteration == 0 and not self.current_recommendations and self.config.num_candidates:
                 strategy['num_candidates'] = self.config.num_candidates
+
+        remaining_iterations = max(1, self.config.objective.max_iterations - self.iteration)
+        strategy_requested_num = strategy.get('num_candidates')
+        debt_before = self.backend_generation_shortfall_debt
+
+        if self.budget_tracker.proposal_budget_remaining is not None:
+            rem_prop = self.budget_tracker.proposal_budget_remaining
+            scheduled_remaining = max(0, rem_prop - debt_before)
+            if remaining_iterations == 1:
+                baseline_requested = scheduled_remaining
+            else:
+                baseline_requested = int(math.ceil(scheduled_remaining / remaining_iterations)) if remaining_iterations > 0 else scheduled_remaining
+
+            desired_total = min(rem_prop, baseline_requested + debt_before)
+            num_to_gen = self.budget_tracker.generation_capacity(desired_total)
+            budget_allocated_num = num_to_gen
+            recovery_requested = min(
+                debt_before,
+                max(0, num_to_gen - baseline_requested),
+            )
+        else:
+            strat_cand = strategy.get('num_candidates')
+            baseline_requested = strat_cand if strat_cand is not None else (self.config.num_candidates or 5)
+            budget_allocated_num = baseline_requested
+            num_to_gen = self.budget_tracker.generation_capacity(baseline_requested)
+            recovery_requested = 0
+
         self.provenance.record_strategy(self.iteration, strategy)
         self._log(f"  Elements: {strategy.get('elements', [])}")
         self._log(f"  Candidates: {strategy.get('num_candidates', self.config.num_candidates)}")
@@ -455,12 +493,6 @@ class MaterialsDiscoveryCampaign:
             iter_seed = self.provenance.manifest.iteration_seeds[self.iteration]
         else:
             iter_seed = getattr(self.config, "master_seed", 42) + self.iteration
-        requested_num_to_gen = strategy.get('num_candidates', self.config.num_candidates)
-        try:
-            requested_num_to_gen = max(0, int(requested_num_to_gen))
-        except (TypeError, ValueError):
-            requested_num_to_gen = max(0, int(self.config.num_candidates))
-        num_to_gen = self.budget_tracker.generation_capacity(requested_num_to_gen)
         candidates = self.generator.generate_batch(
             elements=strategy.get('elements', ['Li', 'P', 'S', 'O']),
             num_candidates=num_to_gen,
@@ -478,6 +510,33 @@ class MaterialsDiscoveryCampaign:
                 f"Generation backend returned {len(candidates)} candidates for a request of {num_to_gen}; "
                 "overproduction cannot be silently discarded under the proposal budget."
             )
+
+        actual = len(candidates)
+        baseline_fulfilled = min(actual, baseline_requested)
+        new_shortfall = max(0, baseline_requested - baseline_fulfilled)
+        actual_after_baseline = max(0, actual - baseline_fulfilled)
+        recovered = min(
+            debt_before,
+            recovery_requested,
+            actual_after_baseline,
+        )
+        debt_after = debt_before - recovered + new_shortfall
+        self.backend_generation_shortfall_debt = debt_after
+
+        if debt_before > 0 or new_shortfall > 0 or recovered > 0 or actual < num_to_gen:
+            if hasattr(self.provenance, "manifest") and hasattr(self.provenance.manifest, "generation_shortfall_events"):
+                self.provenance.manifest.generation_shortfall_events.append({
+                    "iteration": self.iteration,
+                    "requested_count": num_to_gen,
+                    "baseline_requested_count": baseline_requested,
+                    "recovery_requested_count": recovery_requested,
+                    "actual_count": actual,
+                    "new_shortfall": new_shortfall,
+                    "recovered_count": recovered,
+                    "outstanding_before": debt_before,
+                    "outstanding_after": debt_after,
+                    "shortfall": max(0, num_to_gen - actual),
+                })
         self.budget_tracker.record_proposals(len(candidates))
         generation_backend = self.generator.last_generation_backend or getattr(self.generator, "backend_name", "stub")
         self.provenance.register_generation(
@@ -489,7 +548,10 @@ class MaterialsDiscoveryCampaign:
             parameters={
                 'elements': strategy.get('elements', []),
                 'num_candidates': len(candidates),
-                'requested_num_candidates': requested_num_to_gen,
+                'strategy_requested_num_candidates': strategy_requested_num,
+                'budget_allocated_num_candidates': budget_allocated_num,
+                'actual_generated_num_candidates': len(candidates),
+                'requested_num_candidates': num_to_gen,
                 'proposal_budget_remaining': self.budget_tracker.proposal_budget_remaining,
                 'memory_directive_ids': [
                     d.get('record_id') for d in strategy.get('memory_directives', [])
@@ -835,7 +897,10 @@ class MaterialsDiscoveryCampaign:
 
         if self.budget_tracker.proposal_budget_remaining == 0:
             return True, "PROPOSAL_BUDGET_EXHAUSTED"
-        if self.budget_tracker.oracle_budget_remaining == 0:
+        if (
+            self.budget_tracker.oracle_budget_remaining == 0
+            and self.budget_tracker.proposal_budget_remaining is None
+        ):
             return True, "ORACLE_BUDGET_EXHAUSTED"
         if iteration_result.get("num_generated", 0) == 0:
             return True, "NO_CANDIDATES_GENERATED"
@@ -858,6 +923,7 @@ class MaterialsDiscoveryCampaign:
             'iteration': self.iteration,
             'campaign_id': self.campaign_id,
             'results_history': self.results_history,
+            'backend_generation_shortfall_debt': getattr(self, 'backend_generation_shortfall_debt', 0),
             'config': {
                 'name': self.config.name,
                 'domain': self.config.objective.domain,
@@ -898,11 +964,20 @@ class MaterialsDiscoveryCampaign:
 
     def _generate_final_report(self, elapsed_time: float) -> Dict[str, Any]:
         """Generate final report and persist to disk using ProvenanceTracker as single source of truth."""
+        if hasattr(self.provenance, "manifest"):
+            final_debt = getattr(self, "backend_generation_shortfall_debt", 0)
+            remaining_budget = self.budget_tracker.proposal_budget_remaining
+            if remaining_budget is not None and final_debt > remaining_budget:
+                raise RuntimeError(
+                    f"Accounting error: outstanding backend debt ({final_debt}) exceeds remaining proposal budget ({remaining_budget})"
+                )
+            if final_debt > 0:
+                self.provenance.manifest.backend_generation_shortfall = final_debt
+            else:
+                self.provenance.manifest.backend_generation_shortfall = None
         self.provenance.sync_budget(self.budget_tracker, termination_reason=self.termination_reason)
         stats = self.provenance.finalize(status="completed")
         total_principles = sum(r['insights'].get('principles_written', 0) for r in self.results_history)
-
-        # Career memory top candidates
         top_candidates = []
         if self.career_memory:
             top_candidates = self.career_memory.get_top_candidates_ever(
@@ -931,6 +1006,14 @@ class MaterialsDiscoveryCampaign:
             'elapsed_time_seconds': elapsed_time,
             'generation_backend': backend_name,
             'generation_backend_counts': backend_counts,
+            'generation_shortfall_events': (
+                getattr(self.provenance.manifest, "generation_shortfall_events", [])
+                if hasattr(self.provenance, "manifest") else []
+            ),
+            'backend_generation_shortfall': (
+                getattr(self.provenance.manifest, "backend_generation_shortfall", None)
+                if hasattr(self.provenance, "manifest") else None
+            ),
             'run_mode': self.config.run_mode.value,
             'scientific_validity': (
                 ScientificValidity.RESEARCH_VALID.value

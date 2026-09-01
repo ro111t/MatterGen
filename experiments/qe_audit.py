@@ -91,6 +91,7 @@ class QEResultRecord:
     executable: Optional[str] = None
     executable_version: Optional[str] = None
     sssp_manifest_sha256: Optional[str] = None
+    qe_executable_sha256: Optional[str] = None
     kpoints: Optional[Tuple[int, int, int]] = None
 
     def to_dict(self) -> Dict[str, Any]:
@@ -123,6 +124,7 @@ class QELocalDecompositionAuditResult:
     candidate_output_hash: Optional[str] = None
     qe_executable: Optional[str] = None
     qe_executable_version: Optional[str] = None
+    qe_executable_sha256: Optional[str] = None
     sssp_manifest_sha256: Optional[str] = None
     # Keep the complete candidate calculation record alongside the flattened
     # C5-facing fields.  This avoids losing calculation ids/directories when a
@@ -455,15 +457,17 @@ class FakeQECalculator:
         input_data = {"formula": formula, "structure": structure, "config": _config_dict(config), "is_candidate": is_candidate}
         input_hash = compute_sha256(input_data)
         input_path = calc_dir / "input.json"
-        if not input_path.exists():
-            _atomic_write_json(input_path, input_data, indent=2)
         failure = self.failure_modes.get(formula)
+        executable = getattr(config, "qe_executable", "pw.x")
+        executable_version = getattr(config, "qe_executable_version", None)
+        sssp_sha = getattr(config, "sssp_manifest_sha256", None)
+        qe_sha = getattr(config, "qe_executable_sha256", None)
         if failure:
-            result = QEResultRecord(f"calc_{input_hash[:16]}", formula, is_candidate, failure, None, num_atoms, None, 100, 0, None, str(calc_dir).replace("\\", "/"), input_hash, f"Injected failure: {failure}")
+            result = QEResultRecord(f"calc_{input_hash[:16]}", formula, is_candidate, failure, None, num_atoms, None, 100, 0, None, str(calc_dir).replace("\\", "/"), input_hash, f"Injected failure: {failure}", None, None, executable, executable_version, sssp_sha, qe_sha)
         else:
             f_hash = int(hashlib.sha256(formula.encode("utf-8")).hexdigest()[:12], 16)
             energy_pa = -5.0 - (f_hash % 200) / 100.0
-            result = QEResultRecord(f"calc_{input_hash[:16]}", formula, is_candidate, QECalculationStatus.CONVERGED.value, energy_pa * num_atoms, num_atoms, energy_pa, 18, 12, 0.015, str(calc_dir).replace("\\", "/"), input_hash)
+            result = QEResultRecord(f"calc_{input_hash[:16]}", formula, is_candidate, QECalculationStatus.CONVERGED.value, energy_pa * num_atoms, num_atoms, energy_pa, 18, 12, 0.015, str(calc_dir).replace("\\", "/"), input_hash, None, None, None, executable, executable_version, sssp_sha, qe_sha)
         result_path = calc_dir / "result.json"
         result_hash = compute_sha256(result.to_dict())
         result.result_hash = result_hash
@@ -478,6 +482,9 @@ class ASEQuantumEspressoCalculator:
         self.executable = executable
         self.pseudopotentials = dict(pseudopotentials or {})
         self.executable_version = executable_version or self._detect_version()
+        resolved = shutil.which(self.executable) or self.executable
+        self.executable_sha256 = _file_sha256(Path(resolved)) if Path(resolved).is_file() else None
+        self.qe_executable_sha256 = self.executable_sha256
 
     def _detect_version(self) -> Optional[str]:
         exe = shutil.which(self.executable) or self.executable
@@ -594,7 +601,7 @@ class ASEQuantumEspressoCalculator:
         )
         energy = float(energy_matches[-1]) * RY_TO_EV if energy_matches else None
         status = QECalculationStatus.CONVERGED.value if converged else (QECalculationStatus.SCF_FAILED.value if proc is not None else QECalculationStatus.PARSE_FAILED.value)
-        result = QEResultRecord(f"calc_{input_hash[:16]}", formula, is_candidate, status, energy, num_atoms, energy / num_atoms if energy is not None else None, len(re.findall(r"iteration #", output, re.I)), 0, None, str(calc_dir).replace("\\", "/"), input_hash, None if converged else "QE did not provide a converged total energy", None, output_hash, self.executable, self.executable_version, getattr(config, "sssp_manifest_sha256", None), kpoints)
+        result = QEResultRecord(f"calc_{input_hash[:16]}", formula, is_candidate, status, energy, num_atoms, energy / num_atoms if energy is not None else None, len(re.findall(r"iteration #", output, re.I)), 0, None, str(calc_dir).replace("\\", "/"), input_hash, None if converged else "QE did not provide a converged total energy", None, output_hash, self.executable, self.executable_version, getattr(config, "sssp_manifest_sha256", None), self.executable_sha256 or getattr(config, "qe_executable_sha256", None), kpoints)
         canonical = result.to_dict()
         canonical.pop("result_hash", None)
         result.result_hash = compute_sha256(canonical)
@@ -719,6 +726,11 @@ class QEAuditRunner:
             raise QEAuditError("QE audit requires k-point spacing <= 0.25 inverse Angstrom")
         if run_mode == "research" and bool(config.mock_execution):
             raise QEAuditError("Fake QE execution is forbidden in research mode; set mock_execution=False")
+        if run_mode == "research":
+            if not config.qe_executable_sha256 or len(config.qe_executable_sha256) != 64:
+                raise QEAuditError("Research mode requires pinned 64-character qe_executable_sha256")
+            if not config.sssp_manifest_sha256 or len(config.sssp_manifest_sha256) != 64:
+                raise QEAuditError("Research mode requires pinned 64-character sssp_manifest_sha256")
         # Resolve and verify the manifest once, before selecting a calculator.
         # In production this makes the expected digest an explicit input to
         # the runner and prevents a calculator from silently choosing a
@@ -748,8 +760,16 @@ class QEAuditRunner:
         if isinstance(calculator, FakeQECalculator) and (not bool(config.mock_execution) or run_mode == "research"):
             raise QEAuditError("FakeQECalculator requires explicit mock_execution=True outside research mode")
         if run_mode == "research" and not isinstance(calculator, ASEQuantumEspressoCalculator):
-            if not getattr(calculator, "executable_version", None):
-                raise QEAuditError("Injected research QE calculators must expose a pinned executable_version")
+            if not getattr(calculator, "executable_version", None) or not isinstance(getattr(calculator, "executable_version"), str):
+                raise QEAuditError("Injected research QE calculators must expose a non-empty executable_version")
+            if config.qe_executable_version and getattr(calculator, "executable_version") != config.qe_executable_version:
+                raise QEAuditError(f"Injected research QE calculator executable version mismatch: expected {config.qe_executable_version}, got {getattr(calculator, 'executable_version')}")
+            calc_sha = getattr(calculator, "qe_executable_sha256", getattr(calculator, "executable_sha256", None))
+            if not calc_sha or not isinstance(calc_sha, str) or len(calc_sha) != 64 or not all(c in "0123456789abcdefABCDEF" for c in calc_sha):
+                raise QEAuditError("Injected research QE calculators must expose a valid 64-character hexadecimal qe_executable_sha256")
+            calc_sha = calc_sha.lower()
+            if config.qe_executable_sha256 and calc_sha != config.qe_executable_sha256.lower():
+                raise QEAuditError(f"Injected research QE calculator executable SHA256 mismatch: expected {config.qe_executable_sha256.lower()}, got {calc_sha}")
         self.calculator = calculator
 
     def _validate_result_provenance(self, result: QEResultRecord) -> None:
@@ -761,6 +781,14 @@ class QEAuditRunner:
             ):
                 raise QEAuditError(
                     "QE result SSSP manifest SHA256 does not match the verified manifest"
+                )
+        if self.config.qe_executable_sha256:
+            if (
+                not result.qe_executable_sha256
+                or str(result.qe_executable_sha256).lower() != str(self.config.qe_executable_sha256).lower()
+            ):
+                raise QEAuditError(
+                    "QE result executable SHA256 does not match the configured digest"
                 )
 
     def audit_candidate(self, candidate: QEAuditCandidate) -> QELocalDecompositionAuditResult:
@@ -820,6 +848,7 @@ class QEAuditRunner:
             candidate_output_hash=cand_res.output_hash,
             qe_executable=cand_res.executable,
             qe_executable_version=cand_res.executable_version,
+            qe_executable_sha256=cand_res.qe_executable_sha256,
             sssp_manifest_sha256=cand_res.sssp_manifest_sha256,
             candidate_provenance={
                 "candidate_id": candidate.candidate_id,
@@ -885,7 +914,7 @@ class QEAuditRunner:
 
         results = [self.audit_candidate(candidate) for candidate in candidates]
         results_path = self.output_dir / "results.csv"
-        fields = ["candidate_id", "target_task", "condition", "seed", "formula", "num_atoms", "candidate_status", "candidate_energy_per_atom_ev", "competing_phases_count", "competing_phases_all_converged", "chgnet_predicted_hull_distance_ev_per_atom", "dft_local_decomposition_margin_ev_per_atom", "sign_agreement", "margin_difference_ev_per_atom", "reaction_equation", "reaction_balanced", "status", "candidate_input_hash", "candidate_result_hash", "candidate_output_hash", "qe_executable", "qe_executable_version", "sssp_manifest_sha256", "candidate_provenance", "participating_phase_results"]
+        fields = ["candidate_id", "target_task", "condition", "seed", "formula", "num_atoms", "candidate_status", "candidate_energy_per_atom_ev", "competing_phases_count", "competing_phases_all_converged", "chgnet_predicted_hull_distance_ev_per_atom", "dft_local_decomposition_margin_ev_per_atom", "sign_agreement", "margin_difference_ev_per_atom", "reaction_equation", "reaction_balanced", "status", "candidate_input_hash", "candidate_result_hash", "candidate_output_hash", "qe_executable", "qe_executable_version", "qe_executable_sha256", "sssp_manifest_sha256", "candidate_provenance", "participating_phase_results"]
         # csv.writer is used only to build a complete in-memory document;
         # replacing the destination happens exactly once after all rows have
         # passed strict JSON/finite-value validation.

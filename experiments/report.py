@@ -834,12 +834,22 @@ class ReportGenerator:
 
         required_hashes = (
             "candidate_input_hash", "candidate_result_hash", "candidate_output_hash",
-            "qe_executable", "qe_executable_version", "sssp_manifest_sha256",
+            "qe_executable", "qe_executable_version", "qe_executable_sha256", "sssp_manifest_sha256",
         )
         phase_hashes = (
             "input_hash", "result_hash", "output_hash", "executable",
-            "executable_version", "sssp_manifest_sha256",
+            "executable_version", "qe_executable_sha256", "sssp_manifest_sha256",
         )
+        config_map = qe_meta.get("config")
+        if not isinstance(config_map, Mapping):
+            return False
+        expected_qe_sha = config_map.get("qe_executable_sha256")
+        expected_sssp_sha = config_map.get("sssp_manifest_sha256")
+        if not _sha256(expected_qe_sha) or not _sha256(expected_sssp_sha):
+            return False
+        expected_qe_sha = str(expected_qe_sha).lower()
+        expected_sssp_sha = str(expected_sssp_sha).lower()
+
         for row in qe:
             if (
                 row.get("status") != "VALIDATED"
@@ -854,8 +864,13 @@ class ReportGenerator:
                 or not all(_sha256(row.get(key)) for key in required_hashes[:3])
                 or not _nonempty_hash(row.get("qe_executable"))
                 or not _nonempty_hash(row.get("qe_executable_version"))
+                or not _sha256(row.get("qe_executable_sha256"))
                 or not _sha256(row.get("sssp_manifest_sha256"))
             ):
+                return False
+            cand_qe_sha = str(row.get("qe_executable_sha256")).lower()
+            cand_sssp_sha = str(row.get("sssp_manifest_sha256")).lower()
+            if cand_qe_sha != expected_qe_sha or cand_sssp_sha != expected_sssp_sha:
                 return False
             raw_phases = row.get("participating_phase_results")
             if isinstance(raw_phases, str):
@@ -872,18 +887,21 @@ class ReportGenerator:
                     return False
                 if not _nonempty_hash(phase.get("executable")) or not _nonempty_hash(phase.get("executable_version")):
                     return False
+                if not _sha256(phase.get("qe_executable_sha256")):
+                    return False
                 if not _sha256(phase.get("sssp_manifest_sha256")):
                     return False
-            # A candidate and each participating phase must agree on the same
-            # executable/SSSP provenance; otherwise the local decomposition is
-            # not an auditable comparison.
-            if any(
-                phase.get("executable") != row.get("qe_executable")
-                or phase.get("executable_version") != row.get("qe_executable_version")
-                or phase.get("sssp_manifest_sha256") != row.get("sssp_manifest_sha256")
-                for phase in raw_phases
-            ):
-                return False
+                phase_qe_sha = str(phase.get("qe_executable_sha256")).lower()
+                phase_sssp_sha = str(phase.get("sssp_manifest_sha256")).lower()
+                if phase_qe_sha != expected_qe_sha or phase_sssp_sha != expected_sssp_sha:
+                    return False
+                if phase_qe_sha != cand_qe_sha or phase_sssp_sha != cand_sssp_sha:
+                    return False
+                if (
+                    phase.get("executable") != row.get("qe_executable")
+                    or phase.get("executable_version") != row.get("qe_executable_version")
+                ):
+                    return False
         return True
 
     def _statistical_evidence_complete(

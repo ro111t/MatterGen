@@ -190,6 +190,12 @@ def _as_numeric_array(value: Any) -> Optional[np.ndarray]:
     return arr
 
 
+def closest_lattice_image(frac_delta: np.ndarray, lattice: np.ndarray,
+                          *, exclude_zero: bool = False) -> float:
+    """Public interface for the 3-D closest-lattice-image problem."""
+    return _closest_lattice_image(frac_delta, lattice, exclude_zero=exclude_zero)
+
+
 def _closest_lattice_image(frac_delta: np.ndarray, lattice: np.ndarray,
                            *, exclude_zero: bool = False) -> float:
     """Solve the 3-D closest-lattice-image problem for one fractional delta.

@@ -6,6 +6,7 @@ from enum import Enum
 import json
 import hashlib
 import logging
+import math
 import os
 from pathlib import Path
 import time
@@ -458,6 +459,8 @@ class CampaignRunner:
                 success_criteria={}, domain=spec.domain,
                 max_iterations=len(spec.iteration_seeds))
             run_mode = RunMode.RESEARCH if spec.run_mode == "research" else RunMode.DEVELOPMENT
+            num_iterations = max(1, len(spec.iteration_seeds))
+            target_candidates_per_iter = int(math.ceil(spec.proposal_budget / num_iterations))
             config = CampaignConfig(
                 name=spec.run_id, objective=objective, output_dir=output_dir,
                 master_seed=spec.seed, career_db_path=str(memory_db_path),
@@ -471,7 +474,7 @@ class CampaignRunner:
                 use_validation=False, use_synthesis=False,
                 require_thermodynamics=spec.reference_set_path is not None,
                 thermodynamics_backend="chgnet" if spec.run_mode == "research" else None,
-                num_candidates=min(20, spec.proposal_budget),
+                num_candidates=target_candidates_per_iter,
                 # Research specs require MatterGen. Development/mock specs use
                 # the deterministic injected generator for every arm, while
                 # the random baseline remains distinct through its fixed,
@@ -487,7 +490,7 @@ class CampaignRunner:
             campaign = MaterialsDiscoveryCampaign(config=config)
             if spec.condition == "random_mattergen":
                 campaign.orchestrator.plan_iteration = lambda **kwargs: {
-                    "elements": list(spec.elements), "num_candidates": min(20, spec.proposal_budget),
+                    "elements": list(spec.elements), "num_candidates": target_candidates_per_iter,
                     "screening_criteria": {}, "memory_directives": [],
                     "rationale": "fixed random MatterGen baseline", "hypothesis": None}
             campaign.run_campaign()

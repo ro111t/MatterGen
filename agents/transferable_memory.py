@@ -23,6 +23,7 @@ import copy
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 
 from agents.integrity import SCHEMA_VERSION
+from agents.geometry import closest_lattice_image
 
 try:  # Optional in the repository's offline development environment.
     from pymatgen.core import Composition, Element, Structure
@@ -366,35 +367,32 @@ def _coordination_summary(structure: Any) -> Tuple[Optional[Dict[str, Any]], Opt
     matrix = lattice.get("matrix") if isinstance(lattice, Mapping) else lattice
     if isinstance(positions, (list, tuple)) and positions and isinstance(matrix, (list, tuple)) and len(matrix) == 3:
         try:
-            vectors = [[float(x) for x in row] for row in matrix]
-            # Use the shortest lattice-vector norm as a conservative local
-            # envelope, capped to avoid counting distant periodic shells.
-            lengths = [sum(x * x for x in row) ** 0.5 for row in vectors]
+            vectors = np.asarray([[float(x) for x in row] for row in matrix], dtype=float)
+            if vectors.shape != (3, 3) or not np.all(np.isfinite(vectors)):
+                return None, "COORDINATION_COMPUTATION_FAILED"
+            det = float(np.linalg.det(vectors))
+            if not math.isfinite(det) or abs(det) < 1e-10:
+                return None, "COORDINATION_COMPUTATION_FAILED"
+            lengths = [float(np.sqrt(np.sum(vectors[k] * vectors[k]))) for k in range(3)]
             cutoff = min(3.0, max(min(lengths) * 0.55, 1e-8))
             if is_fractional:
-                cart = []
-                for pos in positions:
-                    frac = [float(x) for x in pos[:3]]
-                    cart.append([sum(frac[k] * vectors[k][j] for k in range(3)) for j in range(3)])
+                frac = [np.asarray([float(x) for x in pos[:3]], dtype=float) for pos in positions]
                 method_name = "provided_fractional_distance_v1"
             else:
-                cart = [[float(x) for x in pos[:3]] for pos in positions]
+                inv_vectors = np.linalg.inv(vectors)
+                cart_coords = [np.asarray([float(x) for x in pos[:3]], dtype=float) for pos in positions]
+                frac = [np.dot(cart_pos, inv_vectors) for cart_pos in cart_coords]
                 method_name = "provided_cartesian_distance_v1"
+            if any(not np.all(np.isfinite(p)) for p in frac):
+                return None, "COORDINATION_COMPUTATION_FAILED"
             values = []
-            for i, left in enumerate(cart):
+            for i, left in enumerate(frac):
                 n = 0
-                for j, right in enumerate(cart):
+                for j, right in enumerate(frac):
                     if i == j:
                         continue
-                    delta = [right[k] - left[k] for k in range(3)]
-                    # Orthorhombic minimum-image handling is deterministic;
-                    # skew cells use the direct local image conservatively.
-                    if all(abs(vectors[k][j]) < 1e-10 for k in range(3) for j in range(3) if j != k):
-                        for k in range(3):
-                            length = abs(vectors[k][k])
-                            if length:
-                                delta[k] -= round(delta[k] / length) * length
-                    distance = sum(x * x for x in delta) ** 0.5
+                    delta = right - left
+                    distance = closest_lattice_image(delta, vectors)
                     if distance <= cutoff:
                         n += 1
                 values.append(n)
@@ -405,6 +403,8 @@ def _coordination_summary(structure: Any) -> Tuple[Optional[Dict[str, Any]], Opt
                 "method": method_name,
             }, None
         except (TypeError, ValueError, IndexError, ZeroDivisionError):
+            return None, "COORDINATION_COMPUTATION_FAILED"
+        except Exception:
             return None, "COORDINATION_COMPUTATION_FAILED"
     if not HAS_PYMATGEN or not isinstance(structure, Structure):
         return None, "STRUCTURE_COORDINATION_UNAVAILABLE"

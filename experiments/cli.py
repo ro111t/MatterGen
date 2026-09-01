@@ -19,12 +19,12 @@ import shutil
 import subprocess
 import sys
 import time
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Mapping, Optional, Set
 
-from experiments.dag import ExperimentDAG, NodeType
+from experiments.dag import DAGNode, DAGValidationError, ExperimentDAG, NodeType, REQUIRED_NODE_ARTIFACTS
 from experiments.memory_snapshots import MemorySnapshotManager
 from experiments.metrics import compute_run_metrics
-from experiments.report import ReportGenerator
+from experiments.report import ReportGenerator, _qe_csv_rows
 from experiments.runner import CampaignRunner
 from experiments.spec import (
     BASE_COMMIT_SHA,
@@ -452,36 +452,401 @@ def _find_reusable_snapshot(
     return valid[0]
 
 
+def _build_run_spec(spec: ExperimentSpec, node: DAGNode, dag: ExperimentDAG) -> RunSpec:
+    payload = node.payload
+    task = next(t for t in [spec.source_task, *spec.target_tasks] if t.task_id == payload["task_id"])
+    snapshot_sha = payload.get("source_memory_snapshot_sha256")
+    if payload.get("source_memory_snapshot_path") and not snapshot_sha:
+        for dep_id in node.dependencies:
+            dep = dag.nodes.get(dep_id)
+            if dep and dep.node_type == NodeType.SOURCE_MEMORY_SNAPSHOT:
+                snapshot_sha = dep.result_hash or dep.payload.get("snapshot_sha256")
+                break
+    return RunSpec(
+        run_id=payload["run_id"],
+        experiment_id=spec.experiment_id,
+        task_id=payload["task_id"],
+        elements=payload["elements"],
+        condition=payload.get("condition", "adaptive_no_memory"),
+        seed=payload["seed"],
+        iteration_seeds=[payload["seed"] + i for i in range(spec.iterations_per_run)],
+        proposal_budget=payload["proposal_budget"],
+        oracle_budget=payload["oracle_budget"],
+        geometry_min_distance=spec.geometry_min_distance,
+        thermodynamics_retain_threshold_ev_per_atom=spec.thermodynamics_retain_threshold_ev_per_atom,
+        thermodynamics_stable_threshold_ev_per_atom=spec.thermodynamics_stable_threshold_ev_per_atom,
+        run_mode=spec.run_mode,
+        generation_backend=spec.generation_backend,
+        memory_mode=payload.get("memory_mode", "none"),
+        memory_seed=payload.get("memory_seed", payload["seed"]),
+        output_dir=payload["output_dir"],
+        memory_transfer_declaration=payload.get("memory_transfer_declaration"),
+        reference_set_path=task.reference_set_path,
+        reference_set_sha256=task.reference_set_sha256,
+        reference_set_certified=task.reference_set_certified,
+        source_memory_snapshot_path=payload.get("source_memory_snapshot_path"),
+        source_memory_snapshot_sha256=snapshot_sha,
+        pinned_model_identity=spec.pinned_model_identity,
+        pinned_relaxation_settings=spec.pinned_relaxation_settings,
+        career_db_path=str(Path(payload["output_dir"]) / "career_memory.db"),
+        mattergen_pretrained=spec.mattergen_pretrained,
+        mattergen_model_path=spec.mattergen_model_path,
+        mattergen_checkpoint_sha256=spec.mattergen_checkpoint_sha256,
+        mattergen_sampling_config_path=spec.mattergen_sampling_config_path,
+        mattergen_sampling_config_sha256=spec.mattergen_sampling_config_sha256,
+        mattergen_batch_size=spec.mattergen_batch_size,
+        domain=task.domain,
+        target_properties=dict(task.target_properties),
+        task_constraints=dict(task.constraints),
+        validation_calculator=spec.validation_calculator,
+        synthesis_mode=spec.synthesis_mode,
+    )
+
+
+def _verify_and_hydrate_completed_node(
+    node: DAGNode,
+    spec: ExperimentSpec,
+    dag: ExperimentDAG,
+    all_runs_metrics: List[Any],
+    all_candidates: List[Any],
+    qe_selection_metadata: Dict[str, Any],
+    output_root: Path,
+    pipeline_state: Dict[str, Any],
+) -> None:
+    """Verify that a completed node satisfies its complete persisted output contract and hydrate in-memory state."""
+    if node.expected_output_path:
+        p = Path(node.expected_output_path)
+        if not p.exists() or not p.is_file():
+            raise RuntimeError(f"Node '{node.node_id}' expected output artifact '{p}' is missing or not a file")
+        actual_digest = _file_sha256(p)
+        if not node.result_hash:
+            raise RuntimeError(f"Node '{node.node_id}' marked success but missing result_hash")
+        if actual_digest != str(node.result_hash).lower():
+            raise RuntimeError(
+                f"Node '{node.node_id}' output artifact '{p}' digest mismatch: expected {node.result_hash}, got {actual_digest}"
+            )
+
+    if node.node_type in REQUIRED_NODE_ARTIFACTS:
+        if not node.result_artifacts or not isinstance(node.result_artifacts, Mapping):
+            raise RuntimeError(f"Node '{node.node_id}' ({node.node_type.value}) missing required result_artifacts contract")
+        req_keys = REQUIRED_NODE_ARTIFACTS[node.node_type]
+        missing_keys = req_keys - set(node.result_artifacts.keys())
+        if missing_keys:
+            raise RuntimeError(
+                f"Node '{node.node_id}' ({node.node_type.value}) result_artifacts missing required contract keys: {sorted(missing_keys)}"
+            )
+        if node.node_type == NodeType.AGGREGATION:
+            extra_keys = set(node.result_artifacts.keys()) - req_keys
+            if extra_keys:
+                raise RuntimeError(
+                    f"Node '{node.node_id}' (aggregation) result_artifacts contains unexpected keys: {sorted(extra_keys)}"
+                )
+
+    if node.result_artifacts:
+        for rel_path, expected_digest in node.result_artifacts.items():
+            art_file = output_root / rel_path
+            if not art_file.exists() or not art_file.is_file():
+                raise RuntimeError(f"Node '{node.node_id}' secondary artifact '{rel_path}' is missing or not a file")
+            actual_digest = _file_sha256(art_file)
+            if actual_digest != str(expected_digest).lower():
+                raise RuntimeError(
+                    f"Node '{node.node_id}' secondary artifact '{rel_path}' digest mismatch: expected {expected_digest}, got {actual_digest}"
+                )
+
+    if node.node_type == NodeType.PREFLIGHT:
+        preflight_p = Path(node.expected_output_path)
+        try:
+            p_data = json.loads(preflight_p.read_text(encoding="utf-8"))
+        except Exception as exc:
+            raise RuntimeError(f"Node '{node.node_id}' preflight artifact is malformed JSON: {exc}") from exc
+        if not isinstance(p_data, dict) or p_data.get("status") != "PASSED":
+            raise RuntimeError(f"Node '{node.node_id}' preflight validation report failed")
+        pipeline_state["preflight"] = p_data
+
+    elif node.node_type == NodeType.REFERENCE_SET_VERIFICATION:
+        ref_v_path = Path(node.expected_output_path)
+        try:
+            ref_v = json.loads(ref_v_path.read_text(encoding="utf-8"))
+        except Exception as exc:
+            raise RuntimeError(f"Node '{node.node_id}' reference verification artifact is malformed JSON: {exc}") from exc
+        if not isinstance(ref_v, dict) or not ref_v.get("verified"):
+            raise RuntimeError(f"Node '{node.node_id}' reference verification failed")
+
+        expected_task_id = node.payload.get("task_id")
+        actual_task_id = ref_v.get("task_id")
+        if not actual_task_id or str(actual_task_id) != str(expected_task_id):
+            raise RuntimeError(
+                f"Node '{node.node_id}' reference verification artifact task_id mismatch: "
+                f"expected '{expected_task_id}', got '{actual_task_id}'"
+            )
+
+        ref_path = node.payload.get("reference_set_path")
+        if not ref_path:
+            if spec.run_mode == "research":
+                raise RuntimeError(f"Node '{node.node_id}' reference set path is missing in research mode")
+        else:
+            p_ref = Path(ref_path)
+            if not p_ref.exists() or not p_ref.is_file():
+                raise RuntimeError(f"Node '{node.node_id}' underlying reference set file '{ref_path}' is missing or not a file")
+            ref_sha = _file_sha256(p_ref)
+            exp_sha = node.payload.get("reference_set_sha256")
+            if exp_sha and ref_sha != exp_sha.lower():
+                raise RuntimeError(f"Node '{node.node_id}' underlying reference set SHA256 mismatch")
+
+            actual_ref_path = ref_v.get("reference_set_path") or ref_v.get("path")
+            if not actual_ref_path or str(Path(actual_ref_path).resolve()) != str(p_ref.resolve()):
+                raise RuntimeError(
+                    f"Node '{node.node_id}' reference verification artifact reference_set_path mismatch: "
+                    f"expected '{ref_path}', got '{actual_ref_path}'"
+                )
+
+            art_sha = ref_v.get("sha256")
+            if not art_sha or not isinstance(art_sha, str) or len(art_sha) != 64 or not all(c in "0123456789abcdefABCDEF" for c in art_sha):
+                raise RuntimeError(
+                    f"Node '{node.node_id}' reference verification artifact missing valid 64-character hexadecimal sha256: got '{art_sha}'"
+                )
+            art_sha = art_sha.lower()
+
+            if art_sha != ref_sha:
+                raise RuntimeError(
+                    f"Node '{node.node_id}' reference verification artifact sha256 mismatch with current file: "
+                    f"artifact has '{art_sha}', current file is '{ref_sha}'"
+                )
+            if exp_sha and art_sha != exp_sha.lower():
+                raise RuntimeError(
+                    f"Node '{node.node_id}' reference verification artifact sha256 mismatch with configured reference_set_sha256: "
+                    f"artifact has '{art_sha}', configured is '{exp_sha}'"
+                )
+
+    elif node.node_type in (NodeType.SOURCE_MEMORY_RUN, NodeType.TARGET_CAMPAIGN_RUN):
+        run_spec = _build_run_spec(spec, node, dag)
+        run_dir = Path(run_spec.output_dir)
+        if not CampaignRunner.is_run_completed(run_dir, run_spec):
+            raise RuntimeError(
+                f"Node '{node.node_id}' marked completed, but directory '{run_dir}' failed CampaignRunner completion/integrity verification"
+            )
+        prov_p = run_dir / "campaign_provenance.json"
+        rep_p = run_dir / "report.json"
+        if not prov_p.exists() or not rep_p.exists():
+            raise RuntimeError(f"Node '{node.node_id}' missing campaign_provenance.json or report.json in '{run_dir}'")
+        try:
+            m_data = json.loads(prov_p.read_text(encoding="utf-8"))
+        except Exception as exc:
+            raise RuntimeError(f"Node '{node.node_id}' campaign_provenance.json is malformed JSON: {exc}") from exc
+        try:
+            rep_data = json.loads(rep_p.read_text(encoding="utf-8"))
+        except Exception as exc:
+            raise RuntimeError(f"Node '{node.node_id}' report.json is malformed JSON: {exc}") from exc
+        m_data = {**rep_data, **m_data}
+        rm, cands = compute_run_metrics(
+            manifest_data=m_data,
+            run_id=run_spec.run_id,
+            task_id=run_spec.task_id,
+            condition=run_spec.condition,
+            seed=run_spec.seed,
+            oracle_budget=run_spec.oracle_budget,
+        )
+        for candidate in cands:
+            _load_candidate_structure(candidate, run_dir)
+            _attach_reference_phase_structures(candidate, run_spec.reference_set_path)
+        all_runs_metrics.append(rm)
+        all_candidates.extend(cands)
+
+    elif node.node_type == NodeType.SOURCE_MEMORY_SNAPSHOT:
+        actual_snap_path = Path(node.expected_output_path or node.payload.get("snapshot_path"))
+        if not actual_snap_path.exists() or not actual_snap_path.is_file():
+            raise RuntimeError(f"Node '{node.node_id}' snapshot file '{actual_snap_path}' is missing")
+        actual_sha = _file_sha256(actual_snap_path)
+        if not node.result_hash or actual_sha != node.result_hash:
+            raise RuntimeError(f"Node '{node.node_id}' snapshot file SHA256 mismatch")
+        MemorySnapshotManager.verify_snapshot_integrity(
+            snapshot_path=actual_snap_path,
+            expected_source_task=node.payload["source_task"],
+            expected_master_seed=node.payload["seed"],
+            expected_sqlite_sha256=node.result_hash,
+        )
+        for dependent in dag.nodes.values():
+            if node.node_id in dependent.dependencies:
+                dependent.payload["source_memory_snapshot_path"] = str(actual_snap_path).replace("\\", "/")
+                dependent.payload["source_memory_snapshot_sha256"] = actual_sha
+
+    elif node.node_type == NodeType.AGGREGATION:
+        agg_dir = output_root / "aggregates"
+        required_agg_files = {
+            "aggregates/runs.json": agg_dir / "runs.json",
+            "aggregates/candidates.json": agg_dir / "candidates.json",
+            "aggregates/runs.parquet": agg_dir / "runs.parquet",
+            "aggregates/candidates.parquet": agg_dir / "candidates.parquet",
+        }
+        for rel_k, fp in required_agg_files.items():
+            if not fp.exists() or not fp.is_file():
+                raise RuntimeError(f"Node '{node.node_id}' missing aggregate file '{rel_k}'")
+            if node.result_artifacts and rel_k in node.result_artifacts:
+                if _file_sha256(fp) != str(node.result_artifacts[rel_k]).lower():
+                    raise RuntimeError(f"Node '{node.node_id}' aggregate artifact '{rel_k}' digest mismatch")
+        try:
+            json.loads((agg_dir / "runs.json").read_text(encoding="utf-8"))
+            json.loads((agg_dir / "candidates.json").read_text(encoding="utf-8"))
+        except Exception as exc:
+            raise RuntimeError(f"Node '{node.node_id}' aggregate JSONs malformed: {exc}") from exc
+
+    elif node.node_type == NodeType.STATISTICAL_ANALYSIS:
+        stats_dir = output_root / "statistics"
+        man_p = stats_dir / "analysis_manifest.json"
+        res_p = stats_dir / "results.json"
+        eff_p = stats_dir / "effects.csv"
+        if not man_p.exists() or not res_p.exists() or not eff_p.exists():
+            raise RuntimeError(f"Node '{node.node_id}' missing statistical analysis artifacts")
+        try:
+            s_manifest = json.loads(man_p.read_text(encoding="utf-8"))
+        except Exception as exc:
+            raise RuntimeError(f"Node '{node.node_id}' analysis_manifest.json is malformed: {exc}") from exc
+        artifacts = s_manifest.get("artifacts")
+        if not isinstance(artifacts, dict):
+            raise RuntimeError(f"Node '{node.node_id}' analysis manifest missing artifacts dict")
+        for rel_path, expected_digest in artifacts.items():
+            if rel_path == "canonical_results_sha256":
+                try:
+                    results_data = json.loads(res_p.read_text(encoding="utf-8"))
+                except Exception as exc:
+                    raise RuntimeError(f"Node '{node.node_id}' results.json is malformed: {exc}") from exc
+                canonical = json.dumps(results_data, sort_keys=True, separators=(",", ":"), allow_nan=False).encode("utf-8")
+                if hashlib.sha256(canonical).hexdigest() != str(expected_digest).lower():
+                    raise RuntimeError(f"Node '{node.node_id}' statistics canonical_results_sha256 digest mismatch")
+            else:
+                art_file = stats_dir / rel_path
+                if not art_file.exists() or not art_file.is_file():
+                    raise RuntimeError(f"Node '{node.node_id}' statistical artifact '{rel_path}' is missing")
+                if _file_sha256(art_file) != str(expected_digest).lower():
+                    raise RuntimeError(f"Node '{node.node_id}' statistical artifact '{rel_path}' digest mismatch")
+
+    elif node.node_type == NodeType.QE_AUDIT_SELECTION:
+        qe_dir = output_root / "qe_audit"
+        sel_p = qe_dir / "selection.json"
+        if not sel_p.exists() or not sel_p.is_file():
+            raise RuntimeError(f"Node '{node.node_id}' missing selection.json")
+        try:
+            sel_data = json.loads(sel_p.read_text(encoding="utf-8"))
+        except Exception as exc:
+            raise RuntimeError(f"Node '{node.node_id}' selection.json is malformed: {exc}") from exc
+        c_list = sel_data.get("candidates", []) if isinstance(sel_data, dict) else sel_data
+        qe_selection_metadata["qe_selection_count"] = len(c_list)
+        qe_selection_metadata["qe_selection_insufficiency"] = (
+            sel_data.get("insufficiency") if isinstance(sel_data, dict) else None
+        )
+
+    elif node.node_type == NodeType.QE_AUDIT_EXECUTION:
+        qe_dir = output_root / "qe_audit"
+        res_csv = qe_dir / "results.csv"
+        aud_man = qe_dir / "audit_manifest.json"
+        sel_p = qe_dir / "selection.json"
+        if not res_csv.exists() or not aud_man.exists() or not sel_p.exists():
+            raise RuntimeError(f"Node '{node.node_id}' missing results.csv, audit_manifest.json, or selection.json")
+        try:
+            manifest = json.loads(aud_man.read_text(encoding="utf-8"))
+        except Exception as exc:
+            raise RuntimeError(f"Node '{node.node_id}' audit_manifest.json is malformed: {exc}") from exc
+        artifacts = manifest.get("artifacts")
+        if not isinstance(artifacts, dict):
+            raise RuntimeError(f"Node '{node.node_id}' audit_manifest.json missing artifacts dict")
+        for rel_path, expected_digest in artifacts.items():
+            if rel_path == "canonical_results_sha256":
+                canonical = json.dumps(
+                    manifest.get("result_provenance", []),
+                    sort_keys=True,
+                    separators=(",", ":"),
+                    allow_nan=False,
+                ).encode("utf-8")
+                if hashlib.sha256(canonical).hexdigest() != str(expected_digest).lower():
+                    raise RuntimeError(f"Node '{node.node_id}' QE canonical_results_sha256 digest mismatch")
+            else:
+                art_file = qe_dir / rel_path
+                if not art_file.exists() or not art_file.is_file():
+                    raise RuntimeError(f"Node '{node.node_id}' QE artifact '{rel_path}' is missing")
+                if _file_sha256(art_file) != str(expected_digest).lower():
+                    raise RuntimeError(f"Node '{node.node_id}' QE artifact '{rel_path}' digest mismatch")
+        try:
+            disk_rows = list(csv.DictReader(res_csv.open("r", encoding="utf-8", newline="")))
+        except Exception as exc:
+            raise RuntimeError(f"Node '{node.node_id}' results.csv cannot be parsed: {exc}") from exc
+        if _qe_csv_rows(manifest.get("result_provenance", [])) != _qe_csv_rows(disk_rows):
+            raise RuntimeError(f"Node '{node.node_id}' QE results.csv rows disagree with result_provenance")
+        try:
+            sel_data = json.loads(sel_p.read_text(encoding="utf-8"))
+            sel_cands = sel_data.get("candidates", []) if isinstance(sel_data, dict) else sel_data
+            if manifest.get("selection_count") != len(sel_cands):
+                raise RuntimeError(f"Node '{node.node_id}' selection count mismatch with selection.json")
+            if (sel_data.get("insufficiency") if isinstance(sel_data, dict) else None) != manifest.get("selection_insufficiency"):
+                raise RuntimeError(f"Node '{node.node_id}' selection insufficiency mismatch with selection.json")
+        except Exception as exc:
+            if isinstance(exc, RuntimeError):
+                raise
+            raise RuntimeError(f"Node '{node.node_id}' selection.json validation failed: {exc}") from exc
+        if spec.run_mode == "research":
+            if manifest.get("config", {}).get("qe_executable_sha256") != spec.qe_audit_config.qe_executable_sha256:
+                raise RuntimeError(f"Node '{node.node_id}' qe_executable_sha256 in audit manifest mismatch")
+            if manifest.get("config", {}).get("sssp_manifest_sha256") != spec.qe_audit_config.sssp_manifest_sha256:
+                raise RuntimeError(f"Node '{node.node_id}' sssp_manifest_sha256 in audit manifest mismatch")
+
+    elif node.node_type == NodeType.REPORT_GENERATION:
+        paper_dir = output_root / "paper"
+        figures_dir = output_root / "figures"
+        tables_dir = output_root / "tables"
+        required_report_files = [
+            paper_dir / "claim_evidence_matrix.md",
+            paper_dir / "reproducibility_checklist.md",
+            paper_dir / "claim_status.json",
+            figures_dir / "fig1_best_so_far_vs_oracle_calls.json",
+            figures_dir / "fig2_time_to_threshold_censored.json",
+            figures_dir / "fig3_paired_effect_sizes.json",
+            figures_dir / "fig4_geometry_and_oracle_failures.json",
+            figures_dir / "fig5_memory_directives_breakdown.json",
+            figures_dir / "fig6_shuffled_control_validation.json",
+            figures_dir / "fig7_chgnet_vs_qe_local_decomposition.json",
+            tables_dir / "table_threshold_sensitivity.json",
+            tables_dir / "table_threshold_sensitivity.csv",
+        ]
+        for fp in required_report_files:
+            if not fp.exists() or not fp.is_file():
+                raise RuntimeError(f"Node '{node.node_id}' missing report artifact '{fp}'")
+
+
 def execute_full_experiment_pipeline(
     spec: ExperimentSpec,
     force_rerun: bool = False,
 ) -> Dict[str, Any]:
     """Execute the entire benchmark DAG end-to-end."""
     logger.info(f"Starting Experiment '{spec.experiment_id}'...")
-    # Keep CLI preflight usable in minimal/offline checkouts where optional QE
-    # modules are not installed; execution imports them only at their DAG node.
     from experiments.qe_audit import QEAuditRunner, select_audit_candidates
     output_root = Path(spec.output_root)
-    if force_rerun and output_root.exists() and any(output_root.iterdir()):
-        raise RuntimeError(
-            "force_rerun requires a fresh, empty experiment output directory; "
-            "existing run databases/artifacts will never be reused"
-        )
-    output_root.mkdir(parents=True, exist_ok=True)
-
-    # 1. Preflight
-    preflight = run_preflight_check(spec)
-
-    # 2. Build DAG
-    dag = ExperimentDAG(spec)
-    logger.info(f"Experiment DAG constructed with {len(dag.nodes)} nodes and {dag.total_run_count} runs.")
-
-    # Write DAG manifest
     dag_path = output_root / "experiment_dag.json"
-    _atomic_write_json(dag_path, dag.to_dict())
+    if dag_path.exists() and not force_rerun:
+        if not dag_path.is_file():
+            raise DAGValidationError(f"Existing DAG path '{dag_path}' is not a regular file")
+        try:
+            existing_dag_data = json.loads(dag_path.read_text(encoding="utf-8"))
+        except Exception as exc:
+            raise DAGValidationError(f"Existing experiment DAG manifest '{dag_path}' is malformed JSON: {exc}") from exc
+        dag = ExperimentDAG.from_dict(existing_dag_data, spec)
+        logger.info(f"Loaded existing experiment DAG with {len(dag.nodes)} nodes.")
+    else:
+        if force_rerun and output_root.exists() and any(output_root.iterdir()):
+            raise RuntimeError(
+                "force_rerun requires a fresh, empty experiment output directory; "
+                "existing run databases/artifacts will never be reused"
+            )
+        dag = ExperimentDAG(spec)
+        logger.info(f"Experiment DAG constructed with {len(dag.nodes)} nodes and {dag.total_run_count} runs.")
 
-    # 3. Execute nodes in topological order
+    output_root.mkdir(parents=True, exist_ok=True)
+    if not dag_path.exists():
+        _atomic_write_json(dag_path, dag.to_dict())
+
+    # Execute nodes in topological order
     nodes = dag.topological_order()
+    pipeline_state: Dict[str, Any] = {
+        "preflight": None,
+    }
     all_runs_metrics: List[Any] = []
     all_candidates: List[Any] = []
     expected_run_ids = [
@@ -515,51 +880,34 @@ def execute_full_experiment_pipeline(
         _atomic_write_json(dag_path, dag.to_dict())
 
     for node in nodes:
+        # Check if node was already completed and its complete output contract verifies:
+        if node.executed and node.success and not force_rerun:
+            _verify_and_hydrate_completed_node(
+                node=node,
+                spec=spec,
+                dag=dag,
+                all_runs_metrics=all_runs_metrics,
+                all_candidates=all_candidates,
+                qe_selection_metadata=qe_selection_metadata,
+                output_root=output_root,
+                pipeline_state=pipeline_state,
+            )
+            logger.info(f"Skipping completed DAG Node: [{node.node_type.value}] {node.node_id}")
+            continue
+
         logger.info(f"Executing DAG Node: [{node.node_type.value}] {node.node_id}...")
         # A node can run only after every parent has completed successfully.
         dag.assert_dependencies_succeeded(node.node_id)
         try:
-            if node.node_type in (NodeType.SOURCE_MEMORY_RUN, NodeType.TARGET_CAMPAIGN_RUN):
-                payload = node.payload
-                task = next(t for t in [spec.source_task, *spec.target_tasks] if t.task_id == payload["task_id"])
-                snapshot_sha = payload.get("source_memory_snapshot_sha256")
-                if payload.get("source_memory_snapshot_path") and not snapshot_sha:
-                    for dep_id in node.dependencies:
-                        dep = dag.nodes.get(dep_id)
-                        if dep and dep.node_type == NodeType.SOURCE_MEMORY_SNAPSHOT:
-                            snapshot_sha = dep.payload.get("snapshot_sha256")
-                            break
-                run_spec = RunSpec(
-                    run_id=payload["run_id"], experiment_id=spec.experiment_id,
-                    task_id=payload["task_id"], elements=payload["elements"],
-                    condition=payload.get("condition", "adaptive_no_memory"), seed=payload["seed"],
-                    iteration_seeds=[payload["seed"] + i for i in range(spec.iterations_per_run)],
-                    proposal_budget=payload["proposal_budget"], oracle_budget=payload["oracle_budget"],
-                    geometry_min_distance=spec.geometry_min_distance,
-                    thermodynamics_retain_threshold_ev_per_atom=spec.thermodynamics_retain_threshold_ev_per_atom,
-                    thermodynamics_stable_threshold_ev_per_atom=spec.thermodynamics_stable_threshold_ev_per_atom,
-                    run_mode=spec.run_mode, generation_backend=spec.generation_backend,
-                    memory_mode=payload.get("memory_mode", "none"), memory_seed=payload.get("memory_seed", payload["seed"]),
-                    output_dir=payload["output_dir"], memory_transfer_declaration=payload.get("memory_transfer_declaration"),
-                    reference_set_path=task.reference_set_path, reference_set_sha256=task.reference_set_sha256,
-                    reference_set_certified=task.reference_set_certified,
-                    source_memory_snapshot_path=payload.get("source_memory_snapshot_path"),
-                    source_memory_snapshot_sha256=snapshot_sha,
-                    pinned_model_identity=spec.pinned_model_identity,
-                    pinned_relaxation_settings=spec.pinned_relaxation_settings,
-                    career_db_path=str(Path(payload["output_dir"]) / "career_memory.db"),
-                    mattergen_pretrained=spec.mattergen_pretrained,
-                    mattergen_model_path=spec.mattergen_model_path,
-                    mattergen_checkpoint_sha256=spec.mattergen_checkpoint_sha256,
-                    mattergen_sampling_config_path=spec.mattergen_sampling_config_path,
-                    mattergen_sampling_config_sha256=spec.mattergen_sampling_config_sha256,
-                    mattergen_batch_size=spec.mattergen_batch_size,
-                    domain=task.domain,
-                    target_properties=dict(task.target_properties),
-                    task_constraints=dict(task.constraints),
-                    validation_calculator=spec.validation_calculator,
-                    synthesis_mode=spec.synthesis_mode,
-                )
+            if node.node_type == NodeType.PREFLIGHT:
+                preflight = run_preflight_check(spec)
+                pipeline_state["preflight"] = preflight
+                out = output_root / "preflight.json"
+                node.expected_output_path = str(out).replace("\\", "/")
+                node.result_artifacts = {"preflight.json": _file_sha256(out)}
+
+            elif node.node_type in (NodeType.SOURCE_MEMORY_RUN, NodeType.TARGET_CAMPAIGN_RUN):
+                run_spec = _build_run_spec(spec, node, dag)
                 run_res = CampaignRunner.execute_run(run_spec, force_rerun=force_rerun)
                 # Metrics are derived from the campaign's report, never from a
                 # mutable global CareerMemory query or a synthetic placeholder.
@@ -567,18 +915,21 @@ def execute_full_experiment_pipeline(
                 provenance_p = Path(run_spec.output_dir) / "campaign_provenance.json"
                 if provenance_p.exists():
                     m_data = json.loads(provenance_p.read_text(encoding="utf-8"))
-                    # Preserve run counters/status from the report as
-                    # metadata while keeping candidate order authoritative.
                     if report_p.exists():
                         m_data = {**json.loads(report_p.read_text(encoding="utf-8")), **m_data}
                     rm, cands = compute_run_metrics(
-                        manifest_data=m_data, run_id=run_spec.run_id, task_id=run_spec.task_id,
-                        condition=run_spec.condition, seed=run_spec.seed, oracle_budget=run_spec.oracle_budget,
+                        manifest_data=m_data,
+                        run_id=run_spec.run_id,
+                        task_id=run_spec.task_id,
+                        condition=run_spec.condition,
+                        seed=run_spec.seed,
+                        oracle_budget=run_spec.oracle_budget,
                     )
                     for candidate in cands:
                         _load_candidate_structure(candidate, Path(run_spec.output_dir))
                         _attach_reference_phase_structures(candidate, run_spec.reference_set_path)
-                    all_runs_metrics.append(rm); all_candidates.extend(cands)
+                    all_runs_metrics.append(rm)
+                    all_candidates.extend(cands)
 
             elif node.node_type == NodeType.REFERENCE_SET_VERIFICATION:
                 payload = node.payload
@@ -593,6 +944,9 @@ def execute_full_experiment_pipeline(
                 out = output_root / "references" / f"{payload['task_id']}.verified.json"
                 _atomic_write_json(out, {**payload, "verified": True, "sha256": _file_sha256(Path(p)) if p and Path(p).is_file() else None})
                 node.expected_output_path = str(out).replace("\\", "/")
+                node.result_artifacts = {
+                    str(out.relative_to(output_root)).replace("\\", "/"): _file_sha256(out)
+                }
 
             elif node.node_type == NodeType.SOURCE_MEMORY_SNAPSHOT:
                 payload = node.payload
@@ -618,6 +972,9 @@ def execute_full_experiment_pipeline(
                 node.payload["snapshot_sha256"] = snapshot_sha256
                 node.payload["snapshot_path"] = actual_snapshot_path
                 node.expected_output_path = actual_snapshot_path
+                node.result_artifacts = {
+                    str(Path(actual_snapshot_path).relative_to(output_root)).replace("\\", "/"): snapshot_sha256
+                }
                 for dependent in dag.nodes.values():
                     if node.node_id in dependent.dependencies:
                         dependent.payload["source_memory_snapshot_path"] = actual_snapshot_path
@@ -633,6 +990,12 @@ def execute_full_experiment_pipeline(
                 # as a deterministic fallback when pyarrow is unavailable.
                 _write_parquet(agg_dir / "runs.parquet", run_data)
                 _write_parquet(agg_dir / "candidates.parquet", cand_data)
+                node.result_artifacts = {
+                    "aggregates/runs.json": _file_sha256(agg_dir / "runs.json"),
+                    "aggregates/candidates.json": _file_sha256(agg_dir / "candidates.json"),
+                    "aggregates/runs.parquet": _file_sha256(agg_dir / "runs.parquet"),
+                    "aggregates/candidates.parquet": _file_sha256(agg_dir / "candidates.parquet"),
+                }
 
             elif node.node_type == NodeType.STATISTICAL_ANALYSIS:
                 stats_dir = output_root / "statistics"
@@ -646,6 +1009,11 @@ def execute_full_experiment_pipeline(
                     "spec_hash": spec.spec_hash,
                 }
                 run_statistical_analysis_pipeline(**stats_kwargs)
+                node.result_artifacts = {
+                    "statistics/effects.csv": _file_sha256(stats_dir / "effects.csv"),
+                    "statistics/results.json": _file_sha256(stats_dir / "results.json"),
+                    "statistics/analysis_manifest.json": _file_sha256(stats_dir / "analysis_manifest.json"),
+                }
 
             elif node.node_type == NodeType.QE_AUDIT_SELECTION:
                 qe_dir = output_root / "qe_audit"; qe_dir.mkdir(parents=True, exist_ok=True)
@@ -659,6 +1027,9 @@ def execute_full_experiment_pipeline(
                     "candidates": [c.to_dict() for c in selected_cands],
                     "insufficiency": getattr(selected_cands, "insufficiency", None),
                 })
+                node.result_artifacts = {
+                    "qe_audit/selection.json": _file_sha256(qe_dir / "selection.json"),
+                }
 
             elif node.node_type == NodeType.QE_AUDIT_EXECUTION:
                 qe_dir = output_root / "qe_audit"; selected_path = qe_dir / "selection.json"
@@ -673,8 +1044,16 @@ def execute_full_experiment_pipeline(
                 ).run_full_audit(
                     [QEAuditCandidate(**d) for d in selected_rows]
                 )
+                node.result_artifacts = {
+                    "qe_audit/selection.json": _file_sha256(qe_dir / "selection.json"),
+                    "qe_audit/results.csv": _file_sha256(qe_dir / "results.csv"),
+                    "qe_audit/audit_manifest.json": _file_sha256(qe_dir / "audit_manifest.json"),
+                }
 
             elif node.node_type == NodeType.REPORT_GENERATION:
+                preflight = pipeline_state.get("preflight")
+                if not isinstance(preflight, dict) or preflight.get("status") != "PASSED":
+                    raise RuntimeError("Report generation requires valid hydrated preflight state")
                 rep = ReportGenerator(experiment_root=output_root); stats_dir = output_root / "statistics"; qe_dir = output_root / "qe_audit"
                 stats_manifest: Dict[str, Any] = {}
                 stats_manifest_path = stats_dir / "analysis_manifest.json"
@@ -757,6 +1136,22 @@ def execute_full_experiment_pipeline(
                         "dag": dag.to_dict(),
                     },
                 )
+                node.result_artifacts = {}
+                for rel_k in [
+                    "paper/claim_evidence_matrix.md", "paper/reproducibility_checklist.md", "paper/claim_status.json",
+                    "figures/fig1_best_so_far_vs_oracle_calls.json", "figures/fig2_time_to_threshold_censored.json",
+                    "figures/fig3_paired_effect_sizes.json", "figures/fig4_geometry_and_oracle_failures.json",
+                    "figures/fig5_memory_directives_breakdown.json", "figures/fig6_shuffled_control_validation.json",
+                    "figures/fig7_chgnet_vs_qe_local_decomposition.json",
+                    "tables/table_threshold_sensitivity.json", "tables/table_threshold_sensitivity.csv"
+                ]:
+                    fp = output_root / rel_k
+                    if not fp.exists() or not fp.is_file():
+                        raise RuntimeError(f"Report generation failed: required report artifact '{rel_k}' is missing or not a file")
+                    node.result_artifacts[rel_k] = _file_sha256(fp)
+                for p in sorted((output_root / "figures").glob("*.png")):
+                    rel = str(p.relative_to(output_root)).replace("\\", "/")
+                    node.result_artifacts[rel] = _file_sha256(p)
 
             node.executed = True
             node.success = True

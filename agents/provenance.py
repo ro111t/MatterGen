@@ -534,6 +534,8 @@ class RunManifest:
     oracle_budget_remaining: Optional[int] = None
     iteration_budget_counters: List[Dict[str, Any]] = field(default_factory=list)
     termination_reason: Optional[str] = None
+    generation_shortfall_events: List[Dict[str, Any]] = field(default_factory=list)
+    backend_generation_shortfall: Optional[int] = None
     # CareerMemory view configuration and directive application audit.
     memory_mode: str = "structured_provenance"
     memory_seed: int = 0
