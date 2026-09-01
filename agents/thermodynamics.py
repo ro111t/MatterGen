@@ -27,7 +27,7 @@ except ImportError:  # pragma: no cover - research preflight rejects this case
     PDEntry = PhaseDiagram = Composition = Structure = None
 
 
-THERMODYNAMICS_SCHEMA_VERSION = "1.0.0"
+THERMODYNAMICS_SCHEMA_VERSION = "2.0.0"
 DEFAULT_RETAIN_THRESHOLD_EV_PER_ATOM = 0.10
 DEFAULT_STABLE_THRESHOLD_EV_PER_ATOM = 0.03
 DEFAULT_SENSITIVITY_THRESHOLDS = (0.03, 0.05, 0.10)
@@ -115,6 +115,20 @@ class ReferencePhaseRecord:
 
 
 @dataclass
+class CoverageManifest:
+    source_dataset: str
+    dataset_version: str
+    snapshot_digest: str
+    chemical_system: List[str]
+    selection_procedure: str
+    expected_source_phase_ids: List[str]
+    elemental_endpoint_ids: List[str]
+    required_compounds: List[str] = field(default_factory=list)
+    selection_category_metadata: Optional[Dict[str, Any]] = None
+    manifest_schema_version: str = "1.0.0"
+
+
+@dataclass
 class CertificationReport:
     certified: bool
     chemical_system: List[str]
@@ -128,6 +142,9 @@ class CertificationReport:
     failures: List[Dict[str, str]] = field(default_factory=list)
     compound_coverage_valid: bool = True
     missing_expected_source_phases: List[str] = field(default_factory=list)
+    missing_required_compounds: List[str] = field(default_factory=list)
+    coverage_manifest_hash: Optional[str] = None
+    coverage_manifest_errors: List[str] = field(default_factory=list)
 
 
 @dataclass
@@ -165,6 +182,7 @@ class ThermodynamicResult:
     predicted_thermodynamically_stable: Optional[bool] = None
     retained_by_hull_threshold: Optional[bool] = None
     decomposition: Dict[str, float] = field(default_factory=dict)
+    decomposition_products: List[Dict[str, Any]] = field(default_factory=list)
     relaxed_structure: Any = None
     max_force_ev_per_angstrom: Optional[float] = None
     max_stress_gpa: Optional[float] = None
@@ -444,9 +462,16 @@ def _certify(
     other: List[ReferencePhaseRecord] = []
     compound_phases: List[ReferencePhaseRecord] = []
     present_source_ids: Set[str] = set()
+    successful_source_ids: Set[str] = set()
 
     for phase in phases:
         present_source_ids.add(phase.source_id)
+        if phase.success:
+            successful_source_ids.add(phase.source_id)
+        for dup_id in phase.metadata.get("duplicate_source_ids", []):
+            present_source_ids.add(str(dup_id))
+            if phase.success:
+                successful_source_ids.add(str(dup_id))
         phase_elements = _elements(phase.composition)
         if len(phase_elements) == 1 and phase_elements[0] in endpoint_status:
             endpoint_status[phase_elements[0]] = endpoint_status[phase_elements[0]] or phase.success
@@ -476,12 +501,106 @@ def _certify(
             compound_coverage_valid = False
 
     missing_expected: List[str] = []
-    if source_selection is not None:
+    missing_required: List[str] = []
+    coverage_errors: List[str] = []
+    manifest_hash: Optional[str] = None
+    if source_selection is None:
+        coverage_errors.append("coverage_manifest_required")
+        compound_coverage_valid = False
+    else:
+        try:
+            manifest_hash = sha256_payload(dict(source_selection))
+        except Exception:
+            coverage_errors.append("coverage_manifest_not_canonicalizable")
+
+        required_scalar_fields = (
+            "source_dataset", "dataset_version", "snapshot_digest",
+            "selection_procedure", "manifest_schema_version",
+        )
+        for field_name in required_scalar_fields:
+            value = source_selection.get(field_name)
+            if not isinstance(value, str) or not value.strip():
+                coverage_errors.append(f"missing_or_invalid_{field_name}")
+        snapshot_digest = source_selection.get("snapshot_digest")
+        if not isinstance(snapshot_digest, str) or len(snapshot_digest) != 64 or any(
+            char not in "0123456789abcdefABCDEF" for char in snapshot_digest
+        ):
+            coverage_errors.append("snapshot_digest_must_be_sha256")
+        if source_selection.get("manifest_schema_version") != "1.0.0":
+            coverage_errors.append("unsupported_coverage_manifest_schema")
+
+        decl_system = source_selection.get("chemical_system")
+        if not isinstance(decl_system, list) or sorted(set(str(e) for e in decl_system)) != endpoints:
+            coverage_errors.append("coverage_chemical_system_mismatch")
+            compound_coverage_valid = False
+
         expected_ids = source_selection.get("expected_source_phase_ids", [])
+        endpoint_ids = source_selection.get("elemental_endpoint_ids", [])
+        required_compounds = source_selection.get(
+            "required_compounds", source_selection.get("required_compound_ids", [])
+        )
+        list_fields = {
+            "expected_source_phase_ids": expected_ids,
+            "elemental_endpoint_ids": endpoint_ids,
+        }
+        for field_name, values in list_fields.items():
+            if not isinstance(values, list) or not values or any(
+                not isinstance(value, str) or not value.strip() for value in values
+            ) or len(set(values)) != len(values):
+                coverage_errors.append(f"missing_or_invalid_{field_name}")
+        if not isinstance(required_compounds, list) or any(
+            not isinstance(value, str) or not value.strip() for value in required_compounds
+        ) or len(set(required_compounds)) != len(required_compounds):
+            coverage_errors.append("missing_or_invalid_required_compounds")
+        elif len(endpoints) >= 2 and not required_compounds:
+            coverage_errors.append("missing_or_invalid_required_compounds")
+
         if isinstance(expected_ids, list):
-            missing_expected = sorted(pid for pid in expected_ids if pid not in present_source_ids)
+            missing_expected = sorted(pid for pid in expected_ids if pid not in successful_source_ids)
             if missing_expected:
                 compound_coverage_valid = False
+        if isinstance(required_compounds, list):
+            missing_required = sorted(pid for pid in required_compounds if pid not in successful_source_ids)
+            if missing_required:
+                compound_coverage_valid = False
+
+        if isinstance(expected_ids, list) and isinstance(endpoint_ids, list):
+            if not set(endpoint_ids).issubset(set(expected_ids)):
+                coverage_errors.append("elemental_endpoints_not_in_expected_phases")
+            declared_endpoint_elements: Set[str] = set()
+            for endpoint_id in endpoint_ids:
+                phase = next((p for p in phases if endpoint_id == p.source_id or endpoint_id in p.metadata.get("duplicate_source_ids", [])), None)
+                if phase is None or len(_elements(phase.composition)) != 1:
+                    coverage_errors.append(f"invalid_elemental_endpoint:{endpoint_id}")
+                else:
+                    declared_endpoint_elements.update(_elements(phase.composition))
+            if declared_endpoint_elements != set(endpoints):
+                coverage_errors.append("elemental_endpoint_coverage_mismatch")
+        if isinstance(expected_ids, list) and isinstance(required_compounds, list):
+            if not set(required_compounds).issubset(set(expected_ids)):
+                coverage_errors.append("required_compounds_not_in_expected_phases")
+            for compound_id in required_compounds:
+                phase = next((p for p in phases if compound_id == p.source_id or compound_id in p.metadata.get("duplicate_source_ids", [])), None)
+                if phase is None or len(_elements(phase.composition)) < 2:
+                    coverage_errors.append(f"invalid_required_compound:{compound_id}")
+
+        if coverage_errors:
+            compound_coverage_valid = False
+        else:
+            # Materialize the typed contract after raw validation so future
+            # schema changes cannot silently bypass the declared fields.
+            CoverageManifest(
+                source_dataset=str(source_selection["source_dataset"]),
+                dataset_version=str(source_selection["dataset_version"]),
+                snapshot_digest=str(source_selection["snapshot_digest"]),
+                chemical_system=[str(value) for value in source_selection["chemical_system"]],
+                selection_procedure=str(source_selection["selection_procedure"]),
+                expected_source_phase_ids=[str(value) for value in expected_ids],
+                elemental_endpoint_ids=[str(value) for value in endpoint_ids],
+                required_compounds=[str(value) for value in required_compounds],
+                selection_category_metadata=source_selection.get("selection_category_metadata"),
+                manifest_schema_version=str(source_selection["manifest_schema_version"]),
+            )
 
     certified = (
         not missing_endpoints
@@ -489,6 +608,8 @@ def _certify(
         and (fraction >= 0.95)
         and compound_coverage_valid
         and (not missing_expected)
+        and (not missing_required)
+        and (not coverage_errors)
     )
 
     return CertificationReport(
@@ -504,6 +625,9 @@ def _certify(
         failures=failures,
         compound_coverage_valid=compound_coverage_valid,
         missing_expected_source_phases=missing_expected,
+        missing_required_compounds=missing_required,
+        coverage_manifest_hash=manifest_hash,
+        coverage_manifest_errors=sorted(set(coverage_errors)),
     )
 
 
@@ -713,6 +837,12 @@ class ThermodynamicOracle:
         entries = [PDEntry(phase.composition, phase.total_energy_ev, name=phase.source_id)
                    for phase in reference_set.phases if phase.success]
         self.phase_diagram = PhaseDiagram(entries)
+        self._phase_by_id: Dict[str, ReferencePhaseRecord] = {}
+        for phase in reference_set.phases:
+            if phase.success:
+                self._phase_by_id[phase.source_id] = phase
+                for dup_id in phase.metadata.get("duplicate_source_ids", []):
+                    self._phase_by_id[str(dup_id)] = phase
         self._cache: Dict[str, ThermodynamicResult] = {}
 
     @property
@@ -822,6 +952,31 @@ class ThermodynamicOracle:
             # molecular formula conventions (for example LiO -> Li2O2).
             products = {str(product.name): float(amount)
                         for product, amount in decomposition.items()}
+            decomposition_products = []
+            for product, amount in decomposition.items():
+                source_id = str(product.name)
+                phase_rec = self._phase_by_id.get(source_id)
+                struct = (phase_rec.relaxed_structure if (phase_rec and phase_rec.relaxed_structure is not None) else (phase_rec.structure if phase_rec else None))
+                ser_struct = serialize_structure(struct) if struct is not None else None
+                s_hash = sha256_payload({"structure": ser_struct}) if ser_struct else None
+                formula_val = phase_rec.composition if phase_rec else str(product.composition)
+                if phase_rec is None or struct is None:
+                    raise ReferenceSetError(f"Decomposition phase {source_id!r} is absent from the frozen reference set")
+                product_atom_count = _composition_and_count(struct)[1]
+                if product_atom_count <= 0:
+                    raise ReferenceSetError(f"Decomposition phase {source_id!r} has no atoms")
+                cell_coefficient = float(amount) * float(atom_count) / float(product_atom_count)
+                decomposition_products.append({
+                    "source_id": source_id,
+                    "formula": formula_val,
+                    "composition": formula_val,
+                    "coefficient": cell_coefficient,
+                    "coefficient_basis": "per_candidate_cell",
+                    "structure": ser_struct,
+                    "structure_hash": s_hash,
+                    "reference_set_id": self.reference_set.reference_set_id,
+                    "reference_set_hash": self.reference_set.reference_set_hash,
+                })
         except Exception as exc:
             return self._failure(ThermodynamicFailureCode.PHASE_DIAGRAM_FAILED, str(exc), cache_key=key)
         result = ThermodynamicResult(
@@ -832,7 +987,9 @@ class ThermodynamicOracle:
             predicted_signed_hull_delta_ev_per_atom=signed_delta,
             predicted_thermodynamically_stable=above_hull <= self.stable_threshold_ev_per_atom + 1e-12,
             retained_by_hull_threshold=above_hull <= self.retain_threshold_ev_per_atom + 1e-12,
-            decomposition=products, relaxed_structure=relaxed,
+            decomposition=products,
+            decomposition_products=decomposition_products,
+            relaxed_structure=relaxed,
             max_force_ev_per_angstrom=observed_force,
             max_stress_gpa=_finite_optional(outcome.get("max_stress_gpa")),
             reference_set_id=self.reference_set.reference_set_id,
@@ -856,8 +1013,8 @@ __all__ = [
     "DEFAULT_STABLE_THRESHOLD_EV_PER_ATOM", "DEFAULT_SENSITIVITY_THRESHOLDS",
     "ThermodynamicFailureCode", "ReferenceSetError", "ThermodynamicOracleError",
     "ModelIdentity", "RelaxationSettings", "ReferencePhaseInput", "ReferencePhaseRecord",
-    "CertificationReport", "FrozenReferenceSet", "ThermodynamicResult", "StructureEvaluator",
-    "CHGNetRelaxationEvaluator",
+    "CoverageManifest", "CertificationReport", "FrozenReferenceSet", "ThermodynamicResult",
+    "StructureEvaluator", "CHGNetRelaxationEvaluator",
     "canonical_json", "sha256_payload", "serialize_structure", "deserialize_structure",
     "build_frozen_reference_set", "write_frozen_reference_set", "load_frozen_reference_set",
     "ThermodynamicOracle", "threshold_sensitivity",

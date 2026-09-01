@@ -16,7 +16,7 @@ from agents.thermodynamics import (
     ThermodynamicFailureCode,
     ThermodynamicOracle,
     ThermodynamicOracleError,
-    build_frozen_reference_set,
+    build_frozen_reference_set as _build_frozen_reference_set,
     canonical_json,
     load_frozen_reference_set,
     sha256_payload,
@@ -32,6 +32,38 @@ from campaign import CampaignConfig, MaterialsDiscoveryCampaign
 MODEL = ModelIdentity("fake-chgnet", "0.3.0", "a" * 64)
 SETTINGS = RelaxationSettings(fmax_ev_per_angstrom=0.05, max_steps=500, relax_cell=True)
 REPO_ROOT = Path(__file__).resolve().parents[1]
+
+
+def _coverage_manifest(inputs, chemical_system):
+    from pymatgen.core import Composition
+
+    items = list(inputs)
+    endpoints = [item.source_id for item in items if len(Composition(item.structure["composition"]).elements) == 1]
+    compounds = [item.source_id for item in items if len(Composition(item.structure["composition"]).elements) >= 2]
+    return {
+        "manifest_schema_version": "1.0.0",
+        "source_dataset": "unit-test-fixture",
+        "dataset_version": "fixed-v1",
+        "snapshot_digest": "1" * 64,
+        "chemical_system": sorted(set(chemical_system)),
+        "selection_procedure": "all declared unit-test phases",
+        "expected_source_phase_ids": [item.source_id for item in items],
+        "elemental_endpoint_ids": endpoints,
+        "required_compounds": compounds,
+    }
+
+
+def build_frozen_reference_set(*, inputs, chemical_system, source_selection=None, **kwargs):
+    items = list(inputs)
+    return _build_frozen_reference_set(
+        inputs=items,
+        chemical_system=chemical_system,
+        source_selection=(
+            _coverage_manifest(items, chemical_system)
+            if source_selection is None else source_selection
+        ),
+        **kwargs,
+    )
 
 
 def structure(formula, candidate_id=None, lattice=None, positions=None):

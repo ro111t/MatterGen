@@ -360,6 +360,9 @@ def extract_candidates_from_manifest(
     return records
 
 
+AUC_WORST_VALUE_CAP = 1.0
+
+
 def compute_run_metrics(
     manifest_data: Dict[str, Any],
     run_id: str,
@@ -450,24 +453,44 @@ def compute_run_metrics(
     best_at: Dict[int, Optional[float]] = {}
     trajectory: List[Tuple[int, float]] = []
     best = float("inf")
+    current_incumbent = AUC_WORST_VALUE_CAP
+    call_incumbents: Dict[int, float] = {}
     for c in evaluated:
+        call_idx = int(c.oracle_call_index or 0)
         e = c.predicted_energy_above_hull_ev_per_atom
-        if e is not None and e < best:
-            best = e
+        if e is not None and math.isfinite(e):
+            current_incumbent = min(current_incumbent, e)
+            if e < best:
+                best = e
+        call_incumbents[call_idx] = current_incumbent
         if math.isfinite(best):
-            trajectory.append((int(c.oracle_call_index or 0), best))
+            trajectory.append((call_idx, best))
     for budget in fixed_budgets:
         values = [v for idx, v in trajectory if idx <= budget]
         best_at[budget] = min(values) if values else None
     best_overall = min((v for _, v in trajectory), default=None)
     auc: Optional[float] = None
-    if trajectory and order_complete:
-        auc = 0.0
-        prev_x = 0
-        prev_y = trajectory[0][1]
-        for x, y in trajectory:
-            auc += max(0, x - prev_x) * prev_y
-            prev_x, prev_y = x, y
+    run_status = str(manifest.get("status", source.get("status", "unknown")))
+    if run_status != "completed":
+        missing_fields.append("run_not_completed")
+    auc_eligible = (
+        run_status == "completed"
+        and order_complete
+        and oracle_evals > 0
+        and counter_discrepancy is None
+        and proposal_discrepancy is None
+        and budget_discrepancy is None
+        and not missing_fields
+    )
+    if auc_eligible:
+        total_steps = int(oracle_budget)
+        auc_sum = 0.0
+        last_val = AUC_WORST_VALUE_CAP
+        for step in range(1, total_steps + 1):
+            if step in call_incumbents:
+                last_val = call_incumbents[step]
+            auc_sum += last_val
+        auc = auc_sum / total_steps
 
     unique_formulas = {c.reduced_formula for c in oracle_candidates if c.reduced_formula}
     unique_anon = {c.anonymous_stoichiometry for c in oracle_candidates if c.anonymous_stoichiometry}
@@ -487,6 +510,7 @@ def compute_run_metrics(
     shortfall = meta.get("backend_generation_shortfall") or manifest.get("backend_generation_shortfall")
     if shortfall and isinstance(shortfall, (int, float)) and shortfall > 0:
         missing_fields.append("backend_generation_shortfall")
+        auc = None
 
     metrics = RunMetrics(
         run_id=run_id,
@@ -535,13 +559,14 @@ def compute_run_metrics(
             else "structured_oracle_call_index" if order_complete
             else "incomplete_oracle_call_index"
         ),
-        run_status=str(manifest.get("status", source.get("status", "unknown"))),
+        run_status=run_status,
         shuffle_validation=(manifest.get("memory_shuffle_audit") if isinstance(manifest.get("memory_shuffle_audit"), Mapping) else None),
     )
     return metrics, candidates
 
 
 __all__ = [
+    "AUC_WORST_VALUE_CAP",
     "CandidateRecord",
     "RunMetrics",
     "ProvenanceIntegrityError",

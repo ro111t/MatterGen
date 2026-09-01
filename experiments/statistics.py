@@ -24,6 +24,7 @@ from experiments.spec import (
     CONFIRMATORY_METRICS,
     DEFAULT_FAMILY_WISE_ALPHA,
 )
+from experiments.metrics import AUC_WORST_VALUE_CAP
 
 CONFIRMATORY_FAMILY_NAME = "primary_endpoint_and_threshold_yield_family"
 PRIMARY_CENSORED_ENDPOINT_NAME = "oracle_calls_to_first_candidate_at_or_below_0_10"
@@ -534,13 +535,61 @@ def run_statistical_analysis_pipeline(
                     res.p_value_raw = None
                     res.p_value_adjusted = None
                     res.adjustment_method = None
-                if comp_type == "confirmatory" and metric in confirmatory_metrics and res.p_value_raw is not None:
-                    confirmatory_indices.append(len(results) - 1)
-                    confirmatory_p.append(res.p_value_raw)
 
-    for idx, adjusted in zip(confirmatory_indices, holm_bonferroni_adjust(confirmatory_p)):
-        results[idx].p_value_adjusted = adjusted
-        results[idx].adjustment_method = HOLM_ADJUSTMENT_METHOD_NAME
+    # Confirmatory family is defined by the preregistered Cartesian product:
+    # target_tasks x CONFIRMATORY_CONTROLS x CONFIRMATORY_METRICS
+    target_tasks = [t for t in (expected_tasks or tasks) if t not in {"Li-P-S", "source", "source_task"}]
+    if not target_tasks:
+        target_tasks = list(tasks)
+    conf_controls = list(conditions[1:4])
+    conf_metrics_sorted = sorted(confirmatory_metrics)
+
+    planned_confirmatory_entries: List[Tuple[str, str, str, PairedComparisonResult, Optional[float]]] = []
+    # Build lookup from (task, control, metric) -> result in results
+    result_by_key: Dict[Tuple[str, str, str], PairedComparisonResult] = {
+        (r.target_task, r.condition_b, r.metric_name): r
+        for r in results
+        if r.condition_a == "structured_provenance_memory" and r.comparison_type == "confirmatory"
+    }
+
+    available_count = 0
+    planned_p_values: List[float] = []
+    for task in target_tasks:
+        for control in conf_controls:
+            for metric in conf_metrics_sorted:
+                res = result_by_key.get((task, control, metric))
+                if res is not None and res.p_value_raw is not None and res.status != "UNAVAILABLE_MISSING_TASK_OR_ARM":
+                    p_val = float(res.p_value_raw)
+                    available_count += 1
+                    planned_p_values.append(p_val)
+                    planned_confirmatory_entries.append((task, control, metric, res, p_val))
+                elif res is not None:
+                    # Unavailable comparison gets internal p=1.0 for adjustment without shrinking family size
+                    planned_p_values.append(1.0)
+                    planned_confirmatory_entries.append((task, control, metric, res, None))
+                else:
+                    # Construct explicit unavailable result if completely absent from results
+                    unavail_res = PairedComparisonResult(
+                        analysis_version, task, metric, "structured_provenance_memory", control, "confirmatory",
+                        0, len(all_seeds), 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, None, None, None, [],
+                        method="paired_sign_flip" if metric != PRIMARY_CENSORED_ENDPOINT_NAME else "paired_censored_RMST_within_seed_randomization",
+                        confirmatory_family=CONFIRMATORY_FAMILY_NAME,
+                        status="UNAVAILABLE_MISSING_TASK_OR_ARM",
+                    )
+                    results.append(unavail_res)
+                    result_by_key[(task, control, metric)] = unavail_res
+                    planned_p_values.append(1.0)
+                    planned_confirmatory_entries.append((task, control, metric, unavail_res, None))
+
+    if planned_p_values:
+        adjusted_family = holm_bonferroni_adjust(planned_p_values)
+        for (_, _, _, res, raw_p), adjusted_p in zip(planned_confirmatory_entries, adjusted_family):
+            if raw_p is not None:
+                res.p_value_adjusted = adjusted_p
+                res.adjustment_method = HOLM_ADJUSTMENT_METHOD_NAME
+            else:
+                res.p_value_adjusted = None
+                res.adjustment_method = None
 
     results_payload = [r.to_dict() for r in results]
     manifest = {
@@ -556,8 +605,20 @@ def run_statistical_analysis_pipeline(
         "expected_seeds": all_seeds,
         "expected_tasks": tasks,
         "total_comparisons": len(results),
-        "confirmatory_comparisons_count": len(confirmatory_indices),
+        "planned_family_size": len(planned_confirmatory_entries),
+        "available_comparison_count": available_count,
+        "unavailable_comparison_count": len(planned_confirmatory_entries) - available_count,
+        "confirmatory_comparisons_count": available_count,
         "adjustment_method": HOLM_ADJUSTMENT_METHOD_NAME,
+        "auc_definition": {
+            "metric": "area_under_best_curve",
+            "worst_value_cap_ev_per_atom": AUC_WORST_VALUE_CAP,
+            "horizon": "fixed_oracle_budget",
+            "normalization": "sum_of_call_incumbents_divided_by_oracle_budget",
+            "orientation": "lower_is_better",
+            "step_convention": "failed calls retain the incumbent; successful finite calls update the minimum",
+            "availability": "completed provenance-valid runs only",
+        },
         "results": results_payload,
     }
     if output_dir:
@@ -602,7 +663,10 @@ def run_statistical_analysis_pipeline(
         "experiment_id": experiment_id,
         "spec_hash": spec_hash,
         "total_comparisons": len(results),
-        "confirmatory_comparisons": len(confirmatory_indices),
+        "planned_family_size": manifest["planned_family_size"],
+        "available_comparison_count": manifest["available_comparison_count"],
+        "unavailable_comparison_count": manifest["unavailable_comparison_count"],
+        "confirmatory_comparisons": available_count,
         "expected_seeds": all_seeds,
         "manifest": manifest,
     }

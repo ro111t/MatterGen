@@ -1,4 +1,4 @@
-from typing import Dict, List, Any, Optional
+from typing import Dict, List, Any, Optional, Sequence
 from dataclasses import dataclass, field
 import json
 import os
@@ -33,22 +33,27 @@ class OrchestratorAgent:
     def __init__(self, career_memory: Optional[CareerMemory] = None,
                  api_key: Optional[str] = None,
                  memory_mode: str = "structured_provenance",
-                 memory_seed: int = 0):
+                 memory_seed: int = 0,
+                 allow_llm: bool = True,
+                 locked_elements: Optional[Sequence[str]] = None):
         self.career_memory = career_memory
         self.memory_mode = memory_mode
         self.memory_seed = int(memory_seed)
+        self.allow_llm = allow_llm
+        self.locked_elements = [str(el) for el in locked_elements] if locked_elements is not None else None
         self.current_strategy = None
         self.current_hypothesis_ids: List[str] = []
 
-        # Initialize OpenAI client
-        key = api_key or os.environ.get('OPENAI_API_KEY')
-        if HAS_OPENAI and key:
+        # Initialize OpenAI client only when allow_llm is True
+        key = api_key if api_key is not None else (os.environ.get('OPENAI_API_KEY') if allow_llm else None)
+        if HAS_OPENAI and key and allow_llm:
             self.llm = OpenAI(api_key=key)
             self.llm_available = True
         else:
             self.llm = None
             self.llm_available = False
-            print("  [Orchestrator] No OpenAI key — using heuristic planning")
+            if allow_llm:
+                print("  [Orchestrator] No OpenAI key — using heuristic planning")
         
     def plan_campaign(self, objective: CampaignObjective) -> Dict[str, Any]:
         """
@@ -76,9 +81,11 @@ class OrchestratorAgent:
             "unsupported": transfer.get("unsupported", []),
             "shuffle_audit": transfer.get("shuffle_audit"),
         }
+        if self.locked_elements is not None:
+            strategy["elements"] = list(self.locked_elements)
         self.current_strategy = strategy
         return strategy
-        
+
     def plan_iteration(self, objective: CampaignObjective, history: List[Dict],
                         campaign_id: str = "", iteration: int = 0,
                         recommendations: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
@@ -211,9 +218,11 @@ Example:
         else:
             self.current_hypothesis_ids = []
 
+        if self.locked_elements is not None:
+            strategy["elements"] = list(self.locked_elements)
         self.current_strategy = strategy
         return strategy
-        
+
     def interpret_results(self, batch_results: Dict[str, Any]) -> str:
         """
         Generate natural language interpretation of batch results.

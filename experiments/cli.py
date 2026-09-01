@@ -1022,10 +1022,12 @@ def execute_full_experiment_pipeline(
                     "expected_qe_candidate_count": spec.qe_audit_config.candidate_count,
                     "qe_selection_count": len(selected_cands),
                     "qe_selection_insufficiency": getattr(selected_cands, "insufficiency", None),
+                    "qe_selection_exclusions_by_reason": getattr(selected_cands, "exclusions_by_reason", {}),
                 }
                 _atomic_write_json(qe_dir / "selection.json", {
                     "candidates": [c.to_dict() for c in selected_cands],
                     "insufficiency": getattr(selected_cands, "insufficiency", None),
+                    "exclusions_by_reason": getattr(selected_cands, "exclusions_by_reason", {}),
                 })
                 node.result_artifacts = {
                     "qe_audit/selection.json": _file_sha256(qe_dir / "selection.json"),

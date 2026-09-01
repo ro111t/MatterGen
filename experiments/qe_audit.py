@@ -47,11 +47,18 @@ class QESelectionInsufficiency(QEAuditError):
 
 
 class AuditSelection(list):
-    """List-compatible selection carrying an explicit insufficiency reason."""
+    """List-compatible selection carrying an explicit insufficiency reason and exclusion stats."""
 
-    def __init__(self, values: Sequence[Any] = (), *, insufficiency: Optional[str] = None):
+    def __init__(
+        self,
+        values: Sequence[Any] = (),
+        *,
+        insufficiency: Optional[str] = None,
+        exclusions_by_reason: Optional[Dict[str, int]] = None,
+    ):
         super().__init__(values)
         self.insufficiency = insufficiency
+        self.exclusions_by_reason = dict(exclusions_by_reason or {})
 
 
 @dataclass
@@ -140,8 +147,22 @@ def _get(obj: Any, name: str, default: Any = None) -> Any:
 
 
 def _structure_parts(structure: Mapping[str, Any]) -> Tuple[List[List[float]], List[List[float]], List[str], bool]:
+    if hasattr(structure, "as_dict") and callable(getattr(structure, "as_dict")):
+        structure = structure.as_dict()
     if not isinstance(structure, Mapping):
         raise QEAuditError("A crystal structure object is required; composition-only records are invalid")
+    if "format" in structure and "data" in structure:
+        fmt = structure.get("format")
+        data = structure.get("data")
+        if fmt == "dict" and isinstance(data, Mapping):
+            structure = data
+        elif fmt in {"poscar", "cif"} and isinstance(data, str):
+            try:
+                from pymatgen.core import Structure
+                pmg_struct = Structure.from_str(data, fmt=fmt)
+                return _structure_parts(pmg_struct.as_dict())
+            except Exception as e:
+                raise QEAuditError(f"Failed to parse serialized structure format {fmt}: {e}") from e
     lattice = structure.get("lattice") or structure.get("cell")
     positions = structure.get("positions") or structure.get("coords") or structure.get("coordinates")
     species = structure.get("species") or structure.get("symbols") or structure.get("elements")
@@ -176,8 +197,9 @@ def _structure_parts(structure: Mapping[str, Any]) -> Tuple[List[List[float]], L
 def _formula_counts(formula: str) -> Dict[str, int]:
     if not isinstance(formula, str) or not formula.strip():
         raise QEAuditError("Formula is required for atom balancing")
-    tokens = re.findall(r"([A-Z][a-z]*)([0-9]*(?:\.[0-9]+)?)", formula)
-    if not tokens or "".join(a + b for a, b in tokens) != formula:
+    clean_formula = "".join(formula.split())
+    tokens = re.findall(r"([A-Z][a-z]*)([0-9]*(?:\.[0-9]+)?)", clean_formula)
+    if not tokens or "".join(a + b for a, b in tokens) != clean_formula:
         raise QEAuditError(f"Cannot parse chemical formula {formula!r}")
     counts: Dict[str, int] = {}
     for element, number in tokens:
@@ -198,12 +220,36 @@ def _structure_counts(structure: Mapping[str, Any]) -> Dict[str, int]:
     return counts
 
 
+def _formula_unit_multiplier(formula: str, structure: Mapping[str, Any]) -> Tuple[int, int]:
+    """Return (num_atoms, formula_unit_multiplier).
+
+    Derives multiplier M = struct_count[e] // formula_count[e] and validates
+    exact proportional match across all elements.
+    """
+    struct_counts = _structure_counts(structure)
+    form_counts = _formula_counts(formula)
+    if set(struct_counts) != set(form_counts):
+        raise QEAuditError(f"Structure species {struct_counts} do not match formula {formula} ({form_counts})")
+
+    multipliers = set()
+    for el, f_count in form_counts.items():
+        s_count = struct_counts[el]
+        if s_count % f_count != 0:
+            raise QEAuditError(f"Structure element {el} count {s_count} is not an integer multiple of formula count {f_count}")
+        multipliers.add(s_count // f_count)
+
+    if len(multipliers) != 1:
+        raise QEAuditError(f"Structure species counts {struct_counts} are not proportionally matching formula {formula}")
+
+    m = multipliers.pop()
+    if m <= 0:
+        raise QEAuditError(f"Formula unit multiplier must be positive, got {m}")
+    return sum(struct_counts.values()), m
+
+
 def _validate_formula_structure(formula: str, structure: Mapping[str, Any]) -> int:
-    counts = _structure_counts(structure)
-    formula_counts = _formula_counts(formula)
-    if counts != formula_counts:
-        raise QEAuditError(f"Structure species {counts} do not match formula {formula} ({formula_counts})")
-    return sum(counts.values())
+    num_atoms, _ = _formula_unit_multiplier(formula, structure)
+    return num_atoms
 
 
 def _file_sha256(path: Path) -> str:
@@ -358,35 +404,45 @@ def select_audit_candidates(
         raise QEAuditError("target_count must be positive")
     target_set = set(target_tasks) if target_tasks else None
     condition_set = set(relevant_conditions) if relevant_conditions else None
+    exclusions_by_reason: Dict[str, int] = {}
     eligible: List[Any] = []
     for c in candidates:
         task = str(_get(c, "task_id", _get(c, "target_task", "")))
         if target_set is not None:
             if task not in target_set:
+                exclusions_by_reason["non_target_task"] = exclusions_by_reason.get("non_target_task", 0) + 1
                 continue
         elif task in {"Li-P-S", "source", "source_task"}:
+            exclusions_by_reason["source_task_excluded"] = exclusions_by_reason.get("source_task_excluded", 0) + 1
             continue
         cond = str(_get(c, "condition", ""))
         if condition_set is not None and cond not in condition_set:
+            exclusions_by_reason["condition_not_in_scope"] = exclusions_by_reason.get("condition_not_in_scope", 0) + 1
             continue
         if not bool(_get(c, "evaluated_by_oracle", _get(c, "oracle_evaluated", False))):
+            exclusions_by_reason["unevaluated_by_oracle"] = exclusions_by_reason.get("unevaluated_by_oracle", 0) + 1
             continue
         if not bool(_get(c, "oracle_success", True)):
+            exclusions_by_reason["oracle_evaluation_failed"] = exclusions_by_reason.get("oracle_evaluation_failed", 0) + 1
             continue
         energy = _get(c, "predicted_energy_above_hull_ev_per_atom")
         try:
             energy_f = float(energy)
         except (TypeError, ValueError):
+            exclusions_by_reason["nonfinite_hull_energy"] = exclusions_by_reason.get("nonfinite_hull_energy", 0) + 1
             continue
         if not math.isfinite(energy_f):
+            exclusions_by_reason["nonfinite_hull_energy"] = exclusions_by_reason.get("nonfinite_hull_energy", 0) + 1
             continue
         structure = _get(c, "structure")
         formula = _get(c, "reduced_formula", _get(c, "formula", _get(c, "composition")))
         if not isinstance(structure, Mapping) or not formula:
+            exclusions_by_reason["missing_structure_or_formula"] = exclusions_by_reason.get("missing_structure_or_formula", 0) + 1
             continue
         try:
             _validate_formula_structure(str(formula), structure)
         except QEAuditError:
+            exclusions_by_reason["structure_formula_mismatch"] = exclusions_by_reason.get("structure_formula_mismatch", 0) + 1
             continue
         eligible.append(c)
     eligible.sort(key=lambda c: (
@@ -414,8 +470,8 @@ def select_audit_candidates(
             break
     reason = None if len(selected) >= target_count else f"insufficient_valid_target_candidates:{len(selected)}/{target_count}"
     if reason and strict:
-        raise QESelectionInsufficiency(reason)
-    result = AuditSelection(insufficiency=reason)
+        raise QESelectionInsufficiency(f"{reason}; exclusions: {exclusions_by_reason}")
+    result = AuditSelection(insufficiency=reason, exclusions_by_reason=exclusions_by_reason)
     for rank, c in enumerate(selected, 1):
         result.append(QEAuditCandidate(
             candidate_id=str(_get(c, "candidate_id")),
@@ -616,7 +672,7 @@ def _run_calc(calculator: Any, formula: str, structure: Dict[str, Any], config: 
         return calculator.run_calculation(formula, structure, config, directory)
 
 
-def _product_schema(candidate: QEAuditCandidate) -> List[Tuple[str, float, Dict[str, Any]]]:
+def _product_schema(candidate: QEAuditCandidate) -> List[Tuple[str, float, Dict[str, Any], int]]:
     products = candidate.predicted_decomposition_products
     if isinstance(products, Mapping):
         products = [
@@ -625,7 +681,7 @@ def _product_schema(candidate: QEAuditCandidate) -> List[Tuple[str, float, Dict[
         ]
     if not isinstance(products, list) or not products:
         raise QEAuditError("An atom-balanced decomposition product list is required")
-    parsed: List[Tuple[str, float, Dict[str, Any]]] = []
+    parsed: List[Tuple[str, float, Dict[str, Any], int]] = []
     for product in products:
         if not isinstance(product, Mapping):
             raise QEAuditError("Each decomposition product must be a mapping")
@@ -640,13 +696,13 @@ def _product_schema(candidate: QEAuditCandidate) -> List[Tuple[str, float, Dict[
             raise QEAuditError("Decomposition coefficients must be finite positive numbers")
         if not math.isfinite(coeff) or coeff <= 0:
             raise QEAuditError("Decomposition coefficients must be finite positive numbers")
-        _validate_formula_structure(str(formula), structure)
-        parsed.append((str(formula), coeff, dict(structure)))
+        _, multiplier = _formula_unit_multiplier(str(formula), structure)
+        parsed.append((str(formula), coeff, dict(structure), multiplier))
     return parsed
 
 
 def validate_atom_balanced_reaction(
-    candidate_formula: str,
+    candidate_formula_or_structure: str | Mapping[str, Any],
     products: Sequence[Mapping[str, Any]] | Mapping[str, Any],
 ) -> bool:
     """Validate elemental balance without using guessed atom counts."""
@@ -655,7 +711,10 @@ def validate_atom_balanced_reaction(
             {"formula": formula, "coefficient": coefficient}
             for formula, coefficient in products.items()
         ]
-    candidate_counts = _formula_counts(candidate_formula)
+    if isinstance(candidate_formula_or_structure, Mapping):
+        candidate_counts = _structure_counts(candidate_formula_or_structure)
+    else:
+        candidate_counts = _formula_counts(str(candidate_formula_or_structure))
     product_counts: Dict[str, float] = {}
     for product in products:
         formula = product.get("formula") or product.get("composition")
@@ -682,10 +741,11 @@ def compute_local_decomposition_margin(
     phase_results: Sequence[Mapping[str, Any] | QEResultRecord],
     products: Sequence[Mapping[str, Any]] | Mapping[str, Any],
 ) -> float:
-    """Compute ``(E_candidate - sum(c_i E_phase_i))/N_candidate``.
+    """Compute a full-cell reaction margin.
 
-    Total energies are used for every phase; weighted phase energies per atom
-    are deliberately not averaged, which would be wrong for unlike formulas.
+    Every coefficient is the number of product structure cells required for
+    one candidate structure cell.  Total energies therefore remain on their
+    native cell basis throughout the calculation.
     """
     if candidate_num_atoms <= 0 or not math.isfinite(float(candidate_total_energy_ev)):
         raise QEAuditError("Candidate total energy and atom count are required")
@@ -698,6 +758,9 @@ def compute_local_decomposition_margin(
         status = _get(phase, "status")
         total_energy = _get(phase, "total_energy_ev")
         coefficient = product.get("coefficient", product.get("amount"))
+        basis = product.get("coefficient_basis", "per_candidate_cell")
+        if basis != "per_candidate_cell":
+            raise QEAuditError("Decomposition coefficients must use the per_candidate_cell basis")
         if status != QECalculationStatus.CONVERGED.value or not _finite_number(total_energy) or not _finite_number(coefficient) or float(coefficient) <= 0:
             raise QEAuditError("All decomposition phases must have finite converged total energies")
         reference_total += float(coefficient) * float(total_energy)
@@ -794,15 +857,20 @@ class QEAuditRunner:
     def audit_candidate(self, candidate: QEAuditCandidate) -> QELocalDecompositionAuditResult:
         if not _finite_number(candidate.predicted_energy_above_hull_ev_per_atom):
             raise QEAuditError("Candidate predicted energy above hull must be finite")
-        num_atoms = _validate_formula_structure(candidate.reduced_formula, candidate.structure)
+        num_atoms, cand_mult = _formula_unit_multiplier(candidate.reduced_formula, candidate.structure)
         products = _product_schema(candidate)
-        candidate_counts = _formula_counts(candidate.reduced_formula)
-        product_counts: Dict[str, float] = {}
-        for formula, coeff, _ in products:
-            for element, count in _formula_counts(formula).items():
-                product_counts[element] = product_counts.get(element, 0.0) + coeff * count
-        balanced = validate_atom_balanced_reaction(candidate.reduced_formula, [{"formula": f, "coefficient": c} for f, c, _ in products])
-        equation = f"{candidate.reduced_formula} -> " + " + ".join(f"{coeff:g} {formula}" for formula, coeff, _ in products)
+        product_dicts = [
+            {
+                "formula": f,
+                "coefficient": c,
+                "coefficient_basis": "per_candidate_cell",
+                "structure": s,
+                "formula_unit_multiplier": m,
+            }
+            for f, c, s, m in products
+        ]
+        balanced = validate_atom_balanced_reaction(candidate.structure, product_dicts)
+        equation = f"{cand_mult:g} {candidate.reduced_formula} -> " + " + ".join(f"{coeff:g} {formula}" for formula, coeff, _, _ in products)
         if not balanced:
             return QELocalDecompositionAuditResult(candidate.candidate_id, candidate.target_task, candidate.condition, candidate.seed, candidate.reduced_formula, num_atoms, QECalculationStatus.INVALID_INPUT.value, None, len(products), False, candidate.predicted_energy_above_hull_ev_per_atom, None, None, None, equation, reaction_balanced=False, status="INVALID_UNBALANCED_REACTION")
 
@@ -813,7 +881,7 @@ class QEAuditRunner:
         phase_provenance: List[Dict[str, Any]] = []
         all_converged = cand_res.status == QECalculationStatus.CONVERGED.value
         reference_total = 0.0
-        for index, (formula, coeff, structure) in enumerate(products):
+        for index, (formula, coeff, structure, mult) in enumerate(products):
             directory = self.calc_root / f"phase_{index}_{hashlib.sha256(formula.encode()).hexdigest()[:12]}"
             phase_res = _run_calc(self.calculator, formula, structure, self.config, directory, is_candidate=False)
             self._validate_result_provenance(phase_res)
@@ -822,6 +890,7 @@ class QEAuditRunner:
             phase_record.update({
                 "phase_index": index,
                 "decomposition_coefficient": coeff,
+                "formula_unit_multiplier": mult,
             })
             phase_provenance.append(phase_record)
             if phase_res.status != QECalculationStatus.CONVERGED.value or phase_res.total_energy_ev is None:
@@ -832,7 +901,7 @@ class QEAuditRunner:
         sign = None
         difference = None
         if cand_res.status == QECalculationStatus.CONVERGED.value and cand_res.total_energy_ev is not None and all_converged:
-            margin = compute_local_decomposition_margin(cand_res.total_energy_ev, num_atoms, phase_results, [{"formula": f, "coefficient": c} for f, c, _ in products])
+            margin = compute_local_decomposition_margin(cand_res.total_energy_ev, num_atoms, phase_results, product_dicts)
             sign = (margin <= 0.03) == (candidate.predicted_energy_above_hull_ev_per_atom <= 0.03)
             difference = margin - candidate.predicted_energy_above_hull_ev_per_atom
         status = "VALIDATED" if margin is not None else "INCONCLUSIVE_CALCULATION_FAILURE"
@@ -857,6 +926,7 @@ class QEAuditRunner:
                 "seed": candidate.seed,
                 "selection_rank": candidate.selection_rank,
                 "selection_reason": candidate.selection_reason,
+                "candidate_formula_unit_multiplier": cand_mult,
                 "result": cand_res.to_dict(),
             },
         )
@@ -866,15 +936,19 @@ class QEAuditRunner:
         # insufficiency metadata, and the exact same selection must be bound
         # to the emitted audit manifest.
         selection_has_insufficiency = hasattr(candidates, "insufficiency")
+        selection_has_exclusions = hasattr(candidates, "exclusions_by_reason")
         selection_insufficiency = getattr(candidates, "insufficiency", None)
+        selection_exclusions = dict(getattr(candidates, "exclusions_by_reason", {}) or {})
         candidates = list(candidates)
         self.output_dir.mkdir(parents=True, exist_ok=True)
         selection_path = self.output_dir / "selection.json"
         selection_payload = {
             "candidates": [candidate.to_dict() for candidate in candidates],
             "insufficiency": selection_insufficiency,
+            "exclusions_by_reason": selection_exclusions,
         }
         bound_selection_insufficiency = selection_insufficiency
+        bound_selection_exclusions = selection_exclusions
         # A selection node normally writes this artifact before execution. A
         # direct runner invocation still gets a complete, atomically-written
         # selection artifact; an existing artifact is never overwritten.
@@ -903,12 +977,21 @@ class QEAuditRunner:
                 raise QEAuditError(
                     "QE selection artifact insufficiency does not match the supplied selection"
                 )
+            existing_exclusions = existing_selection.get("exclusions_by_reason", {})
+            if not isinstance(existing_exclusions, Mapping):
+                raise QEAuditError("QE selection artifact exclusions_by_reason must be a mapping")
+            if selection_has_exclusions and dict(existing_exclusions) != selection_exclusions:
+                raise QEAuditError(
+                    "QE selection artifact exclusion counts do not match the supplied selection"
+                )
             # A plain list has no insufficiency metadata of its own (as in the
             # CLI execution node), so an explicit artifact value is the
             # authoritative value in that case. AuditSelection callers must
             # agree explicitly with the artifact.
             if not selection_has_insufficiency and existing_has_insufficiency:
                 bound_selection_insufficiency = existing_insufficiency
+            if not selection_has_exclusions:
+                bound_selection_exclusions = dict(existing_exclusions)
         else:
             _atomic_write_json(selection_path, selection_payload, indent=2)
 
@@ -944,6 +1027,7 @@ class QEAuditRunner:
             "mock_execution": bool(self.config.mock_execution),
             "selection_count": len(candidates),
             "selection_insufficiency": bound_selection_insufficiency,
+            "selection_exclusions_by_reason": bound_selection_exclusions,
             "config": _config_dict(self.config),
             "artifacts": {
                 "selection.json": selection_digest,

@@ -108,6 +108,8 @@ class CampaignConfig:
     min_distance: Optional[float] = None
     minimum_distance: Optional[float] = None
     min_distance_angstrom: Optional[float] = None
+    locked_elements: Optional[List[str]] = None
+    allow_llm_orchestration: bool = True
 
     def __post_init__(self) -> None:
         self.run_mode = normalize_run_mode(self.run_mode)
@@ -195,9 +197,11 @@ class MaterialsDiscoveryCampaign:
 
         self.orchestrator = OrchestratorAgent(
             career_memory=self.career_memory,
-            api_key=os.environ.get('OPENAI_API_KEY'),
+            api_key=os.environ.get('OPENAI_API_KEY') if self.config.allow_llm_orchestration else None,
             memory_mode=self.config.memory_mode,
             memory_seed=self.config.memory_seed,
+            allow_llm=self.config.allow_llm_orchestration,
+            locked_elements=self.config.locked_elements,
         )
         self.current_recommendations: Optional[Dict[str, Any]] = None
         self.distiller = ExperienceDistiller(
@@ -240,6 +244,11 @@ class MaterialsDiscoveryCampaign:
                 'geometry_min_distance': self.config.geometry_min_distance,
                 'memory_mode': self.config.memory_mode,
                 'memory_seed': self.config.memory_seed,
+                'locked_elements': (
+                    list(getattr(self.config, 'locked_elements'))
+                    if getattr(self.config, 'locked_elements', None) is not None else None
+                ),
+                'allow_llm_orchestration': bool(getattr(self.config, 'allow_llm_orchestration', True)),
                 'memory_transfer_declaration': (
                     self.config.objective.constraints.get('memory_transfer_declaration')
                     or self.config.objective.constraints.get('transferability')
@@ -485,6 +494,13 @@ class MaterialsDiscoveryCampaign:
 
         # 2. Generate
         self._log("\n[2/6] Generating Candidates...")
+        if self.config.locked_elements is not None:
+            expected_elems = sorted(self.config.locked_elements)
+            strat_elems = sorted(strategy.get('elements', []))
+            if strat_elems != expected_elems:
+                raise RuntimeError(
+                    f"Strategy elements {strat_elems} do not match declared locked chemical system {expected_elems}"
+                )
         if (
             self.provenance
             and self.provenance.manifest.iteration_seeds
@@ -935,6 +951,11 @@ class MaterialsDiscoveryCampaign:
                 'thermodynamics_stable_threshold_ev_per_atom': self.config.thermodynamics_stable_threshold_ev_per_atom,
                 'memory_mode': self.config.memory_mode,
                 'memory_seed': self.config.memory_seed,
+                'locked_elements': (
+                    list(getattr(self.config, 'locked_elements'))
+                    if getattr(self.config, 'locked_elements', None) is not None else None
+                ),
+                'allow_llm_orchestration': bool(getattr(self.config, 'allow_llm_orchestration', True)),
                 'memory_transfer_declaration': (
                     self.config.objective.constraints.get('memory_transfer_declaration')
                     or self.config.objective.constraints.get('transferability')
@@ -1131,6 +1152,8 @@ class MaterialsDiscoveryCampaign:
             use_career_memory=cfg_data.get('use_career_memory', False),
             memory_mode=cfg_data.get('memory_mode', 'structured_provenance'),
             memory_seed=cfg_data.get('memory_seed', 0),
+            locked_elements=cfg_data.get('locked_elements'),
+            allow_llm_orchestration=cfg_data.get('allow_llm_orchestration', True),
             use_validation=cfg_data.get('use_validation', True),
             validation_top_k=cfg_data.get('validation_top_k', 5),
             use_synthesis=cfg_data.get('use_synthesis', True),

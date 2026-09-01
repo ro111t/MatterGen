@@ -485,7 +485,9 @@ class CampaignRunner:
                 mattergen_sampling_config_path=spec.mattergen_sampling_config_path,
                 mattergen_batch_size=spec.mattergen_batch_size,
                 validation_calculator=spec.validation_calculator,
-                synthesis_mode=spec.synthesis_mode)
+                synthesis_mode=spec.synthesis_mode,
+                locked_elements=list(spec.elements),
+                allow_llm_orchestration=False)
             start = time.time()
             campaign = MaterialsDiscoveryCampaign(config=config)
             if spec.condition == "random_mattergen":

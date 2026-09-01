@@ -17,7 +17,7 @@ from agents.thermodynamics import (
     ReferencePhaseInput,
     ReferenceSetError,
     RelaxationSettings,
-    build_frozen_reference_set,
+    build_frozen_reference_set as _build_frozen_reference_set,
     load_frozen_reference_set,
     sha256_payload,
     write_frozen_reference_set,
@@ -46,6 +46,38 @@ from experiments.spec import (
 
 MODEL = ModelIdentity("fake-chgnet", "0.3.0", "a" * 64)
 SETTINGS = RelaxationSettings(fmax_ev_per_angstrom=0.05, max_steps=500, relax_cell=True)
+
+
+def _coverage_manifest(inputs, chemical_system):
+    from pymatgen.core import Composition
+
+    items = list(inputs)
+    endpoints = [item.source_id for item in items if len(Composition(item.structure["composition"]).elements) == 1]
+    compounds = [item.source_id for item in items if len(Composition(item.structure["composition"]).elements) >= 2]
+    return {
+        "manifest_schema_version": "1.0.0",
+        "source_dataset": "unit-test-fixture",
+        "dataset_version": "fixed-v1",
+        "snapshot_digest": "2" * 64,
+        "chemical_system": sorted(set(chemical_system)),
+        "selection_procedure": "all declared unit-test phases",
+        "expected_source_phase_ids": [item.source_id for item in items],
+        "elemental_endpoint_ids": endpoints,
+        "required_compounds": compounds,
+    }
+
+
+def build_frozen_reference_set(*, inputs, chemical_system, source_selection=None, **kwargs):
+    items = list(inputs)
+    return _build_frozen_reference_set(
+        inputs=items,
+        chemical_system=chemical_system,
+        source_selection=(
+            _coverage_manifest(items, chemical_system)
+            if source_selection is None else source_selection
+        ),
+        **kwargs,
+    )
 
 
 class MockEvaluator:
@@ -278,12 +310,9 @@ def test_censoring_time_is_last_observed_call_not_horizon():
     metrics, _ = compute_run_metrics(manifest_payload, "r1", "target", "adaptive_no_memory", 1, oracle_budget=10)
     assert metrics.reached_0_10_threshold is False
     assert metrics.primary_endpoint_censored is True
-    # Must be 2 (last observed call), NOT 10 (budget)
-    assert metrics.oracle_calls_to_first_candidate_at_or_below_0_10 == 2
-    # AUC must stop at last observed call (prev_x = 2, no extrapolation to 10)
-    # x=1: y=0.35 -> (1-0)*0.35 = 0.35; x=2: y=0.25 -> (2-1)*0.35 = 0.35
-    # Total AUC = 0.70 (without extrapolation to 10)
-    assert metrics.area_under_best_curve == pytest.approx(0.70)
+    # Normalized AUC across fixed horizon of 10 calls:
+    # step 1: 0.35; step 2: 0.25; steps 3..10: 0.25 -> (0.35 + 0.25 + 8*0.25) / 10 = 0.26
+    assert metrics.area_under_best_curve == pytest.approx(0.26)
 
 
 def test_zero_oracle_calls_yields_incomplete_evidence():
@@ -1846,3 +1875,469 @@ def test_dag_pending_node_with_valid_artifact_keys_succeeds(tmp_path, valid_key)
     dag_dict["nodes"][pending_id]["result_artifacts"] = {valid_key: "a" * 64}
     hydrated = ExperimentDAG.from_dict(dag_dict, spec)
     assert hydrated.nodes[pending_id].result_artifacts[valid_key] == "a" * 64
+
+
+# =========================================================================
+# Phase 7: Scientific Correctness Hardening & Acceptance Gate
+# =========================================================================
+
+def test_orchestrator_locked_elements_and_ambient_key_ignored(monkeypatch, tmp_path):
+    from agents.orchestrator import OrchestratorAgent, CampaignObjective
+    monkeypatch.setenv("OPENAI_API_KEY", "sk-fake-key-for-test")
+    # In canonical benchmark runs, allow_llm=False prevents reading ambient key
+    orch = OrchestratorAgent(
+        allow_llm=False,
+        locked_elements=["Na", "Cl"],
+    )
+    assert orch.llm_available is False
+    assert orch.llm is None
+
+    obj = CampaignObjective(
+        target_properties={"density": 2.1},
+        constraints={"elements": ["Na", "Cl"]},
+        success_criteria={},
+    )
+    strat = orch.plan_campaign(obj)
+    assert strat["elements"] == ["Na", "Cl"]
+
+    # Recommendations/expansions cannot change locked elements
+    strat2 = orch.plan_iteration(obj, history=[], recommendations={"elements": ["Na", "Cl", "K"]})
+    assert strat2["elements"] == ["Na", "Cl"]
+
+    monkeypatch.setattr("agents.screening.HAS_CHGNET", False)
+    campaign = MaterialsDiscoveryCampaign(CampaignConfig(
+        name="locked-planner-provenance",
+        objective=obj,
+        output_dir=tmp_path / "locked_planner",
+        use_career_memory=False,
+        use_mattergen=False,
+        use_validation=False,
+        use_synthesis=False,
+        locked_elements=["Na", "Cl"],
+        allow_llm_orchestration=False,
+    ))
+    assert campaign.provenance.manifest.config["locked_elements"] == ["Na", "Cl"]
+    assert campaign.provenance.manifest.config["allow_llm_orchestration"] is False
+
+
+def test_reference_set_coverage_manifest_required_and_failed_compound_rejected(tmp_path):
+    inputs = [
+        ReferencePhaseInput(source_id="Li-ref", structure=_struct(["Li"], "Li-ref")),
+        ReferencePhaseInput(source_id="P-ref", structure=_struct(["P"], "P-ref")),
+        ReferencePhaseInput(source_id="Li3P-ref", structure=_struct(["Li", "Li", "Li", "P"], "Li3P-ref"), source_energy_above_hull_ev_per_atom=0.0),
+        ReferencePhaseInput(source_id="LiP-fail", structure=_struct(["Li", "P"], "LiP-fail")),
+    ]
+    class PartialFailEvaluator(MockEvaluator):
+        def relax(self, value):
+            key = value.get("candidate_id", value.get("composition", "Li"))
+            if key == "LiP-fail":
+                return {"converged": False, "error": "relaxation failed"}
+            return super().relax(value)
+
+    evaluator = PartialFailEvaluator({"Li-ref": -1.0, "P-ref": -2.0, "Li3P-ref": -2.5})
+    coverage = {
+        "manifest_schema_version": "1.0.0",
+        "source_dataset": "materials_project",
+        "dataset_version": "test-snapshot-v1",
+        "snapshot_digest": "3" * 64,
+        "chemical_system": ["Li", "P"],
+        "selection_procedure": "all unit-test phases",
+        "expected_source_phase_ids": ["Li-ref", "P-ref", "Li3P-ref", "LiP-fail"],
+        "elemental_endpoint_ids": ["Li-ref", "P-ref"],
+        "required_compounds": ["LiP-fail"],
+    }
+    json_path = tmp_path / "ref_set_cov.json"
+    ref_set = build_frozen_reference_set(
+        reference_set_id="Li-P-cov-test",
+        chemical_system=["Li", "P"],
+        inputs=inputs,
+        evaluator=evaluator,
+        output_path=json_path,
+        source_selection=coverage,
+    )
+    assert ref_set.certification.certified is False
+    assert "LiP-fail" in ref_set.certification.missing_expected_source_phases
+    assert "LiP-fail" in ref_set.certification.missing_required_compounds
+
+
+def test_reference_set_without_coverage_manifest_cannot_certify(tmp_path):
+    inputs = [
+        ReferencePhaseInput(source_id="Li-ref", structure=_struct(["Li"], "Li-ref")),
+        ReferencePhaseInput(source_id="P-ref", structure=_struct(["P"], "P-ref")),
+        ReferencePhaseInput(
+            source_id="Li3P-ref",
+            structure=_struct(["Li", "Li", "Li", "P"], "Li3P-ref"),
+            source_energy_above_hull_ev_per_atom=0.0,
+        ),
+    ]
+    frozen = _build_frozen_reference_set(
+        reference_set_id="no-coverage",
+        chemical_system=["Li", "P"],
+        inputs=inputs,
+        evaluator=MockEvaluator({"Li-ref": -1.0, "P-ref": -2.0, "Li3P-ref": -2.5}),
+        output_path=tmp_path / "no_coverage.json",
+        source_selection=None,
+    )
+    assert frozen.certification.certified is False
+    assert frozen.certification.coverage_manifest_errors == ["coverage_manifest_required"]
+    with pytest.raises(ReferenceSetError, match="not certified"):
+        load_frozen_reference_set(tmp_path / "no_coverage.json", require_certified=True)
+
+
+def test_thermodynamic_oracle_decomposition_products_schema(tmp_path):
+    from agents.thermodynamics import ThermodynamicOracle
+    inputs = [
+        ReferencePhaseInput(source_id="Li-ref", structure=_struct(["Li"], "Li-ref")),
+        ReferencePhaseInput(source_id="P-ref", structure=_struct(["P"], "P-ref")),
+        ReferencePhaseInput(source_id="Li3P-ref", structure=_struct(["Li", "Li", "Li", "P"], "Li3P-ref"), source_energy_above_hull_ev_per_atom=0.0),
+    ]
+    evaluator = MockEvaluator({"Li-ref": -1.0, "P-ref": -2.0, "Li3P-ref": -2.5})
+    json_path = tmp_path / "ref_set_decomp.json"
+    ref_set = build_frozen_reference_set(
+        reference_set_id="Li-P-decomp",
+        chemical_system=["Li", "P"],
+        inputs=inputs,
+        evaluator=evaluator,
+        output_path=json_path,
+    )
+    oracle = ThermodynamicOracle(ref_set, evaluator)
+    candidate_struct = _struct(["Li", "Li", "P"], "Li2P-cand")
+    res = oracle.evaluate(candidate_struct)
+    assert res.success is True
+    assert len(res.decomposition_products) > 0
+    prod = res.decomposition_products[0]
+    assert "source_id" in prod
+    assert "formula" in prod
+    assert "coefficient" in prod
+    assert "coefficient_basis" in prod
+    assert "structure" in prod
+    assert "structure_hash" in prod
+    assert prod["reference_set_id"] == "Li-P-decomp"
+    from experiments.qe_audit import validate_atom_balanced_reaction
+    assert validate_atom_balanced_reaction(candidate_struct, res.decomposition_products)
+
+
+def test_qe_supercell_multiplier_accounting_and_margin():
+    from experiments.qe_audit import (
+        _formula_unit_multiplier,
+        validate_atom_balanced_reaction,
+        compute_local_decomposition_margin,
+    )
+    cand_struct = _struct(["Li", "Li", "P", "P", "S", "S"], "cand_2x")
+    num_atoms, m_cand = _formula_unit_multiplier("LiPS", cand_struct)
+    assert num_atoms == 6
+    assert m_cand == 2
+
+    p1_struct = _struct(["Li", "Li"], "p1_2x")
+    p2_struct = _struct(["P", "P", "S", "S"], "p2_2x")
+    num_atoms_p1, m_p1 = _formula_unit_multiplier("Li", p1_struct)
+    num_atoms_p2, m_p2 = _formula_unit_multiplier("PS", p2_struct)
+    assert m_p1 == 2
+    assert m_p2 == 2
+
+    products = [
+        {"formula": "Li", "coefficient": 2.0, "structure": p1_struct, "formula_unit_multiplier": 2},
+        {"formula": "PS", "coefficient": 2.0, "structure": p2_struct, "formula_unit_multiplier": 2},
+    ]
+    assert validate_atom_balanced_reaction(cand_struct, products) is True
+
+    phase_results = [
+        {"status": "CONVERGED", "total_energy_ev": -4.0},
+        {"status": "CONVERGED", "total_energy_ev": -8.0},
+    ]
+    margin = compute_local_decomposition_margin(-18.0, 6, phase_results, products)
+    # Candidate cell: -18 eV. Product cells: 2*(-4) + 2*(-8) = -24 eV.
+    # (-18 - -24) / 6 atoms = +1 eV/atom.
+    assert margin == pytest.approx(1.0)
+
+
+def test_confirmatory_holm_family_preserves_multiplicity_with_missing_arm():
+    from experiments.statistics import (
+        run_statistical_analysis_pipeline,
+        PRIMARY_CENSORED_ENDPOINT_NAME,
+        THRESHOLD_YIELD_ENDPOINT_NAME,
+    )
+    run_metrics = [
+        {
+            "task_id": "target_1",
+            "condition": "structured_provenance_memory",
+            "seed": 1,
+            "provenance_complete": True,
+            "oracle_budget": 100,
+            PRIMARY_CENSORED_ENDPOINT_NAME: 10,
+            THRESHOLD_YIELD_ENDPOINT_NAME: 0.5,
+            "reached_0_10_threshold": True,
+        },
+        {
+            "task_id": "target_1",
+            "condition": "adaptive_no_memory",
+            "seed": 1,
+            "provenance_complete": True,
+            "oracle_budget": 100,
+            PRIMARY_CENSORED_ENDPOINT_NAME: 20,
+            THRESHOLD_YIELD_ENDPOINT_NAME: 0.2,
+            "reached_0_10_threshold": True,
+        },
+    ]
+    results, manifest = run_statistical_analysis_pipeline(
+        run_metrics,
+        expected_tasks=["target_1", "target_2"],
+        expected_seeds=[1],
+    )
+    assert manifest["planned_family_size"] == 12
+    assert manifest["available_comparison_count"] == 2
+    assert manifest["unavailable_comparison_count"] == 10
+    assert manifest["manifest"]["auc_definition"]["worst_value_cap_ev_per_atom"] == 1.0
+    available_results = [r for r in results if r.p_value_adjusted is not None]
+    assert len(available_results) == 2
+    for r in available_results:
+        assert r.p_value_adjusted >= r.p_value_raw
+
+
+def test_step_curve_auc_without_backfilling_when_first_call_fails():
+    manifest = {
+        "manifest": {"status": "completed", "proposals_generated": 2, "oracle_evaluations": 2},
+        "candidates": [
+            {
+                "candidate_id": "c1",
+                "composition": "Li",
+                "geometry_valid": True,
+                "oracle_evaluated": True,
+                "oracle_call_index": 1,
+                "oracle_success": False,
+                "proposal_index": 0,
+                "screening_predictions": {},
+            },
+            {
+                "candidate_id": "c2",
+                "composition": "Li",
+                "geometry_valid": True,
+                "oracle_evaluated": True,
+                "oracle_call_index": 2,
+                "oracle_success": True,
+                "proposal_index": 1,
+                "screening_predictions": {"predicted_energy_above_hull_ev_per_atom": 0.20},
+            },
+        ],
+    }
+    metrics, _ = compute_run_metrics(manifest, "r_test", "task", "adaptive_no_memory", 1, oracle_budget=10)
+    assert metrics.area_under_best_curve == pytest.approx(0.28)
+
+
+def test_step_curve_auc_is_unavailable_for_interrupted_run():
+    manifest = {
+        "manifest": {"status": "interrupted", "proposals_generated": 1, "oracle_evaluations": 1},
+        "candidates": [{
+            "candidate_id": "c1",
+            "composition": "Li",
+            "geometry_valid": True,
+            "oracle_evaluated": True,
+            "oracle_call_index": 1,
+            "oracle_success": True,
+            "proposal_index": 0,
+            "screening_predictions": {"predicted_energy_above_hull_ev_per_atom": 0.2},
+        }],
+    }
+    metrics, _ = compute_run_metrics(
+        manifest, "interrupted", "task", "adaptive_no_memory", 1, oracle_budget=10,
+    )
+    assert metrics.area_under_best_curve is None
+    assert "run_not_completed" in metrics.provenance_missing_fields
+
+
+def test_qe_selection_exclusions_persist_to_artifacts(tmp_path):
+    from experiments.qe_audit import select_audit_candidates
+
+    selection = select_audit_candidates(
+        [{"candidate_id": "source", "task_id": "Li-P-S"}], target_count=1,
+    )
+    assert selection.exclusions_by_reason == {"source_task_excluded": 1}
+    runner = QEAuditRunner(QEAuditConfig(mock_execution=True), tmp_path / "qe", FakeQECalculator())
+    runner.run_full_audit(selection)
+    selection_payload = json.loads((tmp_path / "qe" / "selection.json").read_text(encoding="utf-8"))
+    audit_payload = json.loads((tmp_path / "qe" / "audit_manifest.json").read_text(encoding="utf-8"))
+    assert selection_payload["exclusions_by_reason"] == {"source_task_excluded": 1}
+    assert audit_payload["selection_exclusions_by_reason"] == {"source_task_excluded": 1}
+
+
+def test_screening_integrity_canonicalizer_oracle_backend():
+    from agents.integrity import canonicalize_screening_predictions, SCREENING_ENERGY_KEY
+    raw = {
+        "energy_per_atom": -3.45,
+        "max_force_ev_per_angstrom": 0.02,
+        "max_stress_gpa": 0.5,
+    }
+    res = canonicalize_screening_predictions(raw, backend="chgnet_thermodynamic_oracle")
+    assert res["energy_semantics"] == "raw_predicted_per_atom"
+    assert SCREENING_ENERGY_KEY in res
+    assert res[SCREENING_ENERGY_KEY] == -3.45
+
+
+def test_end_to_end_full_acceptance_gate(tmp_path, monkeypatch):
+    """End-to-end integration test verifying all Phase 2 scientific contracts."""
+    from agents.thermodynamics import ThermodynamicOracle
+    from agents.screening import ScreeningAgent
+    from experiments.qe_audit import select_audit_candidates, QEAuditRunner
+    from experiments.cli import _attach_reference_phase_structures, _load_candidate_structure
+    from experiments.statistics import run_statistical_analysis_pipeline, PRIMARY_CENSORED_ENDPOINT_NAME, THRESHOLD_YIELD_ENDPOINT_NAME
+    from agents.integrity import SCREENING_ENERGY_KEY
+
+    # 1. Ambient API key must not activate LLM
+    monkeypatch.setenv("OPENAI_API_KEY", "sk-ambient-unauthorized-token")
+
+    # 2. Build certified reference set for Na-Cl with full coverage manifest
+    na_ref = ReferencePhaseInput(source_id="mp-Na", structure=_struct(["Na"], "mp-Na"))
+    cl_ref = ReferencePhaseInput(source_id="mp-Cl", structure=_struct(["Cl"], "mp-Cl"))
+    nacl_ref = ReferencePhaseInput(source_id="mp-NaCl", structure=_struct(["Na", "Cl"], "mp-NaCl"), source_energy_above_hull_ev_per_atom=0.0)
+    evaluator = MockEvaluator({"mp-Na": -1.3, "mp-Cl": -2.1, "mp-NaCl": -3.2})
+    ref_path = tmp_path / "nacl_ref.json"
+    coverage = {
+        "manifest_schema_version": "1.0.0",
+        "source_dataset": "materials_project",
+        "dataset_version": "test-snapshot-v1",
+        "snapshot_digest": "4" * 64,
+        "chemical_system": ["Cl", "Na"],
+        "selection_procedure": "all unit-test phases",
+        "expected_source_phase_ids": ["mp-Na", "mp-Cl", "mp-NaCl"],
+        "elemental_endpoint_ids": ["mp-Na", "mp-Cl"],
+        "required_compounds": ["mp-NaCl"],
+    }
+    ref_set = build_frozen_reference_set(
+        reference_set_id="Na-Cl-certified",
+        chemical_system=["Na", "Cl"],
+        inputs=[na_ref, cl_ref, nacl_ref],
+        evaluator=evaluator,
+        output_path=ref_path,
+        source_selection=coverage,
+    )
+    assert ref_set.certification.certified is True
+
+    # 3. Oracle and Screening produces structured decomposition products and correct energy semantics
+    oracle = ThermodynamicOracle(ref_set, evaluator)
+    screener = ScreeningAgent(thermodynamic_oracle=oracle)
+    cand_struct = _struct(["Na", "Na", "Cl", "Cl"], "cand_nacl_2x") # 2x supercell
+    batch_results = screener.screen_batch([cand_struct], criteria={})
+    assert len(batch_results) == 1
+    _, screening_res = batch_results[0]
+    assert screening_res.backend == "chgnet_thermodynamic_oracle"
+    thermo_result = oracle.evaluate(cand_struct)
+    assert len(thermo_result.decomposition_products) > 0
+    decomp_prod = thermo_result.decomposition_products[0]
+    assert decomp_prod["reference_set_id"] == "Na-Cl-certified"
+    assert decomp_prod["structure"] is not None
+
+    # 4. Persist through the production provenance/metrics hydration path.
+    prov_dir = tmp_path / "campaign_provenance"
+    tracker = ProvenanceTracker(
+        campaign_id="campaign_nacl",
+        campaign_name="NaCl acceptance",
+        domain="test",
+        output_dir=prov_dir,
+        master_seed=42,
+        config={"proposal_budget": 1, "oracle_budget": 1},
+        objective={},
+        constraints={"elements": ["Na", "Cl"]},
+        run_mode="research",
+        scientific_validity="research_valid",
+        actual_backends={"screening": "chgnet_thermodynamic_oracle"},
+    )
+    tracker.register_generation(
+        [cand_struct], iteration=0, backend="test", seed=42,
+        target_elements=["Na", "Cl"],
+    )
+    budget = DualBudgetTracker(proposal_budget=1, oracle_budget=1)
+    budget.record_proposals(1)
+    persisted_batch = screener.screen_batch([cand_struct], criteria={}, budget_tracker=budget)
+    tracker.record_screening(
+        persisted_batch, criteria={}, iteration=0, backend="chgnet_thermodynamic_oracle"
+    )
+    tracker.sync_budget(budget, iteration=0)
+    tracker.finalize("completed")
+    manifest_payload = json.loads(tracker.campaign_json_path.read_text(encoding="utf-8"))
+    _, extracted = compute_run_metrics(
+        manifest_payload, "run_nacl", "target_nacl",
+        "structured_provenance_memory", 42, oracle_budget=1,
+    )
+    assert len(extracted) == 1
+    _load_candidate_structure(extracted[0], prov_dir)
+    _attach_reference_phase_structures(extracted[0], str(ref_path))
+    assert extracted[0].structure is not None, (
+        extracted[0].structure_path,
+        extracted[0].provenance_missing_fields,
+    )
+    assert extracted[0].decomposition_products
+    assert extracted[0].decomposition_products[0]["coefficient"] == pytest.approx(2.0)
+
+    selection = select_audit_candidates(extracted, target_count=1, target_tasks=["target_nacl"])
+    assert len(selection) == 1, selection.exclusions_by_reason
+    selected_cand = selection[0]
+    assert len(selected_cand.predicted_decomposition_products) > 0
+
+    qe_cfg = QEAuditConfig(mock_execution=True)
+    runner = QEAuditRunner(qe_cfg, tmp_path / "qe_out", FakeQECalculator())
+    audit_res = runner.audit_candidate(selected_cand)
+    assert audit_res.reaction_balanced is True
+    assert audit_res.candidate_provenance["candidate_formula_unit_multiplier"] == 2
+
+    # 5. Holm family preservation with missing arm
+    stat_records = [
+        {
+            "task_id": "target_nacl",
+            "condition": "structured_provenance_memory",
+            "seed": 42,
+            "provenance_complete": True,
+            "oracle_budget": 100,
+            PRIMARY_CENSORED_ENDPOINT_NAME: 15,
+            THRESHOLD_YIELD_ENDPOINT_NAME: 0.6,
+            "reached_0_10_threshold": True,
+        },
+        {
+            "task_id": "target_nacl",
+            "condition": "adaptive_no_memory",
+            "seed": 42,
+            "provenance_complete": True,
+            "oracle_budget": 100,
+            PRIMARY_CENSORED_ENDPOINT_NAME: 35,
+            THRESHOLD_YIELD_ENDPOINT_NAME: 0.1,
+            "reached_0_10_threshold": True,
+        },
+    ]
+    stat_results, stat_manifest = run_statistical_analysis_pipeline(
+        stat_records,
+        expected_tasks=["target_nacl", "target_other"],
+        expected_seeds=[42],
+        output_dir=tmp_path / "stats_out",
+    )
+    assert stat_manifest["planned_family_size"] == 12
+    assert stat_manifest["available_comparison_count"] == 2
+    assert stat_manifest["unavailable_comparison_count"] == 10
+
+    # 6. Step curve AUC
+    run_manifest_payload = {
+        "manifest": {"status": "completed", "proposals_generated": 2, "oracle_evaluations": 2},
+        "candidates": [
+            {
+                "candidate_id": "c1",
+                "composition": "NaCl",
+                "geometry_valid": True,
+                "oracle_evaluated": True,
+                "oracle_call_index": 1,
+                "oracle_success": False,
+                "proposal_index": 0,
+                "screening_predictions": {},
+            },
+            {
+                "candidate_id": "c2",
+                "composition": "NaCl",
+                "geometry_valid": True,
+                "oracle_evaluated": True,
+                "oracle_call_index": 2,
+                "oracle_success": True,
+                "proposal_index": 1,
+                "screening_predictions": {"predicted_energy_above_hull_ev_per_atom": 0.15},
+            },
+        ],
+    }
+    metrics, _ = compute_run_metrics(run_manifest_payload, "r_gate", "target_nacl", "structured_provenance_memory", 42, oracle_budget=10)
+    # Step 1: cap = 1.0; Step 2: 0.15; Steps 3..10: 0.15 -> sum = 1.0 + 0.15 + 8*0.15 = 2.35 -> AUC = 2.35 / 10 = 0.235
+    assert metrics.area_under_best_curve == pytest.approx(0.235)

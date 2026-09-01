@@ -804,10 +804,11 @@ class ProvenanceTracker:
         relative_path = f"structures/{cif_filename}"
 
         cif_content = self._serialize_to_cif(candidate_id, struct)
-        with open(cif_path, "w", encoding="utf-8") as f:
-            f.write(cif_content)
-
-        sha256_hash = hashlib.sha256(cif_content.encode("utf-8")).hexdigest()
+        # Write the exact bytes that are hashed.  Text-mode newline expansion
+        # on Windows previously made every persisted CIF fail its own digest.
+        cif_bytes = cif_content.encode("utf-8")
+        cif_path.write_bytes(cif_bytes)
+        sha256_hash = hashlib.sha256(cif_bytes).hexdigest()
         return relative_path, sha256_hash
 
     def _serialize_to_cif(self, candidate_id: str, struct: Any) -> str:

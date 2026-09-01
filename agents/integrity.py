@@ -139,7 +139,7 @@ def canonicalize_screening_predictions(
         output_key = (
             SCREENING_ENERGY_KEY
             if energy_key in {SCREENING_ENERGY_KEY, "energy", "energy_per_atom"}
-            and backend.lower() == "chgnet"
+            and backend.lower() in {"chgnet", "chgnet_thermodynamic_oracle"}
             else ("mock_predicted_energy_per_atom_ev" if energy_key not in {SCREENING_ENERGY_KEY, "mock_predicted_energy_per_atom_ev"} else energy_key)
         )
         result[output_key] = source[energy_key]
@@ -162,7 +162,7 @@ def canonicalize_screening_predictions(
         }:
             continue
         result[key] = value
-    result.setdefault("energy_semantics", "raw_predicted_per_atom" if backend.lower() == "chgnet" else "mock_raw_per_atom")
+    result.setdefault("energy_semantics", "raw_predicted_per_atom" if backend.lower() in {"chgnet", "chgnet_thermodynamic_oracle"} else "mock_raw_per_atom")
     return result
 
 
