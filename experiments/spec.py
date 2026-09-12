@@ -240,6 +240,7 @@ class RunSpec:
     task_constraints: Dict[str, Any] = field(default_factory=dict)
     validation_calculator: str = "mock"
     synthesis_mode: str = "mock"
+    allow_llm_orchestration: bool = True
 
     def __post_init__(self):
         valid_conditions = FIVE_CONDITIONS + ("source_neutral",)
@@ -359,6 +360,7 @@ class ExperimentSpec:
     mattergen_batch_size: int = 16
     validation_calculator: str = "mock"
     synthesis_mode: str = "mock"
+    allow_llm_orchestration: bool = True
 
     def __post_init__(self):
         if not self.experiment_id:
@@ -476,6 +478,7 @@ class ExperimentSpec:
             "mattergen_batch_size": self.mattergen_batch_size,
             "validation_calculator": self.validation_calculator,
             "synthesis_mode": self.synthesis_mode,
+            "allow_llm_orchestration": self.allow_llm_orchestration,
         }
 
     @classmethod
@@ -491,7 +494,7 @@ class ExperimentSpec:
             "pinned_model_identity", "pinned_relaxation_settings",
             "mattergen_pretrained", "mattergen_model_path", "mattergen_checkpoint_sha256",
             "mattergen_sampling_config_path", "mattergen_sampling_config_sha256", "mattergen_batch_size",
-            "validation_calculator", "synthesis_mode",
+            "validation_calculator", "synthesis_mode", "allow_llm_orchestration",
         }
         unknown = set(data.keys()) - expected_keys
         if unknown:

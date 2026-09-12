@@ -487,7 +487,7 @@ class CampaignRunner:
                 validation_calculator=spec.validation_calculator,
                 synthesis_mode=spec.synthesis_mode,
                 locked_elements=list(spec.elements),
-                allow_llm_orchestration=False)
+                allow_llm_orchestration=getattr(spec, "allow_llm_orchestration", True))
             start = time.time()
             campaign = MaterialsDiscoveryCampaign(config=config)
             if spec.condition == "random_mattergen":

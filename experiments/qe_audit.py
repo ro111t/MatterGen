@@ -26,6 +26,7 @@ from experiments.spec import QEAuditConfig, compute_sha256
 
 
 RY_TO_EV = 13.605693122994
+QE_RESULT_PARSER_VERSION = 2
 
 
 class QECalculationStatus(str, Enum):
@@ -547,7 +548,11 @@ class ASEQuantumEspressoCalculator:
         try:
             proc = subprocess.run([exe, "-h"], capture_output=True, text=True, timeout=10, check=False)
             text = (proc.stdout or "") + (proc.stderr or "")
-            match = re.search(r"(?:Program|version)\s+([0-9]+(?:\.[0-9]+)+)", text, re.I)
+            match = re.search(
+                r"(?:Program\s+(?:[A-Za-z0-9_/-]+\s+)?(?:v\.|version\s*:?|v)?|version\s*:?\s*v?|v\.)\s*([0-9]+(?:\.[0-9]+)+)",
+                text,
+                re.I,
+            )
             return match.group(1) if match else None
         except Exception:
             return None
@@ -599,6 +604,9 @@ class ASEQuantumEspressoCalculator:
             "pseudopotentials": pseudo_hashes,
             "executable": self.executable,
             "executable_version": self.executable_version,
+            # Older caches could label unfinished relaxations as converged.
+            # Bind cache reuse to the rules used to interpret QE output.
+            "result_parser_version": QE_RESULT_PARSER_VERSION,
         })
         calc_dir.mkdir(parents=True, exist_ok=True)
         input_path = calc_dir / "qe.in"
@@ -640,7 +648,7 @@ class ASEQuantumEspressoCalculator:
         output_path = calc_dir / "qe.out"
         exe = shutil.which(self.executable) or self.executable
         try:
-            proc = subprocess.run([exe, "-in", str(input_path)], cwd=str(calc_dir), capture_output=True, text=True, timeout=int(config.timeout_seconds_per_job), check=False)
+            proc = subprocess.run([exe, "-in", "qe.in"], cwd=str(calc_dir), capture_output=True, text=True, timeout=int(config.timeout_seconds_per_job), check=False)
             output = (proc.stdout or "") + (proc.stderr or "")
             _atomic_write_text(output_path, output)
         except Exception as exc:
@@ -649,15 +657,49 @@ class ASEQuantumEspressoCalculator:
             proc = None
         output_hash = _file_sha256(output_path)
         energy_matches = re.findall(r"!\s+total energy\s*=\s*([-+0-9.eE]+)\s+Ry", output)
-        converged = bool(
-            proc is not None
-            and proc.returncode == 0
-            and re.search(r"JOB DONE", output, re.I)
-            and energy_matches
-        )
         energy = float(energy_matches[-1]) * RY_TO_EV if energy_matches else None
-        status = QECalculationStatus.CONVERGED.value if converged else (QECalculationStatus.SCF_FAILED.value if proc is not None else QECalculationStatus.PARSE_FAILED.value)
-        result = QEResultRecord(f"calc_{input_hash[:16]}", formula, is_candidate, status, energy, num_atoms, energy / num_atoms if energy is not None else None, len(re.findall(r"iteration #", output, re.I)), 0, None, str(calc_dir).replace("\\", "/"), input_hash, None if converged else "QE did not provide a converged total energy", None, output_hash, self.executable, self.executable_version, getattr(config, "sssp_manifest_sha256", None), self.executable_sha256 or getattr(config, "qe_executable_sha256", None), kpoints)
+        job_done = bool(re.search(r"JOB DONE", output, re.I))
+        is_relax = bool(re.search(r"calculation\s*=\s*['\"](?:vc-)?relax['\"]", text, re.I))
+        max_steps_reached = bool(re.search(r"maximum number of steps has been reached", output, re.I))
+        scf_failed = bool(re.search(r"convergence NOT achieved", output, re.I))
+        bfgs_converged = bool(re.search(r"bfgs converged in", output, re.I) or re.search(r"Begin final coordinates", output, re.I))
+
+        if is_relax:
+            structural_converged = bfgs_converged and not max_steps_reached and not scf_failed
+            converged = bool(
+                proc is not None
+                and proc.returncode == 0
+                and job_done
+                and energy_matches
+                and structural_converged
+            )
+        else:
+            converged = bool(
+                proc is not None
+                and proc.returncode == 0
+                and job_done
+                and energy_matches
+                and not scf_failed
+                and (bool(re.search(r"convergence has been achieved", output, re.I)) or not re.search(r"iteration #", output, re.I))
+            )
+
+        if converged:
+            status = QECalculationStatus.CONVERGED.value
+            failure_reason = None
+        elif proc is None:
+            status = QECalculationStatus.PARSE_FAILED.value
+            failure_reason = "QE execution failed or timed out"
+        elif max_steps_reached or (is_relax and not bfgs_converged):
+            status = QECalculationStatus.RELAXATION_NOT_CONVERGED.value
+            failure_reason = "QE relaxation did not converge (maximum steps reached or structural convergence not achieved)"
+        elif scf_failed or not energy_matches:
+            status = QECalculationStatus.SCF_FAILED.value
+            failure_reason = "QE SCF convergence not achieved"
+        else:
+            status = QECalculationStatus.PARSE_FAILED.value
+            failure_reason = "QE calculation did not complete successfully"
+
+        result = QEResultRecord(f"calc_{input_hash[:16]}", formula, is_candidate, status, energy, num_atoms, energy / num_atoms if energy is not None else None, len(re.findall(r"iteration #", output, re.I)), 0, None, str(calc_dir).replace("\\", "/"), input_hash, failure_reason, None, output_hash, self.executable, self.executable_version, getattr(config, "sssp_manifest_sha256", None), self.executable_sha256 or getattr(config, "qe_executable_sha256", None), kpoints)
         canonical = result.to_dict()
         canonical.pop("result_hash", None)
         result.result_hash = compute_sha256(canonical)

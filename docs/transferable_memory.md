@@ -36,6 +36,14 @@ in the manifest/config for replay:
   marginals while breaking query pairing. It is labelled invalid for
   scientific decision support and exists only as an experimental control.
 
+Experiment specifications expose `allow_llm_orchestration` (default `true`).
+Set it to `false` for offline runs with heuristic planning. When enabled, the
+planner uses `OPENAI_API_KEY` if available; missing credentials or API failures
+fall back to heuristic planning. Text summaries enter the LLM prompt only and
+do not produce candidate-prioritization directives. Their effect on discovery
+has not been demonstrated under the benchmark's fixed budgets and locked
+chemical systems; treat this mode as experimental, not a validated baseline.
+
 Only finalized prior campaigns can warm-start a new run. Evidence is
 deduplicated by a canonical descriptor/outcome fingerprint, so duplicate rows
 do not inflate counts or confidence. Negative outcomes and failed transfer
@@ -53,4 +61,3 @@ oracle accounting. Extraction handles arbitrary nested structures and converts
 NumPy arrays/coordinates deterministically. All prioritization scores, directive
 audits, derangement permutations, and extraction failures are serialized in
 campaign checkpoints and manifests for exact end-to-end replay.
-

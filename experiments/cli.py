@@ -500,6 +500,7 @@ def _build_run_spec(spec: ExperimentSpec, node: DAGNode, dag: ExperimentDAG) -> 
         task_constraints=dict(task.constraints),
         validation_calculator=spec.validation_calculator,
         synthesis_mode=spec.synthesis_mode,
+        allow_llm_orchestration=spec.allow_llm_orchestration,
     )
 
 
