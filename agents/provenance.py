@@ -27,6 +27,20 @@ import subprocess
 import sys
 from typing import Any, Dict, List, Optional, Tuple, Union
 
+from agents.integrity import (
+    FORCE_KEY,
+    LEGACY_SCHEMA_VERSION,
+    SCHEMA_VERSION,
+    SCREENING_ENERGY_KEY,
+    STRESS_KEY,
+    VALIDATION_ENERGY_KEY,
+    LegacySchemaError,
+    ScientificValidity,
+    canonicalize_screening_predictions,
+    canonicalize_validation_properties,
+    is_schema_v2,
+)
+
 # Optional chemical and computational libraries
 try:
     from pymatgen.core import Composition, Structure
@@ -56,6 +70,52 @@ class CandidateStatus(str, Enum):
 def _get_utc_now_iso() -> str:
     """Return current UTC timestamp in ISO 8601 format."""
     return datetime.now(timezone.utc).isoformat()
+
+
+def _canonical_manifest_value(value: Any) -> Any:
+    """Return a deterministic JSON-safe representation for manifest hashing.
+
+    Audit payloads are assembled by several agents and may contain tuples,
+    sets, paths, enum values, or non-finite numbers.  ``json.dumps(...,
+    default=str)`` is not sufficient here: set stringification can depend on
+    insertion/hash order and JSON permits non-finite values by default.  Keep
+    the canonicalization local to manifest hashing so persisted report/schema
+    formats remain backward compatible.
+    """
+    if isinstance(value, dict):
+        return {
+            str(key): _canonical_manifest_value(item)
+            for key, item in sorted(value.items(), key=lambda pair: str(pair[0]))
+        }
+    if isinstance(value, (list, tuple)):
+        return [_canonical_manifest_value(item) for item in value]
+    if isinstance(value, (set, frozenset)):
+        items = [_canonical_manifest_value(item) for item in value]
+        return sorted(items, key=lambda item: json.dumps(
+            item, sort_keys=True, separators=(",", ":"), ensure_ascii=False,
+        ))
+    if isinstance(value, Enum):
+        return _canonical_manifest_value(value.value)
+    if isinstance(value, Path):
+        return str(value)
+    if isinstance(value, bytes):
+        return value.hex()
+    if isinstance(value, float) and not math.isfinite(value):
+        return str(value)
+    if value is None or isinstance(value, (bool, int, float, str)):
+        return value
+    return str(value)
+
+
+def _canonical_manifest_json(value: Any) -> str:
+    """Serialize a manifest hash payload without representation ambiguity."""
+    return json.dumps(
+        _canonical_manifest_value(value),
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=False,
+        allow_nan=False,
+    )
 
 
 def extract_candidate_id(struct: Any, fallback_idx: Optional[int] = None) -> str:
@@ -244,9 +304,13 @@ class SoftwareEnvironment:
 class CandidateRecord:
     """
     Versioned record schema representing the complete lifecycle of a single material candidate.
-    Schema Version: 1.0.0
+    Schema Version: 2.0.0
     """
-    schema_version: str = "1.0.0"
+    schema_version: str = SCHEMA_VERSION
+    scientific_validity: str = ScientificValidity.DEMO_ONLY.value
+    run_mode: str = "development"
+    requested_backends: Dict[str, Any] = field(default_factory=dict)
+    actual_backends: Dict[str, Any] = field(default_factory=dict)
 
     # Identity
     candidate_id: str = ""
@@ -280,6 +344,16 @@ class CandidateRecord:
     screening_filter_reasons: List[str] = field(default_factory=list)
     screening_rank: Optional[int] = None
     screening_timestamp_iso: Optional[str] = None
+    # Geometry gate and oracle accounting (additive fields within schema 2.0.0)
+    geometry_valid: Optional[bool] = None
+    geometry_failure_code: Optional[str] = None
+    geometry_validation_details: Dict[str, Any] = field(default_factory=dict)
+    geometry_minimum_distance: Optional[float] = None
+    geometry_offending_pair: Optional[List[int]] = None
+    provenance_stage: Optional[str] = None
+    oracle_evaluated: Optional[bool] = None
+    oracle_cache_hit: Optional[bool] = None
+    oracle_call_index: Optional[int] = None
 
     # Validation
     validation_calculator: Optional[str] = None
@@ -311,6 +385,18 @@ class CandidateRecord:
     strategy_influence: Optional[str] = None
     decision_timestamp_iso: Optional[str] = None
 
+    def __post_init__(self) -> None:
+        """Normalize direct v2 construction to the unambiguous vocabulary."""
+        if self.schema_version == SCHEMA_VERSION:
+            self.screening_predictions = canonicalize_screening_predictions(
+                self.screening_predictions,
+                backend=self.screening_backend or self.actual_backends.get("screening", "heuristic"),
+            )
+            self.validation_properties = canonicalize_validation_properties(
+                self.validation_properties,
+                calculator=self.validation_calculator or self.actual_backends.get("validation", "mock"),
+            )
+
     def to_dict(self) -> Dict[str, Any]:
         """Export as structured dictionary."""
         return asdict(self)
@@ -320,7 +406,11 @@ class CandidateRecord:
         """Construct CandidateRecord from dictionary."""
         known_fields = cls.__dataclass_fields__.keys()
         filtered = {k: v for k, v in data.items() if k in known_fields}
-        return cls(**filtered)
+        record = cls(**filtered)
+        if not is_schema_v2(data):
+            record.schema_version = str(data.get("schema_version", LEGACY_SCHEMA_VERSION))
+            record.scientific_validity = ScientificValidity.LEGACY_INVALID_ENERGY_SEMANTICS.value
+        return record
 
     def to_flat_dict(self) -> Dict[str, Any]:
         """
@@ -352,17 +442,26 @@ class CandidateRecord:
             "passes_screening_filters": self.passes_screening_filters if self.passes_screening_filters is not None else "",
             "screening_filter_reasons": "; ".join(self.screening_filter_reasons),
             "screening_rank": self.screening_rank if self.screening_rank is not None else "",
-            "screening_formation_energy": self.screening_predictions.get("formation_energy", ""),
-            "screening_forces": self.screening_predictions.get("forces", ""),
-            "screening_stress": self.screening_predictions.get("stress", ""),
-            "screening_stability": self.screening_predictions.get("stability", ""),
+            "screening_predicted_energy_per_atom_ev": self.screening_predictions.get(SCREENING_ENERGY_KEY, self.screening_predictions.get("mock_predicted_energy_per_atom_ev", "")),
+            "screening_max_force_ev_per_angstrom": self.screening_predictions.get(FORCE_KEY, ""),
+            "screening_max_stress_gpa": self.screening_predictions.get(STRESS_KEY, ""),
             "screening_timestamp_iso": self.screening_timestamp_iso or "",
+            "geometry_valid": self.geometry_valid if self.geometry_valid is not None else "",
+            "geometry_failure_code": self.geometry_failure_code or "",
+            "geometry_validation_details": json.dumps(self.geometry_validation_details, sort_keys=True, default=str),
+            "geometry_minimum_distance": self.geometry_minimum_distance if self.geometry_minimum_distance is not None else "",
+            "geometry_offending_pair": ";".join(str(i) for i in (self.geometry_offending_pair or [])),
+            "provenance_stage": self.provenance_stage or "",
+            "oracle_evaluated": self.oracle_evaluated if self.oracle_evaluated is not None else "",
+            "oracle_cache_hit": self.oracle_cache_hit if self.oracle_cache_hit is not None else "",
+            "oracle_call_index": self.oracle_call_index if self.oracle_call_index is not None else "",
             # Validation
             "validation_calculator": self.validation_calculator or "",
             "validation_converged": self.validation_converged if self.validation_converged is not None else "",
             "validation_cost_hours": self.validation_cost_hours if self.validation_cost_hours is not None else "",
-            "validation_energy_per_atom": self.validation_properties.get("energy_per_atom", ""),
-            "validation_stability": self.validation_properties.get("stability", ""),
+            "validation_energy_per_atom_ev": self.validation_properties.get(VALIDATION_ENERGY_KEY, self.validation_properties.get("mock_energy_per_atom_ev", "")),
+            "validation_max_force_ev_per_angstrom": self.validation_properties.get(FORCE_KEY, ""),
+            "validation_max_stress_gpa": self.validation_properties.get(STRESS_KEY, ""),
             "validation_band_gap": self.validation_properties.get("band_gap", ""),
             "validation_bulk_modulus": self.validation_properties.get("bulk_modulus", ""),
             "validation_error_message": self.validation_error_message or "",
@@ -385,16 +484,24 @@ class CandidateRecord:
             "stored_in_memory": self.stored_in_memory,
             "strategy_influence": self.strategy_influence or "",
             "decision_timestamp_iso": self.decision_timestamp_iso or "",
+            "scientific_validity": self.scientific_validity,
+            "run_mode": self.run_mode,
+            "requested_backends": json.dumps(self.requested_backends, sort_keys=True, default=str),
+            "actual_backends": json.dumps(self.actual_backends, sort_keys=True, default=str),
         }
 
 
 @dataclass
 class RunManifest:
     """
-    Campaign execution manifest ("1.0.0").
+    Campaign execution manifest ("2.0.0").
     Records startup configuration, environment, seeds, and planning strategies.
     """
-    schema_version: str = "1.0.0"
+    schema_version: str = SCHEMA_VERSION
+    scientific_validity: str = ScientificValidity.DEMO_ONLY.value
+    run_mode: str = "development"
+    requested_backends: Dict[str, Any] = field(default_factory=dict)
+    actual_backends: Dict[str, Any] = field(default_factory=dict)
     campaign_id: str = ""
     campaign_name: str = ""
     domain: str = ""
@@ -414,6 +521,30 @@ class RunManifest:
     total_candidates_generated: int = 0
     total_candidates_accepted: int = 0
     total_candidates_rejected: int = 0
+    # Campaign resource limits and deterministic event counters.  ``None``
+    # means unlimited, preserving development behavior from earlier sprints.
+    proposal_budget: Optional[int] = None
+    oracle_budget: Optional[int] = None
+    proposals_generated: int = 0
+    geometry_valid: int = 0
+    invalid_geometry: int = 0
+    oracle_evaluations: int = 0
+    oracle_cache_hits: int = 0
+    proposal_budget_remaining: Optional[int] = None
+    oracle_budget_remaining: Optional[int] = None
+    iteration_budget_counters: List[Dict[str, Any]] = field(default_factory=list)
+    termination_reason: Optional[str] = None
+    generation_shortfall_events: List[Dict[str, Any]] = field(default_factory=list)
+    backend_generation_shortfall: Optional[int] = None
+    # CareerMemory view configuration and directive application audit.
+    memory_mode: str = "structured_provenance"
+    memory_seed: int = 0
+    memory_transfer_declaration: Dict[str, Any] = field(default_factory=dict)
+    memory_directives_applied: List[Dict[str, Any]] = field(default_factory=list)
+    memory_directives_rejected: List[Dict[str, Any]] = field(default_factory=list)
+    memory_priority_audit: List[Dict[str, Any]] = field(default_factory=list)
+    memory_extraction_failures: List[Dict[str, Any]] = field(default_factory=list)
+    memory_shuffle_audit: List[Dict[str, Any]] = field(default_factory=list)
 
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)
@@ -422,7 +553,15 @@ class RunManifest:
     def from_dict(cls, data: Dict[str, Any]) -> RunManifest:
         known_fields = cls.__dataclass_fields__.keys()
         filtered = {k: v for k, v in data.items() if k in known_fields}
-        return cls(**filtered)
+        manifest = cls(**filtered)
+        # Loading is intentionally permissive for audit tooling.  The caller
+        # must use assert_schema_v2_compatible before scientific retrieval or
+        # execution; v1 is never upgraded in place.
+        if not is_schema_v2(data):
+            manifest.schema_version = str(data.get("schema_version", LEGACY_SCHEMA_VERSION))
+            manifest.scientific_validity = ScientificValidity.LEGACY_INVALID_ENERGY_SEMANTICS.value
+            manifest.run_mode = str(data.get("run_mode", "development"))
+        return manifest
 
     def save(self, path: Path) -> Path:
         path = Path(path)
@@ -441,8 +580,16 @@ class RunManifest:
             "constraints": self.constraints,
             "config": self.config,
             "strategies": self.strategies,
+            "memory_mode": self.memory_mode,
+            "memory_seed": self.memory_seed,
+            "memory_transfer_declaration": self.memory_transfer_declaration,
+            "memory_directives_applied": self.memory_directives_applied,
+            "memory_directives_rejected": self.memory_directives_rejected,
+            "memory_priority_audit": self.memory_priority_audit,
+            "memory_extraction_failures": self.memory_extraction_failures,
+            "memory_shuffle_audit": self.memory_shuffle_audit,
         }
-        return hashlib.sha256(json.dumps(content, sort_keys=True, default=str).encode("utf-8")).hexdigest()
+        return hashlib.sha256(_canonical_manifest_json(content).encode("utf-8")).hexdigest()
 
     def is_consistent_with(self, other: RunManifest) -> Tuple[bool, List[str]]:
         """Verify configuration consistency between an original and a reproduced run."""
@@ -461,6 +608,10 @@ class RunManifest:
             discrepancies.append(f"Config mismatch: {self.config} != {other.config}")
         if json.dumps(self.strategies, sort_keys=True, default=str) != json.dumps(other.strategies, sort_keys=True, default=str):
             discrepancies.append(f"Strategies mismatch: {self.strategies} != {other.strategies}")
+        if self.memory_mode != other.memory_mode or self.memory_seed != other.memory_seed:
+            discrepancies.append(f"Memory view mismatch: {self.memory_mode}/{self.memory_seed} != {other.memory_mode}/{other.memory_seed}")
+        if json.dumps(self.memory_transfer_declaration, sort_keys=True, default=str) != json.dumps(other.memory_transfer_declaration, sort_keys=True, default=str):
+            discrepancies.append("Memory transfer declaration mismatch")
         return (len(discrepancies) == 0, discrepancies)
 
 
@@ -480,6 +631,12 @@ class ProvenanceTracker:
         config: Optional[Dict[str, Any]] = None,
         objective: Optional[Dict[str, Any]] = None,
         constraints: Optional[Dict[str, Any]] = None,
+        run_mode: str = "development",
+        scientific_validity: Optional[str] = None,
+        requested_backends: Optional[Dict[str, Any]] = None,
+        actual_backends: Optional[Dict[str, Any]] = None,
+        proposal_budget: Optional[int] = None,
+        oracle_budget: Optional[int] = None,
     ):
         self.campaign_id = campaign_id
         self.campaign_name = campaign_name
@@ -489,6 +646,14 @@ class ProvenanceTracker:
         self.config_dict = config or {}
         self.objective_dict = objective or {}
         self.constraints_dict = constraints or {}
+        self.run_mode = str(run_mode)
+        self.scientific_validity = scientific_validity or (
+            ScientificValidity.RESEARCH_VALID.value
+            if self.run_mode == "research"
+            else ScientificValidity.DEMO_ONLY.value
+        )
+        self.requested_backends = dict(requested_backends or {})
+        self.actual_backends = dict(actual_backends or {})
 
         self.structures_dir = self.output_dir / "structures"
         self.structures_dir.mkdir(parents=True, exist_ok=True)
@@ -504,6 +669,10 @@ class ProvenanceTracker:
             campaign_id=self.campaign_id,
             campaign_name=self.campaign_name,
             domain=self.domain,
+            scientific_validity=self.scientific_validity,
+            run_mode=self.run_mode,
+            requested_backends=self.requested_backends,
+            actual_backends=self.actual_backends,
             git_commit_sha=self.environment.git_commit_sha,
             environment=self.environment.to_dict(),
             master_seed=self.master_seed,
@@ -514,12 +683,59 @@ class ProvenanceTracker:
             strategies=[],
             start_time_iso=_get_utc_now_iso(),
             status="running",
+            proposal_budget=proposal_budget,
+            oracle_budget=oracle_budget,
+            proposal_budget_remaining=proposal_budget,
+            oracle_budget_remaining=oracle_budget,
+            memory_mode=str(self.config_dict.get("memory_mode", "structured_provenance")),
+            memory_seed=int(self.config_dict.get("memory_seed", 0)),
+            memory_transfer_declaration=dict(
+                self.config_dict.get("memory_transfer_declaration")
+                or self.constraints_dict.get("memory_transfer_declaration")
+                or self.constraints_dict.get("transferability")
+                or self.constraints_dict.get("memory_transfer")
+                or {}
+            ),
         )
 
     def write_manifest(self) -> Path:
         """Write current manifest state to manifest.json."""
         self.manifest.manifest_hash = self.manifest.compute_manifest_hash()
         return self.manifest.save(self.manifest_path)
+
+    def sync_budget(self, tracker: Any, *, iteration: Optional[int] = None,
+                    termination_reason: Optional[str] = None) -> Dict[str, Any]:
+        """Copy deterministic dual-budget counters into the manifest.
+
+        Keeping this update in the provenance owner ensures checkpoints and the
+        final manifest agree even when a screening backend is replaced in a
+        development test.
+        """
+        if tracker is None:
+            return {}
+        snapshot = tracker.to_dict(termination_reason=termination_reason) if hasattr(tracker, "to_dict") else dict(tracker)
+        for field_name in (
+            "proposal_budget", "oracle_budget", "proposals_generated", "geometry_valid",
+            "invalid_geometry", "oracle_evaluations", "oracle_cache_hits",
+            "proposal_budget_remaining", "oracle_budget_remaining",
+        ):
+            if field_name in snapshot:
+                setattr(self.manifest, field_name, snapshot[field_name])
+        if termination_reason is not None:
+            self.manifest.termination_reason = termination_reason
+        if iteration is not None:
+            entry = dict(snapshot)
+            entry["iteration"] = iteration
+            # A checkpoint/replay should contain one canonical snapshot per
+            # iteration, rather than duplicate updates from a caller.
+            self.manifest.iteration_budget_counters = [
+                e for e in self.manifest.iteration_budget_counters
+                if e.get("iteration") != iteration
+            ]
+            self.manifest.iteration_budget_counters.append(entry)
+            self.manifest.iteration_budget_counters.sort(key=lambda e: e.get("iteration", 0))
+        self.write_manifest()
+        return snapshot
 
     def record_strategy(self, iteration: int, strategy: Dict[str, Any]) -> None:
         """Record planned strategy for the iteration to ensure deterministic replay."""
@@ -531,8 +747,47 @@ class ProvenanceTracker:
             "diversity_weight": strategy.get("diversity_weight", 0.3),
             "rationale": strategy.get("rationale", ""),
             "hypothesis": strategy.get("hypothesis", ""),
+            "memory_directives": strategy.get("memory_directives", []),
+            "memory_directive_audit": strategy.get("memory_directive_audit", {}),
+            "memory_policy": strategy.get("memory_policy", {}),
+            "memory_transfer_declaration": strategy.get("memory_transfer_declaration", {}),
         }
         self.manifest.strategies.append(clean_strat)
+        audit = clean_strat["memory_directive_audit"] or {}
+        if audit.get("shuffle_audit"):
+            shuffle = dict(audit["shuffle_audit"])
+            shuffle["iteration"] = iteration
+            if shuffle not in self.manifest.memory_shuffle_audit:
+                self.manifest.memory_shuffle_audit.append(shuffle)
+        for record_id in audit.get("applied", []):
+            if record_id not in [x.get("record_id") for x in self.manifest.memory_directives_applied]:
+                self.manifest.memory_directives_applied.append({
+                    "record_id": record_id, "iteration": iteration,
+                    "mode": self.manifest.memory_mode,
+                })
+        for rejected in audit.get("rejected", []):
+            item = dict(rejected)
+            item["iteration"] = iteration
+            if item not in self.manifest.memory_directives_rejected:
+                self.manifest.memory_directives_rejected.append(item)
+        self.write_manifest()
+
+    def record_memory_prioritization(self, entries: List[Dict[str, Any]], iteration: int) -> None:
+        """Persist pre-oracle memory priority scores and their citations."""
+        for entry in entries:
+            item = dict(entry)
+            item["iteration"] = iteration
+            if item not in self.manifest.memory_priority_audit:
+                self.manifest.memory_priority_audit.append(item)
+        self.write_manifest()
+
+    def record_memory_extraction_audit(self, entries: List[Dict[str, Any]], iteration: int) -> None:
+        """Persist structured feature-extraction failures for audit/replay."""
+        for entry in entries:
+            item = dict(entry)
+            item["iteration"] = iteration
+            if item not in self.manifest.memory_extraction_failures:
+                self.manifest.memory_extraction_failures.append(item)
         self.write_manifest()
 
     # -------------------------------------------------------------------------
@@ -549,10 +804,11 @@ class ProvenanceTracker:
         relative_path = f"structures/{cif_filename}"
 
         cif_content = self._serialize_to_cif(candidate_id, struct)
-        with open(cif_path, "w", encoding="utf-8") as f:
-            f.write(cif_content)
-
-        sha256_hash = hashlib.sha256(cif_content.encode("utf-8")).hexdigest()
+        # Write the exact bytes that are hashed.  Text-mode newline expansion
+        # on Windows previously made every persisted CIF fail its own digest.
+        cif_bytes = cif_content.encode("utf-8")
+        cif_path.write_bytes(cif_bytes)
+        sha256_hash = hashlib.sha256(cif_bytes).hexdigest()
         return relative_path, sha256_hash
 
     def _serialize_to_cif(self, candidate_id: str, struct: Any) -> str:
@@ -668,6 +924,10 @@ class ProvenanceTracker:
             record = CandidateRecord(
                 candidate_id=cand_id,
                 campaign_id=self.campaign_id,
+                scientific_validity=self.scientific_validity,
+                run_mode=self.run_mode,
+                requested_backends=dict(self.requested_backends),
+                actual_backends=dict(self.actual_backends),
                 iteration=iteration,
                 created_at_iso=now_iso,
                 composition=formula,
@@ -718,6 +978,10 @@ class ProvenanceTracker:
                 record = CandidateRecord(
                     candidate_id=cand_id,
                     campaign_id=self.campaign_id,
+                    scientific_validity=self.scientific_validity,
+                    run_mode=self.run_mode,
+                    requested_backends=dict(self.requested_backends),
+                    actual_backends=dict(self.actual_backends),
                     iteration=iteration,
                     composition=formula,
                     chemical_system=chem_sys,
@@ -729,19 +993,54 @@ class ProvenanceTracker:
                 self.records[cand_id] = record
 
             record.screening_backend = backend
-            record.screening_predictions = getattr(res, "predictions", {}) or {}
+            res_failure_code = (
+                getattr(res, "geometry_failure_code", None)
+                or getattr(res, "failure_code", None)
+            )
+            if res_failure_code in {"INVALID_GEOMETRY", "ORACLE_BUDGET_EXHAUSTED", "PREDICTION_FAILED", "THERMODYNAMIC_ORACLE_FAILED"}:
+                record.screening_predictions = {}
+            else:
+                record.screening_predictions = canonicalize_screening_predictions(
+                    getattr(res, "predictions", {}) or {}, backend=backend
+                )
             record.screening_score = getattr(res, "score", None)
             record.screening_score_components = getattr(res, "score_components", {}) or {}
             record.passes_screening_filters = getattr(res, "passes_filters", True)
             record.screening_filter_reasons = getattr(res, "filter_reasons", []) or []
             record.screening_rank = getattr(res, "rank", rank_idx)
             record.screening_timestamp_iso = now_iso
+            record.geometry_valid = getattr(res, "geometry_valid", None)
+            record.geometry_failure_code = (
+                res_failure_code
+            )
+            record.geometry_validation_details = (
+                getattr(res, "geometry_details", None)
+                or getattr(res, "details", None)
+                or {}
+            )
+            record.geometry_minimum_distance = record.geometry_validation_details.get("minimum_distance")
+            offending_pair = record.geometry_validation_details.get("offending_pair")
+            record.geometry_offending_pair = list(offending_pair) if offending_pair is not None else None
+            record.provenance_stage = getattr(res, "provenance_stage", "screening")
+            record.oracle_evaluated = getattr(res, "oracle_evaluated", None)
+            record.oracle_cache_hit = getattr(res, "oracle_cache_hit", None)
+            record.oracle_call_index = getattr(res, "oracle_call_index", None)
 
             if not record.passes_screening_filters:
                 record.status = CandidateStatus.REJECTED.value
-                record.rejection_stage = "screening"
+                if record.geometry_failure_code == "INVALID_GEOMETRY" or record.provenance_stage == "geometry_validation":
+                    record.rejection_stage = "geometry_validation"
+                elif record.geometry_failure_code == "ORACLE_BUDGET_EXHAUSTED" or record.provenance_stage == "oracle_budget":
+                    record.rejection_stage = "oracle_budget"
+                elif record.provenance_stage == "thermodynamics":
+                    record.rejection_stage = "thermodynamics"
+                else:
+                    record.rejection_stage = "screening"
                 reasons_str = "; ".join(record.screening_filter_reasons) if record.screening_filter_reasons else "Failed screening criteria"
-                record.rejection_reason = f"Screening filter failed: {reasons_str}"
+                if record.geometry_failure_code in {"INVALID_GEOMETRY", "ORACLE_BUDGET_EXHAUSTED", "PREDICTION_FAILED", "THERMODYNAMIC_ORACLE_FAILED"}:
+                    record.rejection_reason = f"{record.geometry_failure_code}: {reasons_str}"
+                else:
+                    record.rejection_reason = f"Screening filter failed: {reasons_str}"
                 record.decision_timestamp_iso = now_iso
             elif record.status != CandidateStatus.REJECTED.value:
                 record.status = CandidateStatus.SCREENED.value
@@ -774,7 +1073,10 @@ class ProvenanceTracker:
 
             record.validation_calculator = getattr(v, "calculator", "mock")
             record.validation_converged = getattr(v, "converged", False)
-            record.validation_properties = getattr(v, "properties", {}) or {}
+            record.validation_properties = canonicalize_validation_properties(
+                getattr(v, "properties", {}) or {},
+                calculator=str(getattr(v, "calculator", "mock")),
+            )
             record.validation_cost_hours = getattr(v, "cost_hours", 0.0)
             record.validation_error_message = getattr(v, "error_message", "") or None
             record.validation_timestamp_iso = now_iso
@@ -924,7 +1226,11 @@ class ProvenanceTracker:
     def save_campaign_provenance(self) -> Path:
         """Write consolidated campaign JSON provenance record."""
         payload = {
-            "schema_version": "1.0.0",
+            "schema_version": SCHEMA_VERSION,
+            "scientific_validity": self.scientific_validity,
+            "run_mode": self.run_mode,
+            "requested_backends": dict(self.requested_backends),
+            "actual_backends": dict(self.actual_backends),
             "campaign_id": self.campaign_id,
             "campaign_name": self.campaign_name,
             "domain": self.domain,
@@ -990,13 +1296,9 @@ class ProvenanceTracker:
         scores = [r.screening_score for r in screened if r.screening_score is not None]
         best_score = max(scores) if scores else 0.0
 
-        val_stabilities = [
-            r.validation_properties.get("stability")
-            for r in validated
-            if "stability" in r.validation_properties
-        ]
-        best_validated_stability = max(val_stabilities) if val_stabilities else 0.0
-
+        # Energies are raw model/calculator outputs.  Keep them on each
+        # candidate, but do not aggregate/rank across compositions until a
+        # reference-set thermodynamic result is available (Sprint 3).
         synth_scores = [
             r.synthesis_feasibility_score
             for r in synthesis_assessed
@@ -1026,7 +1328,16 @@ class ProvenanceTracker:
             "total_synthesis_feasible": len(synthesis_feasible),
             "synthesis_feasibility_rate": len(synthesis_feasible) / len(synthesis_assessed) if len(synthesis_assessed) > 0 else 0.0,
             "best_score_ever": best_score,
-            "best_validated_stability_ever": best_validated_stability,
             "best_synthesis_feasibility_ever": best_synthesis_feasibility,
             "generation_backend_counts": backend_counts,
+            "proposals_generated": self.manifest.proposals_generated or total_generated,
+            "geometry_valid": self.manifest.geometry_valid,
+            "invalid_geometry": self.manifest.invalid_geometry,
+            "oracle_evaluations": self.manifest.oracle_evaluations,
+            "oracle_cache_hits": self.manifest.oracle_cache_hits,
+            "proposal_budget": self.manifest.proposal_budget,
+            "oracle_budget": self.manifest.oracle_budget,
+            "proposal_budget_remaining": self.manifest.proposal_budget_remaining,
+            "oracle_budget_remaining": self.manifest.oracle_budget_remaining,
+            "termination_reason": self.manifest.termination_reason,
         }

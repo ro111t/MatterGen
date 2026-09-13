@@ -9,6 +9,7 @@ sys.path.insert(0, str(ROOT))
 import pytest
 
 from agents.screening import ScreeningAgent, ScreeningResult, DEFAULT_SCREENING_WEIGHTS
+from agents.integrity import FORCE_KEY, SCREENING_ENERGY_KEY, STRESS_KEY
 
 
 @pytest.fixture(autouse=True)
@@ -16,10 +17,9 @@ def disable_chgnet(monkeypatch):
     """Keep screening tests fast and deterministic by avoiding real CHGNet inference."""
     def _predict(self, struct, struct_id):
         return {
-            "formation_energy": -2.0,
-            "forces": 0.5,
-            "stress": 0.05,
-            "stability": -2.0,
+            SCREENING_ENERGY_KEY: -2.0,
+            FORCE_KEY: 0.5,
+            STRESS_KEY: 0.05,
         }
 
     monkeypatch.setattr(ScreeningAgent, "_predict", _predict)
@@ -38,9 +38,16 @@ class _FakeComposition:
 
 
 def _make_stub(formula: str, generation_id: str = "") -> dict:
+    # Screening now has a strict geometry gate; keep these lightweight test
+    # records representative of a real periodic dictionary structure.
+    import re
+    n_sites = sum(int(count or 1) for _, count in re.findall(r"([A-Z][a-z]?)(\d*)", formula))
+    positions = [[(i * 0.37) % 0.8, (i * 0.23) % 0.8, (i * 0.41) % 0.8] for i in range(n_sites)]
     return {
         "composition": formula,
         "generation_id": generation_id or formula,
+        "lattice": [[8.0, 0.0, 0.0], [0.0, 8.0, 0.0], [0.0, 0.0, 8.0]],
+        "positions": positions,
     }
 
 
@@ -96,10 +103,9 @@ def test_target_property_match_affects_score():
 
     # Patch the predictor so the stub carries a band_gap property we can target.
     agent._predict = lambda struct, sid: {
-        "formation_energy": -2.0,
-        "forces": 0.1,
-        "stress": 0.1,
-        "stability": -2.0,
+        SCREENING_ENERGY_KEY: -2.0,
+        FORCE_KEY: 0.1,
+        STRESS_KEY: 0.1,
         "band_gap": 2.5,
     }
 
@@ -122,38 +128,53 @@ def test_custom_weights_change_score():
 
     # Force a prediction where the components differ enough that changing weights changes the total.
     agent._predict = lambda struct, sid: {
-        "formation_energy": -4.0,
-        "forces": 1.0,
-        "stress": 2.0,
-        "stability": -4.0,
+        SCREENING_ENERGY_KEY: -4.0,
+        FORCE_KEY: 1.0,
+        STRESS_KEY: 2.0,
     }
 
-    stability_focused = {"stability": 1.0, "relaxation_quality": 0.0, "target_property_match": 0.0, "composition_novelty": 0.0}
-    relaxation_focused = {"stability": 0.0, "relaxation_quality": 1.0, "target_property_match": 0.0, "composition_novelty": 0.0}
+    novelty_focused = {"relaxation_quality": 0.0, "target_property_match": 0.0, "composition_novelty": 1.0}
+    relaxation_focused = {"relaxation_quality": 1.0, "target_property_match": 0.0, "composition_novelty": 0.0}
 
-    results_stable = agent.screen_batch([stub], criteria={}, weights=stability_focused)
+    results_novel = agent.screen_batch([stub], criteria={}, weights=novelty_focused)
     results_relaxation = agent.screen_batch([stub], criteria={}, weights=relaxation_focused)
 
-    assert results_stable[0][1].score != results_relaxation[0][1].score
-    assert results_stable[0][1].score_components["stability"] == 100.0
-    assert results_stable[0][1].score > results_relaxation[0][1].score
+    assert results_novel[0][1].score != results_relaxation[0][1].score
+    assert "energy_quality" not in results_novel[0][1].score_components
 
 
 def test_filter_reasons_rejected_candidates():
     agent = ScreeningAgent()
     stub = _make_stub("LiP", "stub_0")
 
-    # The heuristic predictor produces formation energies in [-4, -0.5]; 0.0 is out of range
-    # but we can force a rejection with a very low max_formation_energy threshold.
-    # Instead, monkeypatch _predict to return an unphysical value.
+    # Force a rejection with an explicit geometry diagnostic.
     agent._predict = lambda struct, sid: {
-        "formation_energy": 10.0,
-        "forces": 0.1,
-        "stress": 0.1,
-        "stability": -10.0,
+        SCREENING_ENERGY_KEY: -2.0,
+        FORCE_KEY: 10.0,
+        STRESS_KEY: 0.1,
     }
 
-    results = agent.screen_batch([stub], criteria={"max_formation_energy": 5.0})
+    results = agent.screen_batch([stub], criteria={"max_force_ev_per_angstrom": 5.0})
     _, result = results[0]
     assert not result.passes_filters
-    assert any("formation_energy" in reason for reason in result.filter_reasons)
+    assert any(FORCE_KEY in reason for reason in result.filter_reasons)
+
+
+def test_raw_energy_is_diagnostic_only():
+    agent = ScreeningAgent()
+    stub = _make_stub("LiP", "stub_energy")
+    agent._predict = lambda struct, sid: {
+        SCREENING_ENERGY_KEY: -1.0,
+        FORCE_KEY: 0.1,
+        STRESS_KEY: 0.1,
+    }
+    low = agent.screen_batch([stub], criteria={}, deduplicate=False)[0][1]
+    agent.prediction_cache.clear()
+    agent._predict = lambda struct, sid: {
+        SCREENING_ENERGY_KEY: -100.0,
+        FORCE_KEY: 0.1,
+        STRESS_KEY: 0.1,
+    }
+    high = agent.screen_batch([stub], criteria={}, deduplicate=False)[0][1]
+    assert low.passes_filters == high.passes_filters
+    assert low.score == high.score

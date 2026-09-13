@@ -21,8 +21,9 @@ def test_mock_validation_returns_result():
 
     assert isinstance(result, ValidationResult)
     assert result.converged
-    assert "energy" in result.properties
-    assert "stability" in result.properties
+    assert "energy_per_atom_ev" in result.properties
+    assert "total_energy_ev" in result.properties
+    assert not any(key.startswith("thermo_") for key in result.properties)
     assert result.cost_hours > 0
     assert result.structure_id
 

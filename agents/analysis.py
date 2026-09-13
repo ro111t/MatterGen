@@ -10,6 +10,14 @@ import math
 
 import numpy as np
 
+from agents.integrity import (
+    FORCE_KEY,
+    SCREENING_ENERGY_KEY,
+    VALIDATION_ENERGY_KEY,
+    canonicalize_screening_predictions,
+    canonicalize_validation_properties,
+)
+
 
 @dataclass
 class AnalysisResult:
@@ -44,10 +52,9 @@ class AnalysisAgent:
         top_k: int = 3,
     ):
         self.properties_to_compare = properties_to_compare or [
-            "formation_energy",
-            "energy",
-            "stability",
-            "forces",
+            SCREENING_ENERGY_KEY,
+            VALIDATION_ENERGY_KEY,
+            FORCE_KEY,
         ]
         self.top_k = top_k
         self.iteration_history: List[AnalysisResult] = []
@@ -80,10 +87,16 @@ class AnalysisAgent:
 
         # Build a lookup from structure_id to screening prediction.
         screening_lookup: Dict[str, Dict[str, float]] = {}
+        screening_scores: Dict[str, float] = {}
         for struct, screen_res in screening_results:
             sid = getattr(screen_res, 'structure_id', '')
             if sid:
-                screening_lookup[sid] = getattr(screen_res, 'predictions', {})
+                screening_lookup[sid] = canonicalize_screening_predictions(
+                    getattr(screen_res, 'predictions', {})
+                )
+                score = getattr(screen_res, 'score', None)
+                if score is not None:
+                    screening_scores[sid] = float(score)
 
         # Pair validation results with their screening predictions.
         paired: List[Tuple[str, Dict[str, float], Dict[str, float]]] = []
@@ -91,16 +104,23 @@ class AnalysisAgent:
             if not getattr(v, 'converged', False):
                 continue
             sid = getattr(v, 'structure_id', '')
-            dft_props = getattr(v, 'properties', {})
+            dft_props = canonicalize_validation_properties(
+                getattr(v, 'properties', {}),
+                calculator=str(getattr(v, 'calculator', 'mock')),
+            )
             ml_props = screening_lookup.get(sid, {})
             paired.append((sid, ml_props, dft_props))
 
         # Compute per-property metrics.
         for prop in self.properties_to_compare:
             ml_vals, dft_vals, ids = [], [], []
+            ml_key = prop
+            dft_key = prop
+            if prop in {SCREENING_ENERGY_KEY, VALIDATION_ENERGY_KEY}:
+                ml_key, dft_key = SCREENING_ENERGY_KEY, VALIDATION_ENERGY_KEY
             for sid, ml_props, dft_props in paired:
-                ml_val = ml_props.get(prop)
-                dft_val = dft_props.get(prop)
+                ml_val = ml_props.get(ml_key)
+                dft_val = dft_props.get(dft_key)
                 if ml_val is not None and dft_val is not None:
                     ml_vals.append(float(ml_val))
                     dft_vals.append(float(dft_val))
@@ -132,18 +152,11 @@ class AnalysisAgent:
             if result.pearson_r.get(prop, 0.0) < 0.3 and len(ml_vals) > 2:
                 result.failure_modes.append(f"Weak correlation for {prop} (r={result.pearson_r[prop]:.2f}).")
 
-        # Identify top candidates by a combined DFT + ML score.
+        # Identify top candidates by the existing non-thermodynamic screening
+        # score.  Raw per-atom energies are calibration diagnostics only.
         candidates = []
         for sid, ml_props, dft_props in paired:
-            stability = dft_props.get('stability', dft_props.get('formation_energy', 0.0))
-            ml_score = 0.0
-            for p in ['formation_energy', 'stability']:
-                val = ml_props.get(p)
-                if val is not None:
-                    ml_score = float(val)
-                    break
-            # Lower (more negative) stability/energy is better; negate for ranking.
-            score = -float(stability) if stability is not None else 0.0
+            score = screening_scores.get(sid, 0.0)
             candidates.append({
                 'structure_id': sid,
                 'score': score,

@@ -61,6 +61,9 @@ All agents below are implemented. Heavy external backends (Mattergen API, VASP/Q
 - **Orchestrator Agent**: High-level strategic planning using LLM; falls back to deterministic strategy when no API key is available.
 - **Generation Agent**: Generates candidate structures using Microsoft MatterGen when available, with a pymatgen-based mock fallback.
 - **Screening Agent**: Fast ML-based filtering with CHGNet/M3GNet/ALIGNN (currently CHGNet enabled by default).
+
+- **Geometry and budget gate**: Every generated candidate is retained in provenance, but only finite, nondegenerate 3-D periodic structures with a minimum periodic separation of at least 0.8 Å reach the oracle. Proposal and oracle budgets are independently auditable; benchmark specifications configure 200 proposals and 100 oracle evaluations across 5 iterations (40 proposals/iteration). Development ``CampaignConfig`` instances may omit either limit for unlimited operation.
+- **Frozen thermodynamic oracle**: Research runs load a certified, checksummed reference set prepared offline with the identical pinned CHGNet weights and relaxation settings used for candidates. Formation energy uses elemental references and energy above hull uses all competing frozen phases; neither is inferred from raw CHGNet energy.
 - **Validation Agent**: DFT relaxation and property calculation via ASE; supports VASP, Quantum ESPRESSO, GPAW, and a deterministic `mock` backend.
 - **Analysis Agent**: Compares ML screening predictions against DFT validation and reports MAE, RMSE, bias, Pearson r, failure modes, and top candidates.
 - **Synthesis Feasibility Agent**: Estimates precursor difficulty, synthesis route, and experimental cost from composition heuristics.
@@ -137,7 +140,8 @@ from agents.orchestrator import CampaignObjective
 objective = CampaignObjective(
     target_properties={
         'band_gap': 2.5,  # eV
-        'formation_energy': -2.0,  # eV/atom
+        # Raw ML energy is recorded for audit; thermodynamic targets require
+        # the reference-set/hull capability and are unavailable in Sprint 1.
     },
     constraints={
         'elements': ['Li', 'P', 'S', 'O'],
@@ -154,6 +158,7 @@ config = CampaignConfig(
     objective=objective,
     output_dir=Path("./campaigns/electrolyte"),
     verbose=True,
+    run_mode="development",  # default; use "research" for fail-closed execution
     # use_mattergen=True,  # enable real MatterGen generation when available
     # mattergen_pretrained="chemical_system",  # element-conditioned generation
 )
@@ -189,16 +194,21 @@ python campaign.py \
 
 Flags:
 - `--domain`: campaign domain name
+- `--run-mode`: `development` (default, deterministic mocks permitted) or `research` (all required scientific backends must be configured)
 - `--iterations`: number of iterations to run
 - `--candidates`: fallback/default batch size (orchestrator may adjust it)
 - `--validation-top-k`: number of screened candidates to validate
 - `--no-career-memory`: disable persistent learning across campaigns
 - `--no-validation`: skip DFT validation
 - `--no-synthesis`: skip synthesis feasibility assessment
-- `--use-mattergen`: use the MatterGen diffusion model instead of the pymatgen mock
+- `--use-mattergen`: use the MatterGen diffusion model instead of the pymatgen mock (required in research mode)
 - `--mattergen-pretrained`: MatterGen checkpoint name (e.g. `mattergen_base`, `chemical_system`)
 - `--mattergen-model-path`: path to a local MatterGen checkpoint directory
 - `--mattergen-batch-size`: batch size for MatterGen generation
+- `--proposal-budget`: maximum generated proposals (benchmark default: 200; omitted is unlimited in development)
+- `--oracle-budget`: maximum geometrically valid oracle evaluations (benchmark default: 100; omitted is unlimited in development)
+- `--geometry-min-distance`: absolute periodic minimum distance in Å (default: 0.8)
+- `--thermodynamics-reference-set`: local frozen reference JSON; its adjacent `.sha256` is mandatory and no runtime download is performed
 - `--mattergen-sampling-config-name`: name of the sampling config YAML file to use (`default` or `csp`)
 - `--mattergen-sampling-config-path`: path to a MatterGen sampling config directory (defaults to bundled configs)
 
@@ -217,8 +227,7 @@ python3 -m pytest tests/ -v
 
 Specify desired material properties:
 - `band_gap`: Electronic band gap (eV)
-- `formation_energy`: Formation energy (eV/atom)
-- `stability`: Thermodynamic stability (eV/atom)
+- `predicted_energy_per_atom_ev`: Raw CHGNet/MatterGen diagnostic (not a formation or hull metric)
 - Custom properties supported by Mattergen
 
 ### Constraints
@@ -232,15 +241,36 @@ Control generation space:
 ### Screening Criteria
 
 Filter candidates:
-- `min_stability`: Minimum stability threshold
-- `max_formation_energy`: Maximum formation energy
 - `min_band_gap`, `max_band_gap`: Band gap range
-- `max_forces`: Maximum atomic forces
+- `max_force_ev_per_angstrom`: Maximum residual force diagnostic
+- `max_predicted_energy_above_hull_ev_per_atom`: predicted hull cutoff (default `0.10` eV/atom)
+
+### Offline thermodynamic reference sets
+
+Reference construction is a separate, one-time workflow. First download and
+curate structures outside the campaign, then pass the local JSON to
+`scripts/build_reference_set.py` with an importable pinned evaluator factory.
+The builder deduplicates structures, relaxes references with cell relaxation,
+`fmax <= 0.05 eV/Å`, and 500 steps by default, and writes canonical JSON plus
+an adjacent SHA256 file. A set is certified only when every elemental endpoint
+and every supplied source-near-hull phase (`<= 0.05 eV/atom`) succeeds and at
+least 95% of the remaining unique phases succeed. Failures remain in the
+artifact; they are never silently dropped.
+
+Use a versioned name such as `frozen_reference_set_Li_P_S_chgnet_v1.json`.
+Campaigns only load and verify this artifact; they never query Materials
+Project or relax reference phases at runtime. The loader rejects checksum,
+schema, chemical-system, model-weight hash, checkpoint-version, relaxation-
+setting, or certification mismatches. Candidate results report
+`predicted_formation_energy_ev_per_atom`,
+`predicted_energy_above_hull_ev_per_atom`, and explicit decomposition products.
+The default retained cutoff is `0.10 eV/atom`, while “predicted stable” means
+`<= 0.03 eV/atom`; sensitivity counts at 0.03/0.05/0.10 are available. These
+are model-predicted thermodynamic quantities, not evidence of synthesizability.
 
 ### Multi-Objective Screening
 
-`agents/screening.py` ranks candidates with a composite score that combines:
-- **Stability** (favoring lower formation energy)
+`agents/screening.py` records raw energy as a per-candidate diagnostic only. Its temporary pre-hull score combines:
 - **Relaxation quality** (low forces/stress)
 - **Target property match** (closeness to campaign objective targets such as `band_gap`)
 - **Composition novelty** (rarity within the generated batch)
@@ -250,9 +280,9 @@ The default weights are configurable via the `weights` argument to `screen_batch
 ```python
 screened = screener.screen_batch(
     structures=candidates,
-    criteria={"max_forces": 1.0},
+    criteria={"max_force_ev_per_angstrom": 1.0},
     target_properties={"band_gap": 2.5},
-    weights={"stability": 0.4, "target_property_match": 0.3, "relaxation_quality": 0.2, "composition_novelty": 0.1},
+    weights={"target_property_match": 0.35, "relaxation_quality": 0.40, "composition_novelty": 0.25},
 )
 ```
 
@@ -262,9 +292,9 @@ screened = screener.screen_batch(
 
 Each iteration:
 1. **Plan**: LLM or heuristic strategy decides element focus and batch size.
-2. **Generate**: candidate structures via MatterGen diffusion model (when the environment satisfies its `numpy<2.0`/torch constraints) or pymatgen mock fallback.
-3. **Screen**: CHGNet/M3GNet filters candidates against lenient thresholds.
-4. **Validate**: ASE-backed DFT relaxation on top candidates (mock by default).
+2. **Generate**: candidate structures via MatterGen diffusion model (or deterministic pymatgen development mock).
+3. **Screen**: CHGNet records raw energy plus force/stress diagnostics; raw energy is not a thermodynamic filter.
+4. **Validate**: ASE-backed DFT relaxation on top candidates (development mock by default).
 5. **Analyze**: compare ML predictions against DFT to quantify model error.
 6. **Assess**: estimate synthesis feasibility and route.
 7. **Learn**: CareerMemory records principles; StrategyAgent recommends next iteration.
@@ -315,7 +345,7 @@ campaigns/
   "total_synthesis_assessed": 30,
   "total_synthesis_feasible": 24,
   "best_score_ever": 78.5,
-  "best_validated_stability_ever": -1.45,
+  "thermodynamics_metrics_available": false,
   "best_synthesis_feasibility_ever": 0.82,
   "top_candidates": [...]
 }
@@ -410,7 +440,7 @@ wandb.log({"success_rate": rate})
 ## Limitations
 
 - **Computational cost**: DFT is expensive (hours per material)
-- **Synthesis gap**: Computational stability ≠ synthesizability
+- **Thermodynamics**: Raw ML/calculator energies are not formation or hull values; reference-set thermodynamics is required
 - **Model accuracy**: ML predictions have ~10-20% error
 - **Search space**: Vast - needs good priors
 

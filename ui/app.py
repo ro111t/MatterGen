@@ -42,11 +42,18 @@ with st.sidebar:
     domain = st.text_input("Domain", value="li_solid_electrolyte")
 
     st.subheader("Target Properties")
-    target_stability = st.number_input(
-        "Target stability (eV/atom)", value=-0.1, step=0.05, format="%.3f"
+    st.info("Hull metrics require an offline-built, certified frozen reference set evaluated with the same CHGNet checkpoint.")
+    thermodynamics_reference_set_path = st.text_input(
+        "Frozen reference-set JSON (optional)", value="",
+        help="No reference data is downloaded at runtime; the adjacent .sha256 file is required.",
     )
-    target_formation_energy = st.number_input(
-        "Target formation energy (eV/atom)", value=-2.0, step=0.1, format="%.2f"
+    thermodynamics_retain_threshold_ev_per_atom = st.number_input(
+        "Retain hull threshold (eV/atom)", value=0.10, min_value=0.0, step=0.01,
+        format="%.2f", help="Candidates at or below this predicted energy above hull are retained.",
+    )
+    thermodynamics_stable_threshold_ev_per_atom = st.number_input(
+        "Stable hull threshold (eV/atom)", value=0.03, min_value=0.0, step=0.01,
+        format="%.2f", help="Candidates at or below this predicted energy above hull are labeled predicted stable.",
     )
 
     st.subheader("Constraints")
@@ -60,18 +67,43 @@ with st.sidebar:
     candidates_per_iteration = st.number_input(
         "Candidates per iteration", value=15, min_value=1, step=1
     )
+    proposal_budget = st.number_input(
+        "Proposal budget (paper default 400)", value=400, min_value=1, step=1,
+        help="Every generated candidate consumes one proposal slot.",
+    )
+    oracle_budget = st.number_input(
+        "Oracle budget (paper default 200)", value=200, min_value=1, step=1,
+        help="Every geometrically valid candidate submitted to CHGNet consumes one oracle slot, including cache hits.",
+    )
+    geometry_min_distance = st.number_input(
+        "Minimum periodic distance (Å)", value=0.8, min_value=0.001, step=0.1,
+    )
     use_career_memory = st.checkbox("Use career memory", value=True)
+    memory_mode = st.selectbox(
+        "Career memory view",
+        options=["none", "text_summary", "structured_provenance", "shuffled_control"],
+        index=2,
+        disabled=not use_career_memory,
+        help="Shuffled control preserves marginals but is invalid for scientific decision support.",
+    )
+    memory_seed = st.number_input("Career memory seed", value=0, step=1, disabled=not use_career_memory)
+    run_mode = st.selectbox(
+        "Run mode", options=["development", "research"], index=0,
+        help="Research mode fails closed unless MatterGen, CHGNet, scientific validation, and required thermodynamics are configured.",
+    )
 
     st.subheader("Pipeline Stages")
-    use_validation = st.checkbox("Run DFT validation (mock)", value=True)
+    use_validation = st.checkbox("Run DFT validation (development mock)", value=True)
     validation_top_k = st.number_input(
         "Top candidates to validate", value=3, min_value=1, step=1,
         disabled=not use_validation,
     )
-    use_synthesis = st.checkbox("Run synthesis feasibility", value=True, disabled=not use_validation)
+    use_synthesis = st.checkbox("Run synthesis feasibility (development-only)", value=True, disabled=not use_validation or run_mode == "research")
+    if run_mode == "research":
+        use_synthesis = False
 
     st.subheader("Generation Backend")
-    use_mattergen = st.checkbox("Use MatterGen (falls back to mock if unavailable)", value=False)
+    use_mattergen = st.checkbox("Use MatterGen", value=False)
     mattergen_pretrained = st.selectbox(
         "MatterGen pretrained model",
         options=[
@@ -111,13 +143,17 @@ with st.sidebar:
 def _run_campaign_ui(
     campaign_name: str,
     domain: str,
-    target_stability: float,
-    target_formation_energy: float,
     element_list: list,
     max_atoms: int,
     iterations: int,
     candidates_per_iteration: int,
+    proposal_budget: int,
+    oracle_budget: int,
+    geometry_min_distance: float,
     use_career_memory: bool,
+    memory_mode: str,
+    memory_seed: int,
+    run_mode: str,
     use_validation: bool,
     validation_top_k: int,
     use_synthesis: bool,
@@ -126,16 +162,16 @@ def _run_campaign_ui(
     mattergen_sampling_config_name: str,
     mattergen_batch_size: int,
     mattergen_model_path: str,
+    thermodynamics_reference_set_path: str,
+    thermodynamics_retain_threshold_ev_per_atom: float,
+    thermodynamics_stable_threshold_ev_per_atom: float,
 ):
     """Lazy import heavy deps and run one campaign."""
     from campaign import CampaignConfig, MaterialsDiscoveryCampaign
     from agents.orchestrator import CampaignObjective
 
     objective = CampaignObjective(
-        target_properties={
-            "stability": target_stability,
-            "formation_energy": target_formation_energy,
-        },
+        target_properties={},
         constraints={"elements": element_list, "max_atoms": max_atoms},
         success_criteria={"min_score": 999.0},  # run full iteration budget
         domain=domain,
@@ -147,16 +183,25 @@ def _run_campaign_ui(
         objective=objective,
         output_dir=Path(f"./campaigns/{domain}"),
         use_career_memory=use_career_memory,
+        memory_mode=memory_mode,
+        memory_seed=memory_seed,
+        run_mode=run_mode,
         verbose=False,  # streamlit captures its own output
         use_validation=use_validation,
         validation_top_k=validation_top_k,
         use_synthesis=use_synthesis,
         num_candidates=candidates_per_iteration,
+        proposal_budget=proposal_budget,
+        oracle_budget=oracle_budget,
+        geometry_min_distance=geometry_min_distance,
         use_mattergen=use_mattergen,
         mattergen_pretrained=mattergen_pretrained,
         mattergen_sampling_config_name=mattergen_sampling_config_name,
         mattergen_batch_size=mattergen_batch_size,
         mattergen_model_path=mattergen_model_path if mattergen_model_path else None,
+        thermodynamics_reference_set_path=(thermodynamics_reference_set_path or None),
+        thermodynamics_retain_threshold_ev_per_atom=thermodynamics_retain_threshold_ev_per_atom,
+        thermodynamics_stable_threshold_ev_per_atom=thermodynamics_stable_threshold_ev_per_atom,
     )
 
     campaign = MaterialsDiscoveryCampaign(config)
@@ -172,13 +217,17 @@ if run_button:
         results = _run_campaign_ui(
             campaign_name=campaign_name,
             domain=domain,
-            target_stability=target_stability,
-            target_formation_energy=target_formation_energy,
             element_list=element_list,
             max_atoms=max_atoms,
             iterations=iterations,
             candidates_per_iteration=candidates_per_iteration,
+            proposal_budget=proposal_budget,
+            oracle_budget=oracle_budget,
+            geometry_min_distance=geometry_min_distance,
             use_career_memory=use_career_memory,
+            memory_mode=memory_mode,
+            memory_seed=memory_seed,
+            run_mode=run_mode,
             use_validation=use_validation,
             validation_top_k=validation_top_k,
             use_synthesis=use_synthesis,
@@ -187,6 +236,9 @@ if run_button:
             mattergen_sampling_config_name=mattergen_sampling_config_name,
             mattergen_batch_size=mattergen_batch_size,
             mattergen_model_path=mattergen_model_path,
+            thermodynamics_reference_set_path=thermodynamics_reference_set_path,
+            thermodynamics_retain_threshold_ev_per_atom=thermodynamics_retain_threshold_ev_per_atom,
+            thermodynamics_stable_threshold_ev_per_atom=thermodynamics_stable_threshold_ev_per_atom,
         )
 
     progress.progress(100, text="Campaign complete")
@@ -210,7 +262,18 @@ if run_button:
     col5.metric("Validated", results.get("total_validated", 0))
     col6.metric("Converged", results.get("total_converged", 0))
     col7.metric("Synthesis Feasible", results.get("total_synthesis_feasible", 0))
-    col8.metric("Best Validated Stability", f"{results.get('best_validated_stability_ever', 0):.3f}")
+    col8.metric("Thermodynamics", "pending hull oracle")
+
+    st.subheader("Geometry and Oracle Budget")
+    budget_cols = st.columns(6)
+    budget_cols[0].metric("Proposals", results.get("proposals_generated", results.get("total_generated", 0)))
+    budget_cols[1].metric("Geometry valid", results.get("geometry_valid", 0))
+    budget_cols[2].metric("Invalid geometry", results.get("invalid_geometry", 0))
+    budget_cols[3].metric("Oracle evaluations", results.get("oracle_evaluations", 0))
+    budget_cols[4].metric("Proposal remaining", results.get("proposal_budget_remaining", "unlimited"))
+    budget_cols[5].metric("Oracle remaining", results.get("oracle_budget_remaining", "unlimited"))
+    if results.get("termination_reason"):
+        st.caption(f"Termination: {results['termination_reason']}")
 
     # Load the latest checkpoint for per-iteration details
     output_dir = Path(f"./campaigns/{domain}")
@@ -312,7 +375,7 @@ if run_button:
                         "converged": insights.get("num_converged"),
                         "synthesis_feasible": insights.get("num_synthesis_feasible"),
                         "best_score": insights.get("best_score"),
-                        "best_validated_stability": insights.get("best_validated_stability"),
+                        "thermodynamics_available": insights.get("thermodynamics_metrics_available", False),
                     })
             if history:
                 hist_df = pd.DataFrame(history).drop_duplicates("iteration")

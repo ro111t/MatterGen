@@ -22,6 +22,15 @@ import warnings
 
 import numpy as np
 
+from agents.integrity import (
+    FORCE_KEY,
+    STRESS_KEY,
+    VALIDATION_ENERGY_KEY,
+    RunMode,
+    canonicalize_validation_properties,
+    normalize_run_mode,
+)
+
 try:
     from ase import Atoms
     from ase.calculators.calculator import Calculator as ASECalculator
@@ -49,6 +58,12 @@ class ValidationResult:
     properties: Dict[str, float] = field(default_factory=dict)
     cost_hours: float = 0.0
     error_message: str = ""
+    scientific_validity: str = "demo_only"
+
+    def __post_init__(self) -> None:
+        self.properties = canonicalize_validation_properties(
+            self.properties, calculator=str(self.calculator)
+        )
 
 
 class ValidationAgent:
@@ -73,7 +88,10 @@ class ValidationAgent:
         properties_to_compute: Optional[List[str]] = None,
         max_relax_steps: int = 100,
         fmax: float = 0.05,
+        run_mode: RunMode | str = RunMode.DEVELOPMENT,
+        mode: Optional[str] = None,
     ):
+        self.run_mode = normalize_run_mode(mode if mode is not None else run_mode)
         self.calculator_name = calculator if isinstance(calculator, str) else "ase"
         self.calculator = calculator if not isinstance(calculator, str) else None
         self.n_workers = max(1, n_workers)
@@ -91,6 +109,10 @@ class ValidationAgent:
         if isinstance(self.calculator, str):
             name = self.calculator.lower()
             if name == "mock":
+                if self.run_mode == RunMode.RESEARCH:
+                    raise RuntimeError(
+                        "Research mode requires a configured scientific validation calculator; mock validation is not allowed."
+                    )
                 return "mock"
             if name == "vasp":
                 return self._init_vasp()
@@ -100,9 +122,17 @@ class ValidationAgent:
                 return self._init_gpaw()
             raise ValueError(f"Unknown calculator backend: {self.calculator}")
         if self.calculator is None:
+            if self.run_mode == RunMode.RESEARCH:
+                raise RuntimeError(
+                    "Research mode requires an explicit scientific validation calculator; None would select mock validation."
+                )
             return "mock"
         if HAS_ASE and isinstance(self.calculator, ASECalculator):
             return self.calculator
+        if self.run_mode == RunMode.RESEARCH:
+            raise RuntimeError(
+                "Research mode received an unavailable validation calculator object; refusing mock substitution."
+            )
         return "mock"
 
     def _init_vasp(self):
@@ -110,6 +140,10 @@ class ValidationAgent:
             from ase.calculators.vasp import Vasp
             return Vasp()
         except Exception as e:
+            if self.run_mode == RunMode.RESEARCH:
+                raise RuntimeError(
+                    f"VASP calculator initialization failed in research mode: {e}"
+                ) from e
             warnings.warn(f"VASP calculator init failed: {e}. Using mock mode.")
             return "mock"
 
@@ -118,6 +152,10 @@ class ValidationAgent:
             from ase.calculators.espresso import Espresso
             return Espresso(command="pw.x < PREFIX.pwi > PREFIX.pwo")
         except Exception as e:
+            if self.run_mode == RunMode.RESEARCH:
+                raise RuntimeError(
+                    f"Quantum ESPRESSO calculator initialization failed in research mode: {e}"
+                ) from e
             warnings.warn(f"Quantum ESPRESSO calculator init failed: {e}. Using mock mode.")
             return "mock"
 
@@ -126,6 +164,10 @@ class ValidationAgent:
             from gpaw import GPAW
             return GPAW()
         except Exception as e:
+            if self.run_mode == RunMode.RESEARCH:
+                raise RuntimeError(
+                    f"GPAW calculator initialization failed in research mode: {e}"
+                ) from e
             warnings.warn(f"GPAW calculator init failed: {e}. Using mock mode.")
             return "mock"
 
@@ -144,6 +186,8 @@ class ValidationAgent:
         sid = structure_id or self._structure_id(structure)
 
         if self._backend == "mock":
+            if self.run_mode == RunMode.RESEARCH:
+                raise RuntimeError("Research mode cannot execute mock validation.")
             return self._mock_validate(structure, sid, props)
 
         if not HAS_ASE:
@@ -295,17 +339,17 @@ class ValidationAgent:
 
         properties: Dict[str, float] = {}
         if "energy" in properties_to_compute:
-            properties["energy"] = energy
+            properties["total_energy_ev"] = energy
         if "forces" in properties_to_compute:
-            properties["forces"] = max_force
+            properties[FORCE_KEY] = max_force
         if "stress" in properties_to_compute:
-            properties["stress"] = max_stress
+            properties[STRESS_KEY] = max_stress
         if "band_gap" in properties_to_compute:
             properties["band_gap"] = band_gap
 
         # Formation energy per atom (fake but consistent)
-        properties["formation_energy_per_atom"] = energy / max(n_atoms, 1)
-        properties["stability"] = -abs(properties["formation_energy_per_atom"])
+        properties[VALIDATION_ENERGY_KEY] = energy / max(n_atoms, 1)
+        properties["energy_semantics"] = "mock_raw_per_atom"
 
         # Mock cost: ~1-6 CPU hours per structure
         cost_hours = float(rng.uniform(1.0, 6.0))
@@ -351,15 +395,15 @@ class ValidationAgent:
 
             properties: Dict[str, float] = {}
             if "energy" in properties_to_compute:
-                properties["energy"] = energy
+                properties["total_energy_ev"] = energy
             if "forces" in properties_to_compute:
-                properties["forces"] = max_force
+                properties[FORCE_KEY] = max_force
             if "stress" in properties_to_compute:
-                properties["stress"] = max_stress
+                properties[STRESS_KEY] = max_stress
 
             n_atoms = len(atoms)
-            properties["formation_energy_per_atom"] = energy / max(n_atoms, 1)
-            properties["stability"] = -abs(properties["formation_energy_per_atom"])
+            properties[VALIDATION_ENERGY_KEY] = energy / max(n_atoms, 1)
+            properties["energy_semantics"] = "raw_per_atom"
 
             # Very rough wall-time cost estimate
             elapsed_hours = (time.time() - start) / 3600.0
@@ -387,6 +431,7 @@ class ValidationAgent:
         return {
             "calculator": self.calculator_name,
             "backend_type": "mock" if self._backend == "mock" else "ase",
+            "run_mode": self.run_mode.value,
             "n_workers": self.n_workers,
             "properties_to_compute": self.properties_to_compute,
         }

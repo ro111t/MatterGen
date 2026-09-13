@@ -1,4 +1,4 @@
-from typing import Dict, List, Any, Optional
+from typing import Dict, List, Any, Optional, Sequence
 from dataclasses import dataclass, field
 import json
 import os
@@ -10,6 +10,7 @@ except ImportError:
     HAS_OPENAI = False
 
 from agents.career_memory import CareerMemory
+from agents.transferable_memory import TransferableFeatures, extract_transferable_features
 
 
 @dataclass
@@ -30,20 +31,29 @@ class OrchestratorAgent:
     """
 
     def __init__(self, career_memory: Optional[CareerMemory] = None,
-                 api_key: Optional[str] = None):
+                 api_key: Optional[str] = None,
+                 memory_mode: str = "structured_provenance",
+                 memory_seed: int = 0,
+                 allow_llm: bool = True,
+                 locked_elements: Optional[Sequence[str]] = None):
         self.career_memory = career_memory
+        self.memory_mode = memory_mode
+        self.memory_seed = int(memory_seed)
+        self.allow_llm = allow_llm
+        self.locked_elements = [str(el) for el in locked_elements] if locked_elements is not None else None
         self.current_strategy = None
         self.current_hypothesis_ids: List[str] = []
 
-        # Initialize OpenAI client
-        key = api_key or os.environ.get('OPENAI_API_KEY')
-        if HAS_OPENAI and key:
+        # Initialize OpenAI client only when allow_llm is True
+        key = api_key if api_key is not None else (os.environ.get('OPENAI_API_KEY') if allow_llm else None)
+        if HAS_OPENAI and key and allow_llm:
             self.llm = OpenAI(api_key=key)
             self.llm_available = True
         else:
             self.llm = None
             self.llm_available = False
-            print("  [Orchestrator] No OpenAI key — using heuristic planning")
+            if allow_llm:
+                print("  [Orchestrator] No OpenAI key — using heuristic planning")
         
     def plan_campaign(self, objective: CampaignObjective) -> Dict[str, Any]:
         """
@@ -52,9 +62,30 @@ class OrchestratorAgent:
         warm_start = self._get_career_warm_start(objective)
         prompt = self._build_planning_prompt(objective, warm_start)
         strategy = self._call_llm_for_strategy(prompt)
+        # Keep the initial planning API behaviorally aligned with iteration
+        # planning: structured/control views can affect only the same bounded
+        # policy channel, while none/text remain non-executable.
+        transfer = self._get_transferable_directives(objective)
+        if transfer.get("directives") and self.memory_mode in {"structured_provenance", "shuffled_control"}:
+            strategy["memory_directives"] = transfer["directives"]
+        strategy = self._apply_transfer_policy(strategy, transfer)
+        strategy["memory_directive_audit"] = {
+            "mode": self.memory_mode,
+            "seed": self.memory_seed,
+            "applied": [item["record_id"] for item in transfer.get("applied", [])],
+            "rejected": [
+                {"record_id": item["record_id"], "reasons": item["reasons"]}
+                for item in transfer.get("rejected", [])
+            ],
+            "scientific_decision_support": transfer.get("scientific_decision_support", True),
+            "unsupported": transfer.get("unsupported", []),
+            "shuffle_audit": transfer.get("shuffle_audit"),
+        }
+        if self.locked_elements is not None:
+            strategy["elements"] = list(self.locked_elements)
         self.current_strategy = strategy
         return strategy
-        
+
     def plan_iteration(self, objective: CampaignObjective, history: List[Dict],
                         campaign_id: str = "", iteration: int = 0,
                         recommendations: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
@@ -68,11 +99,15 @@ class OrchestratorAgent:
         career_context = ""
         hypothesis_basis = ""
         source_principle_ids = []
-        if self.career_memory:
+        # ``none`` is a true no-memory ablation.  The shuffled control is
+        # likewise isolated to its mismatched transferable corpus so that
+        # ordinary career principles cannot leak a second, unshuffled signal
+        # into the control arm.
+        if self.career_memory and self.memory_mode not in {"none", "shuffled_control"}:
             principles = self.career_memory.get_relevant_principles(
                 domain=objective.domain,
                 property_target=list(objective.target_properties.keys())[0]
-                    if objective.target_properties else 'stability'
+                    if objective.target_properties else 'screening_quality'
             )
             cross_domain = self.career_memory.get_cross_domain_insights(
                 target_domain=objective.domain
@@ -99,6 +134,19 @@ class OrchestratorAgent:
 
             hypothesis_basis = career_context
 
+        # Fetch the configured memory view before constructing the planning
+        # prompt so text/control context genuinely enters planning.
+        transfer = self._get_transferable_directives(objective, target_campaign_id=campaign_id)
+        if transfer.get("text_summary"):
+            career_context += "\nTRANSFERABLE MEMORY TEXT VIEW (context only; not executable):\n" + transfer["text_summary"]
+        if self.memory_mode == "structured_provenance" and transfer.get("directives"):
+            career_context += "\nSTRUCTURED TRANSFERABLE MEMORY (bounded, cited planner hints):\n"
+            for directive in transfer["directives"][:8]:
+                career_context += "  - " + json.dumps(directive, sort_keys=True, default=str) + "\n"
+        if transfer.get("memory_view"):
+            career_context += "\nTRANSFERABLE MEMORY CONTROL VIEW (invalid for scientific decisions):\n" + json.dumps(transfer["memory_view"], sort_keys=True, default=str)
+        hypothesis_basis = career_context
+
         prompt = f"""You are a materials science AI planning iteration {iteration} of a discovery campaign.
 
 OBJECTIVE:
@@ -113,20 +161,47 @@ Based on this, design the generation strategy for the next batch.
 Respond ONLY with JSON with these keys:
 - elements: list of element symbols to focus on (3-5 elements)
 - num_candidates: integer (suggest 10-30 for local testing)
-- screening_criteria: dict with max_formation_energy, max_forces, min_stability
+- screening_criteria: dict with max_force_ev_per_angstrom and optional max_stress_gpa
 - diversity_weight: float 0-1
 - rationale: one sentence explanation
 - hypothesis: one testable scientific hypothesis for this iteration
 
 Example:
 {{"elements": ["Li", "P", "S", "Cl"], "num_candidates": 20,
-  "screening_criteria": {{"max_formation_energy": 2.0, "max_forces": 1.0}},
+  "screening_criteria": {{"max_force_ev_per_angstrom": 1.0, "max_stress_gpa": 5.0}},
   "diversity_weight": 0.4,
   "rationale": "Argyrodite Li-P-S-Cl space has strong literature support.",
-  "hypothesis": "Cl substitution in Li6PS5X improves stability scores above 15."}}"""
+  "hypothesis": "Cl substitution changes the fraction of geometrically plausible generated structures."}}"""
 
         strategy = self._call_llm_for_strategy(prompt)
         strategy = self._validate_strategy(strategy, objective, recommendations=recommendations)
+        transfer_declaration = (
+            (objective.constraints or {}).get("memory_transfer_declaration")
+            or (objective.constraints or {}).get("transferability")
+            or (objective.constraints or {}).get("memory_transfer")
+        )
+        if transfer_declaration:
+            # This is copied from user/task configuration, never inferred from
+            # the source formula or element names.
+            strategy["memory_transfer_declaration"] = transfer_declaration
+        # Structured memory directives are advisory planner inputs only.  They
+        # carry evidence/principle/campaign citations and explicit rejection
+        # reasons; no directive can relax geometry or thermodynamic gates.
+        if transfer["directives"]:
+            strategy["memory_directives"] = transfer["directives"]
+        strategy = self._apply_transfer_policy(strategy, transfer)
+        strategy["memory_directive_audit"] = {
+            "mode": self.memory_mode,
+            "seed": self.memory_seed,
+            "applied": [item["record_id"] for item in transfer.get("applied", [])],
+            "rejected": [
+                {"record_id": item["record_id"], "reasons": item["reasons"]}
+                for item in transfer.get("rejected", [])
+            ],
+            "scientific_decision_support": transfer.get("scientific_decision_support", True),
+            "unsupported": transfer.get("unsupported", []),
+            "shuffle_audit": transfer.get("shuffle_audit"),
+        }
 
         # Record hypothesis in career memory
         if self.career_memory and campaign_id and strategy.get('hypothesis'):
@@ -143,9 +218,11 @@ Example:
         else:
             self.current_hypothesis_ids = []
 
+        if self.locked_elements is not None:
+            strategy["elements"] = list(self.locked_elements)
         self.current_strategy = strategy
         return strategy
-        
+
     def interpret_results(self, batch_results: Dict[str, Any]) -> str:
         """
         Generate natural language interpretation of batch results.
@@ -156,14 +233,13 @@ Example:
             rate = batch_results.get('screening_rate', batch_results.get('success_rate', 0.0))
             return (
                 f"Generated {n_gen} candidates, {n_scr} passed screening "
-                f"({rate:.1%} pass rate). "
-                f"Avg stability: {batch_results.get('avg_stability', 0):.3f} eV/atom."
+                f"({rate:.1%} pass rate). Thermodynamic metrics are unavailable."
             )
 
         prompt = f"""Analyze these materials discovery results briefly (2-3 sentences):
 - Generated: {batch_results.get('num_generated', 0)} candidates
 - Passed screening: {batch_results.get('num_passed', batch_results.get('num_screened', 0))} ({batch_results.get('screening_rate', batch_results.get('success_rate', 0.0)):.1%})
-- Avg stability: {batch_results.get('avg_stability', 0):.3f} eV/atom
+- Thermodynamic metrics: unavailable until a reference-set calculation is configured
 - Successful: {batch_results.get('num_successful', 0)}
 
 Focus on: what worked, what failed, one concrete recommendation."""
@@ -205,7 +281,7 @@ Focus on: what worked, what failed, one concrete recommendation."""
         
     def _get_career_warm_start(self, objective: CampaignObjective) -> str:
         """Query CareerMemory for relevant past experience."""
-        if not self.career_memory:
+        if not self.career_memory or self.memory_mode in {"none", "shuffled_control"}:
             return ""
 
         summary = self.career_memory.get_career_summary()
@@ -217,7 +293,7 @@ Focus on: what worked, what failed, one concrete recommendation."""
         principles = self.career_memory.get_relevant_principles(
             domain=objective.domain,
             property_target=list(objective.target_properties.keys())[0]
-                if objective.target_properties else 'stability'
+                if objective.target_properties else 'screening_quality'
         )
         if principles:
             context += "Known principles:\n"
@@ -236,7 +312,116 @@ Focus on: what worked, what failed, one concrete recommendation."""
             for c in top:
                 context += f"  - {c['formula']} (score={c['score']:.2f})\n"
 
+        transfer = self._get_transferable_directives(objective)
+        if transfer.get("text_summary"):
+            context += "Transferable memory text view (context only; not executable):\n"
+            context += transfer["text_summary"] + "\n"
+        elif transfer.get("memory_view"):
+            context += "Transferable memory shuffled control (invalid for scientific decisions):\n"
+            context += json.dumps(transfer["memory_view"], sort_keys=True, default=str) + "\n"
+        elif transfer.get("directives"):
+            context += "Transferable structure directives (bounded hints; gates remain mandatory):\n"
+            for directive in transfer["directives"][:3]:
+                context += f"  - {json.dumps(directive, sort_keys=True, default=str)}\n"
+
         return context
+
+    def _get_transferable_directives(self, objective: CampaignObjective, target_campaign_id: Optional[str] = None) -> Dict[str, Any]:
+        """Query structure-aware memory using an explicit, conservative target."""
+        empty = {
+            "applied": [], "rejected": [], "directives": [], "record_count": 0,
+            "scientific_decision_support": self.memory_mode != "shuffled_control",
+            "control_only": self.memory_mode == "shuffled_control",
+            "unsupported": [], "shuffle_audit": None,
+        }
+        if not self.career_memory or self.memory_mode == "none":
+            return empty
+        constraints = objective.constraints or {}
+        supplied = constraints.get("transferable_features") or constraints.get("memory_query_features")
+        if supplied:
+            target_features = TransferableFeatures.from_dict(supplied)
+        else:
+            elements = constraints.get("elements", [])
+            target_features = extract_transferable_features({"elements": elements})
+        if self.memory_mode == "text_summary":
+            # Text is useful context for an LLM but cannot be converted back
+            # into an executable scientific directive.
+            view = self.career_memory.memory_view(self.memory_mode, seed=self.memory_seed, target_campaign_id=target_campaign_id)
+            empty["text_summary"] = view.get("text", "")
+            empty["rejected"] = view.get("chronology_rejected", [])
+            return empty
+        if self.memory_mode == "shuffled_control":
+            view = self.career_memory.memory_view(self.memory_mode, seed=self.memory_seed, target_campaign_id=target_campaign_id)
+            empty["memory_view"] = view
+            audit = view.get("shuffle_audit")
+            empty["shuffle_audit"] = audit
+            empty["rejected"] = view.get("chronology_rejected", [])
+            valid_derangement = bool(
+                isinstance(audit, dict) and audit.get("valid") is True
+                and int(audit.get("fixed_points", -1)) == 0
+            )
+            if view.get("records") and valid_derangement:
+                from agents.transferable_memory import TransferableMemoryRecord, make_directive
+                empty["directives"] = [make_directive(TransferableMemoryRecord.from_dict(item)) for item in view["records"]]
+                empty["applied"] = [{"record_id": d["record_id"], "reasons": ["SHUFFLED_CONTROL_POLICY_ONLY"]} for d in empty["directives"]]
+                empty["unsupported"] = [{"record_id": d["record_id"], "reasons": ["CONTROL_ONLY_NOT_SCIENTIFIC_DECISION_SUPPORT"]} for d in empty["directives"]]
+            elif view.get("records"):
+                empty["rejected"].append({
+                    "record_id": "SHUFFLED_CONTROL",
+                    "reasons": ["INVALID_OR_NON_DERANGED_SHUFFLE_AUDIT"],
+                })
+            return empty
+        result = self.career_memory.get_transferable_directives(
+            target_features=target_features,
+            target_domain=objective.domain,
+            target_elements=constraints.get("elements"),
+            target_campaign_id=target_campaign_id,
+        )
+        result["scientific_decision_support"] = True
+        return result
+
+    @staticmethod
+    def _apply_transfer_policy(strategy: Dict[str, Any], transfer: Dict[str, Any]) -> Dict[str, Any]:
+        """Apply only bounded exploration/exploitation hints to planning."""
+        directives = transfer.get("directives", [])
+        control_only = bool(transfer.get("control_only", False))
+        if control_only:
+            audit = transfer.get("shuffle_audit")
+            if not (
+                isinstance(audit, dict) and audit.get("valid") is True
+                and int(audit.get("fixed_points", -1)) == 0
+            ):
+                directives = []
+        usable = [d for d in directives if d.get("exploration_weight") is not None or d.get("exploitation_weight") is not None]
+        if not usable:
+            strategy["memory_policy"] = {
+                "applied": [], "supported_effects": [],
+                "unsupported_effects": transfer.get("unsupported", []),
+                "control_only": control_only,
+            }
+            return strategy
+        exploration = sum(float(d.get("exploration_weight") or 0.0) for d in usable) / len(usable)
+        exploitation = sum(float(d.get("exploitation_weight") or 0.0) for d in usable) / len(usable)
+        # Diversity is a planning policy knob only; all geometry, hull, and
+        # dual-budget gates remain owned by downstream stages.
+        base = float(strategy.get("diversity_weight", 0.4))
+        strategy["diversity_weight"] = min(0.8, max(0.1, 0.5 * base + 0.5 * exploration))
+        strategy["memory_policy"] = {
+            "applied": [d.get("record_id") for d in usable],
+            "supported_effects": ["diversity_weight", "exploration_weight", "exploitation_weight"],
+            "exploration_weight": min(0.8, max(0.0, exploration)),
+            "exploitation_weight": min(1.0, max(0.0, exploitation)),
+            "unsupported_effects": transfer.get("unsupported", []),
+            # A valid shuffled arm deliberately exercises the same bounded
+            # policy surface with deranged record/response pairings.  It is a
+            # negative experimental control, never scientific decision support.
+            "control_only": control_only,
+            "scientific_decision_support": not control_only,
+            "bounded": True,
+            "bypasses_geometry_gate": False,
+            "bypasses_thermodynamic_gate": False,
+        }
+        return strategy
 
     def _build_planning_prompt(self, objective: CampaignObjective,
                                 warm_start: str = "") -> str:
@@ -294,13 +479,11 @@ Respond ONLY with JSON with keys:
             'elements': ['Li', 'P', 'S', 'O'],
             'num_candidates': 15,
             'screening_criteria': {
-                'max_formation_energy': 5.0,
-                'max_forces': 500.0,
-                'min_stability': -20.0,
+                'max_force_ev_per_angstrom': 500.0,
             },
             'diversity_weight': 0.4,
             'rationale': 'Default Li-P-S-O space for solid electrolytes.',
-            'hypothesis': 'Li-P-S compositions with low formation energy will pass screening.'
+            'hypothesis': 'Li-P-S compositions will produce distinct geometric screening yields.'
         }
         
     def _validate_strategy(self, strategy: Dict[str, Any],
@@ -325,9 +508,12 @@ Respond ONLY with JSON with keys:
         # Generated structures are unrelaxed, so CHGNet will report large forces.
         # Enforce lenient screening defaults so candidates reach validation.
         criteria = strategy.get('screening_criteria', {})
-        criteria['max_formation_energy'] = max(float(criteria.get('max_formation_energy', 5.0)), 5.0)
-        criteria['max_forces'] = max(float(criteria.get('max_forces', 500.0)), 100.0)
-        criteria['min_stability'] = min(float(criteria.get('min_stability', -20.0)), -10.0)
+        # Raw model energy is diagnostic-only until a thermodynamic reference
+        # set is configured; never inject an energy threshold into screening.
+        criteria.pop('max_predicted_energy_per_atom_ev', None)
+        criteria['max_force_ev_per_angstrom'] = max(
+            float(criteria.get('max_force_ev_per_angstrom', 500.0)), 100.0
+        )
         strategy['screening_criteria'] = criteria
 
         return strategy

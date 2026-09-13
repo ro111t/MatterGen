@@ -99,6 +99,29 @@ SCHEMA_HYPOTHESES = """
     )
 """
 
+# Structure-aware schema-v2 evidence is additive.  Keeping it in a separate
+# table lets old CareerMemory databases open without rewriting or silently
+# upgrading their legacy rows.  A row's JSON payload is canonical and carries
+# the typed descriptor/applicability/directive records.
+SCHEMA_TRANSFERABLE_RECORDS = """
+    CREATE TABLE IF NOT EXISTS transferable_records (
+        record_id          TEXT PRIMARY KEY,
+        schema_version     TEXT NOT NULL,
+        evidence_hash      TEXT NOT NULL UNIQUE,
+        source_domain      TEXT NOT NULL,
+        campaign_ids       TEXT NOT NULL DEFAULT '[]',
+        source_candidate_ids TEXT NOT NULL DEFAULT '[]',
+        source_formulas    TEXT NOT NULL DEFAULT '[]',
+        outcome_label      TEXT NOT NULL DEFAULT 'unknown',
+        outcome_value      REAL,
+        evidence_count     INTEGER NOT NULL DEFAULT 1,
+        confidence         REAL NOT NULL DEFAULT 0.0,
+        finalized          INTEGER NOT NULL DEFAULT 0,
+        payload            TEXT NOT NULL,
+        created_at         REAL
+    )
+"""
+
 ALL_SCHEMAS = [
     SCHEMA_CAMPAIGNS,
     SCHEMA_PRINCIPLES,
@@ -106,4 +129,5 @@ ALL_SCHEMAS = [
     SCHEMA_CROSS_DOMAIN,
     SCHEMA_CANDIDATES,
     SCHEMA_HYPOTHESES,
+    SCHEMA_TRANSFERABLE_RECORDS,
 ]
