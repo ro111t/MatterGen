@@ -8,6 +8,7 @@ import hashlib
 import json
 from pathlib import Path
 import sqlite3
+import subprocess
 
 import pytest
 
@@ -74,10 +75,14 @@ def test_preflight_rejects_dirty_research_and_reference_hash_failure(tmp_path, m
     object.__setattr__(bad, "reference_set_certified", True)
     object.__setattr__(spec, "run_mode", "research")
     object.__setattr__(spec, "generation_backend", "mattergen")
-    monkeypatch.setattr(
-        "experiments.cli.subprocess.check_output",
-        lambda cmd, **k: "HEAD" if "rev-parse" in cmd else "experiments/dirty.py",
-    )
+    real_check_output = subprocess.check_output
+
+    def _fake_check_output(cmd, **kwargs):
+        if isinstance(cmd, (list, tuple)) and cmd and cmd[0] == "git":
+            return "HEAD" if any("rev-parse" in str(arg) for arg in cmd) else "experiments/dirty.py"
+        return real_check_output(cmd, **kwargs)
+
+    monkeypatch.setattr("experiments.cli.subprocess.check_output", _fake_check_output)
     object.__setattr__(spec, "code_commit", "HEAD")
     with pytest.raises(RuntimeError, match="Preflight validation failed"):
         run_preflight_check(spec)
