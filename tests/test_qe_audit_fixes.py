@@ -281,7 +281,7 @@ def test_runner_passes_allow_llm_orchestration_to_campaign_config(tmp_path):
         experiment_id="test_exp",
         task_id="Li-P-S",
         elements=["Li", "P", "S"],
-        condition="adaptive_no_memory",
+        condition="source_neutral",
         seed=42,
         iteration_seeds=[42],
         proposal_budget=10,

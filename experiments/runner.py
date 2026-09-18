@@ -18,7 +18,7 @@ from agents.orchestrator import CampaignObjective
 from agents.thermodynamics import load_frozen_reference_set
 from campaign import CampaignConfig, MaterialsDiscoveryCampaign
 from experiments.memory_snapshots import MemorySnapshotManager, compute_file_sha256
-from experiments.spec import MEMORY_ARMS, RunSpec, compute_sha256
+from experiments.spec import FIVE_CONDITIONS, MEMORY_ARMS, RunSpec, compute_sha256
 
 logger = logging.getLogger(__name__)
 
@@ -487,7 +487,10 @@ class CampaignRunner:
                 validation_calculator=spec.validation_calculator,
                 synthesis_mode=spec.synthesis_mode,
                 locked_elements=list(spec.elements),
-                allow_llm_orchestration=getattr(spec, "allow_llm_orchestration", True))
+                allow_llm_orchestration=(
+                    False if spec.condition in FIVE_CONDITIONS
+                    else getattr(spec, "allow_llm_orchestration", True)
+                ))
             start = time.time()
             campaign = MaterialsDiscoveryCampaign(config=config)
             if spec.condition == "random_mattergen":

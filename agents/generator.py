@@ -170,6 +170,7 @@ class MattergenGenerator:
         elements: Optional[List[str]] = None,
         target_properties: Optional[Dict[str, Any]] = None,
         seed: Optional[int] = None,
+        target_compositions_dict: Optional[List[Dict[str, float]]] = None,
     ) -> List[Any]:
         """Generate up to num_candidates structures."""
         if num_candidates < 1:
@@ -198,7 +199,7 @@ class MattergenGenerator:
         if target_properties:
             properties.update(target_properties)
 
-        target_comps = list(self.target_compositions)
+        target_comps = list(target_compositions_dict if target_compositions_dict is not None else self.target_compositions)
         if elements and not target_comps and not properties and "chemical_system" in allowed_cond:
             # Best-effort chemical-system conditioning when supported by model
             system = "-".join(sorted(elements))
@@ -297,6 +298,8 @@ class GenerationAgent:
         domain: str = "",
         memory_directives: Optional[List[Dict[str, Any]]] = None,
         directives: Optional[List[Dict[str, Any]]] = None,
+        target_compositions_dict: Optional[List[Dict[str, float]]] = None,
+        diversity_weight: float = 0.4,
     ) -> List[Any]:
         """
         Generate num_candidates structures using the given elements.
@@ -306,19 +309,23 @@ class GenerationAgent:
             num_candidates: How many structures to produce
             seed: Random seed for reproducibility
             domain: Optional domain hint for prototype selection
+            target_compositions_dict: Optional list of target compositions for memory conditioning
+            diversity_weight: Policy diversity weight used for provenance/audit
 
         Returns:
             List of pymatgen Structure objects (or stub dicts if pymatgen unavailable)
         """
         start_idx = self._total_generated
         self.last_memory_directives = list(memory_directives or directives or [])
+        self.last_target_compositions_dict = list(target_compositions_dict or [])
+        self.last_diversity_weight = float(diversity_weight)
         backend = "pymatgen_mock" if HAS_PYMATGEN else "stub"
         if self.use_mattergen and self._mattergen is not None:
             try:
                 try:
-                    structures = self._mattergen.generate(num_candidates, elements=elements, seed=seed)
+                    structures = self._mattergen.generate(num_candidates, elements=elements, seed=seed, target_compositions_dict=target_compositions_dict)
                 except TypeError:
-                    structures = self._mattergen.generate(num_candidates, elements=elements)
+                    structures = self._mattergen.generate(num_candidates, elements=elements, target_compositions_dict=target_compositions_dict)
                 backend = "mattergen"
             except Exception as e:
                 if self.run_mode == RunMode.RESEARCH:
@@ -329,10 +336,10 @@ class GenerationAgent:
                     f"  [Generator] MatterGen generation failed ({e}); "
                     "falling back to mock for this batch"
                 )
-                structures = self._generate_pymatgen_fallback(elements, num_candidates, seed, start_idx=start_idx)
+                structures = self._generate_pymatgen_fallback(elements, num_candidates, seed, start_idx=start_idx, target_compositions_dict=target_compositions_dict)
                 backend = "pymatgen_mock" if HAS_PYMATGEN else "stub"
         else:
-            structures = self._generate_pymatgen_fallback(elements, num_candidates, seed, start_idx=start_idx)
+            structures = self._generate_pymatgen_fallback(elements, num_candidates, seed, start_idx=start_idx, target_compositions_dict=target_compositions_dict)
 
         # Tag each structure with an immutable candidate ID at birth
         for i, struct in enumerate(structures):
@@ -357,29 +364,33 @@ class GenerationAgent:
     def _generate_pymatgen_fallback(self, elements: List[str],
                                      num_candidates: int,
                                      seed: int,
-                                     start_idx: int = 0) -> List[Any]:
+                                     start_idx: int = 0,
+                                     target_compositions_dict: Optional[List[Dict[str, float]]] = None) -> List[Any]:
         """Use pymatgen mock (or stub) with a deterministic RNG."""
         rng = random.Random(seed)
         if HAS_PYMATGEN:
-            return self._generate_pymatgen_structures(elements, num_candidates, rng, start_idx=start_idx)
-        return self._generate_stub_structures(elements, num_candidates, rng, start_idx=start_idx)
+            return self._generate_pymatgen_structures(elements, num_candidates, rng, start_idx=start_idx, target_compositions_dict=target_compositions_dict)
+        return self._generate_stub_structures(elements, num_candidates, rng, start_idx=start_idx, target_compositions_dict=target_compositions_dict)
 
     def _generate_pymatgen_structures(self, elements: List[str],
                                        num_candidates: int,
                                        rng: random.Random,
-                                       start_idx: int = 0) -> List[Any]:
+                                       start_idx: int = 0,
+                                       target_compositions_dict: Optional[List[Dict[str, float]]] = None) -> List[Any]:
         """Generate realistic mock structures using pymatgen."""
         structures = []
         valid_elements = self._filter_valid_elements(elements)
         if not valid_elements:
             valid_elements = ['Li', 'P', 'S']
 
+        target_compositions_dict = target_compositions_dict or []
         for i in range(num_candidates):
+            target_comp = target_compositions_dict[i] if i < len(target_compositions_dict) else None
             try:
-                struct = self._build_random_structure(valid_elements, rng, i)
+                struct = self._build_random_structure(valid_elements, rng, i, target_composition=target_comp)
                 structures.append(struct)
             except Exception:
-                structures.append(self._build_minimal_structure(valid_elements, rng, i))
+                structures.append(self._build_minimal_structure(valid_elements, rng, i, target_composition=target_comp))
 
         return structures
 
@@ -395,18 +406,33 @@ class GenerationAgent:
         return valid
 
     def _build_random_structure(self, elements: List[str],
-                                 rng: random.Random, idx: int) -> Any:
-        """Build a random crystal structure with given elements."""
-        n_formula_units = rng.choice([1, 2, 4])
-        n_elem_types = rng.randint(2, min(4, len(elements)))
-        chosen = rng.sample(elements, n_elem_types)
+                                 rng: random.Random, idx: int,
+                                 target_composition: Optional[Dict[str, float]] = None) -> Any:
+        """Build a random crystal structure with given elements.
 
-        # Random stoichiometry (small integers)
-        stoich = [rng.choice([1, 2, 3, 4]) for _ in chosen]
+        If target_composition is provided and all of its elements are available,
+        it is used instead of a fully random stoichiometry.  This implements
+        memory-guided mock generation while keeping the same lattice randomness.
+        """
+        n_formula_units = rng.choice([1, 2, 4])
+
+        if (
+            target_composition is not None
+            and all(el in elements for el in target_composition)
+            and any(v > 0 for v in target_composition.values())
+        ):
+            chosen = sorted([el for el in target_composition if target_composition[el] > 0])
+            base_stoich = [max(1, int(round(float(target_composition[el])))) for el in chosen]
+        else:
+            n_elem_types = rng.randint(2, min(4, len(elements)))
+            chosen = sorted(rng.sample(elements, n_elem_types))
+            base_stoich = [rng.choice([1, 2, 3, 4]) for _ in chosen]
+
+        stoich = [n * n_formula_units for n in base_stoich]
         species = []
         coords = []
         for el, n in zip(chosen, stoich):
-            for _ in range(n * n_formula_units):
+            for _ in range(n):
                 species.append(el)
                 coords.append([rng.random(), rng.random(), rng.random()])
 
@@ -423,24 +449,46 @@ class GenerationAgent:
         return struct
 
     def _build_minimal_structure(self, elements: List[str],
-                                  rng: random.Random, idx: int) -> Any:
+                                  rng: random.Random, idx: int,
+                                  target_composition: Optional[Dict[str, float]] = None) -> Any:
         """Fallback: simple cubic with 2 species."""
-        el1 = elements[0]
-        el2 = elements[1] if len(elements) > 1 else elements[0]
+        if (
+            target_composition is not None
+            and all(el in elements for el in target_composition)
+            and any(v > 0 for v in target_composition.values())
+        ):
+            chosen = sorted([el for el in target_composition if target_composition[el] > 0])[:2]
+            if len(chosen) == 1:
+                chosen = chosen * 2
+        else:
+            el1 = elements[0]
+            el2 = elements[1] if len(elements) > 1 else elements[0]
+            chosen = [el1, el2]
         a = rng.uniform(4.0, 8.0)
         lattice = Lattice.cubic(a)
-        return Structure(lattice, [el1, el2],
+        return Structure(lattice, chosen,
                          [[0, 0, 0], [0.5, 0.5, 0.5]])
 
     def _generate_stub_structures(self, elements: List[str],
                                    num_candidates: int,
                                    rng: random.Random,
-                                   start_idx: int = 0) -> List[Dict[str, Any]]:
+                                   start_idx: int = 0,
+                                   target_compositions_dict: Optional[List[Dict[str, float]]] = None) -> List[Dict[str, Any]]:
         """Fallback when pymatgen is unavailable — returns dicts with deterministic rng positions."""
         structs = []
+        target_compositions_dict = target_compositions_dict or []
         for i in range(num_candidates):
-            chosen = rng.sample(elements, min(3, len(elements)))
-            stoich = [rng.randint(1, 4) for _ in chosen]
+            target_comp = target_compositions_dict[i] if i < len(target_compositions_dict) else None
+            if (
+                target_comp is not None
+                and all(el in elements for el in target_comp)
+                and any(v > 0 for v in target_comp.values())
+            ):
+                chosen = sorted([el for el in target_comp if target_comp[el] > 0])
+                stoich = [max(1, int(round(float(target_comp[el])))) for el in chosen]
+            else:
+                chosen = sorted(rng.sample(elements, min(3, len(elements))))
+                stoich = [rng.randint(1, 4) for _ in chosen]
             formula = ''.join(f"{e}{s}" for e, s in zip(chosen, stoich))
             total_atoms = sum(stoich)
             positions = [[rng.random(), rng.random(), rng.random()] for _ in range(total_atoms)]

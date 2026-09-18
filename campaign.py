@@ -52,7 +52,7 @@ from agents.thermodynamics import (
     load_frozen_reference_set,
     threshold_sensitivity,
 )
-from agents.transferable_memory import MEMORY_MODES, prioritize_candidates
+from agents.transferable_memory import MEMORY_MODES, prioritize_candidates, _stable_hash
 
 
 @dataclass
@@ -459,6 +459,35 @@ class MaterialsDiscoveryCampaign:
             if self.iteration == 0 and not self.current_recommendations and self.config.num_candidates:
                 strategy['num_candidates'] = self.config.num_candidates
 
+        # Deterministic seed for this iteration; used by the generator and for
+        # the exploratory target-composition sampling in the strategy policy.
+        if (
+            self.provenance
+            and self.provenance.manifest.iteration_seeds
+            and self.iteration < len(self.provenance.manifest.iteration_seeds)
+        ):
+            iter_seed = self.provenance.manifest.iteration_seeds[self.iteration]
+        else:
+            iter_seed = getattr(self.config, "master_seed", 42) + self.iteration
+
+        # Allow the in-campaign policy to consume the structured memory
+        # directives retrieved by the orchestrator.  It produces the concrete
+        # target-composition conditioning for the generator.
+        policy_recommendations = self.strategy.recommend(
+            objective=self.config.objective,
+            history=self.results_history,
+            directives=strategy.get("memory_directives", []),
+            seed=iter_seed,
+        )
+        if policy_recommendations.get("diversity_weight") is not None:
+            strategy["diversity_weight"] = float(policy_recommendations["diversity_weight"])
+        if policy_recommendations.get("target_compositions_dict") is not None:
+            strategy["target_compositions_dict"] = list(policy_recommendations["target_compositions_dict"])
+        if policy_recommendations.get("num_memory_guided_proposals") is not None:
+            strategy["num_memory_guided_proposals"] = int(policy_recommendations["num_memory_guided_proposals"])
+        if policy_recommendations.get("num_exploratory_proposals") is not None:
+            strategy["num_exploratory_proposals"] = int(policy_recommendations["num_exploratory_proposals"])
+
         remaining_iterations = max(1, self.config.objective.max_iterations - self.iteration)
         strategy_requested_num = strategy.get('num_candidates')
         debt_before = self.backend_generation_shortfall_debt
@@ -501,20 +530,27 @@ class MaterialsDiscoveryCampaign:
                 raise RuntimeError(
                     f"Strategy elements {strat_elems} do not match declared locked chemical system {expected_elems}"
                 )
-        if (
-            self.provenance
-            and self.provenance.manifest.iteration_seeds
-            and self.iteration < len(self.provenance.manifest.iteration_seeds)
-        ):
-            iter_seed = self.provenance.manifest.iteration_seeds[self.iteration]
+        # Truncate the policy's target-composition list to the budget-resolved
+        # number of candidates.  The list is ordered with memory-derived targets
+        # first, then exploratory targets, so truncation preserves priority.
+        requested_target_compositions = strategy.get('target_compositions_dict', [])
+        if isinstance(requested_target_compositions, list):
+            requested_target_compositions = requested_target_compositions[:num_to_gen]
         else:
-            iter_seed = getattr(self.config, "master_seed", 42) + self.iteration
+            requested_target_compositions = []
+
+        raw_n_memory = int(policy_recommendations.get('num_memory_guided_proposals', 0))
+        num_memory_guided = min(num_to_gen, raw_n_memory)
+        num_exploratory = num_to_gen - num_memory_guided
+
         candidates = self.generator.generate_batch(
             elements=strategy.get('elements', ['Li', 'P', 'S', 'O']),
             num_candidates=num_to_gen,
             seed=iter_seed,
             domain=self.config.objective.domain,
             memory_directives=strategy.get('memory_directives', []),
+            target_compositions_dict=requested_target_compositions,
+            diversity_weight=float(strategy.get('diversity_weight', 0.4)),
         )
         # A backend that overproduces has already consumed proposal resources,
         # so silently slicing would make the accounting non-auditable.  Abort
@@ -569,10 +605,19 @@ class MaterialsDiscoveryCampaign:
                 'actual_generated_num_candidates': len(candidates),
                 'requested_num_candidates': num_to_gen,
                 'proposal_budget_remaining': self.budget_tracker.proposal_budget_remaining,
+                'memory_mode': self.config.memory_mode,
                 'memory_directive_ids': [
                     d.get('record_id') for d in strategy.get('memory_directives', [])
                     if d.get('record_id')
                 ],
+                'memory_directive_hashes': [
+                    _stable_hash(d) for d in strategy.get('memory_directives', [])
+                ],
+                'diversity_weight': float(strategy.get('diversity_weight', 0.4)),
+                'target_compositions_dict': requested_target_compositions,
+                'num_memory_guided_proposals': num_memory_guided,
+                'num_exploratory_proposals': num_exploratory,
+                'generation_backend': generation_backend,
             },
             model_name_or_path=self.config.mattergen_model_path if generation_backend == "mattergen" else None,
             checkpoint=self.config.mattergen_pretrained if generation_backend == "mattergen" else None,
@@ -824,9 +869,12 @@ class MaterialsDiscoveryCampaign:
             strategy=strategy,
             insights=insights,
         )
+        next_iter_seed = getattr(self.config, "master_seed", 42) + self.iteration + 1
         self.current_recommendations = self.strategy.recommend(
             objective=self.config.objective,
             history=self.results_history,
+            directives=strategy.get("memory_directives", []),
+            seed=next_iter_seed,
         )
         self._log(f"\n[Strategy] Next iteration recommendation: {self.current_recommendations['rationale']}")
 

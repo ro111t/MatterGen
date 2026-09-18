@@ -121,6 +121,15 @@ def _parse_formula(formula: Any) -> Tuple[Dict[str, float], Optional[str]]:
     return amounts, anon
 
 
+def _element_order_for_anonymous_pattern(amounts: Dict[str, float]) -> List[str]:
+    """Return source elements sorted the same way _parse_formula builds the anonymous pattern."""
+    if not amounts:
+        return []
+    scale = min(v for v in amounts.values() if v > 0)
+    ratios = [(e, round(v / scale, 8)) for e, v in amounts.items()]
+    return [e for e, _ in sorted(ratios, key=lambda x: (-x[1], x[0]))]
+
+
 def _get_formula(structure: Any, result: Any = None) -> Optional[str]:
     if isinstance(structure, Mapping):
         for key in ("composition", "formula", "reduced_formula"):
@@ -989,6 +998,14 @@ def make_directive(record: TransferableMemoryRecord, *, max_exploration: float =
         directive["volume_per_atom_range"] = (max(0.0, value * 0.9), value * 1.1)
     if not directive.get("permitted_element_class_substitutions") and record.applicability.allowed_element_classes:
         directive["permitted_element_class_substitutions"] = dict(record.applicability.allowed_element_classes)
+    # Preserve the source element order and classes so a downstream policy can
+    # map the canonical anonymous stoichiometry back to a concrete target
+    # chemical system through the declared permitted substitutions.
+    source_formula = (record.source_formulas or [None])[0]
+    if source_formula:
+        amounts, _ = _parse_formula(source_formula)
+        directive["source_element_order"] = _element_order_for_anonymous_pattern(amounts)
+    directive["source_element_classes"] = dict(record.features.element_classes or {})
     # Every positive evidence record receives a bounded policy signal derived
     # from its recorded confidence.  This is the only currently supported
     # executable effect; structural preferences remain advisory metadata until

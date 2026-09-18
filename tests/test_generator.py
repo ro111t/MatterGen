@@ -45,7 +45,7 @@ def test_generation_agent_records_mattergen_when_it_succeeds(monkeypatch):
         def __init__(self, **kwargs):
             pass
 
-        def generate(self, num_candidates, elements=None):
+        def generate(self, num_candidates, elements=None, **kwargs):
             return [f"mattergen-{index}" for index in range(num_candidates)]
 
     monkeypatch.setattr(generator, "MattergenGenerator", FakeMattergen)

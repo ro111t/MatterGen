@@ -66,8 +66,9 @@ class OrchestratorAgent:
         # planning: structured/control views can affect only the same bounded
         # policy channel, while none/text remain non-executable.
         transfer = self._get_transferable_directives(objective)
-        if transfer.get("directives") and self.memory_mode in {"structured_provenance", "shuffled_control"}:
-            strategy["memory_directives"] = transfer["directives"]
+        # Always expose the retrieved directives (even if empty) so the
+        # strategy policy can make an explicit no-directive decision.
+        strategy["memory_directives"] = list(transfer.get("directives", []))
         strategy = self._apply_transfer_policy(strategy, transfer)
         strategy["memory_directive_audit"] = {
             "mode": self.memory_mode,
@@ -187,8 +188,7 @@ Example:
         # Structured memory directives are advisory planner inputs only.  They
         # carry evidence/principle/campaign citations and explicit rejection
         # reasons; no directive can relax geometry or thermodynamic gates.
-        if transfer["directives"]:
-            strategy["memory_directives"] = transfer["directives"]
+        strategy["memory_directives"] = list(transfer.get("directives", []))
         strategy = self._apply_transfer_policy(strategy, transfer)
         strategy["memory_directive_audit"] = {
             "mode": self.memory_mode,
@@ -499,6 +499,8 @@ Respond ONLY with JSON with keys:
                 strategy['diversity_weight'] = float(recommendations['diversity_weight'])
             if recommendations.get('screening_criteria'):
                 strategy['screening_criteria'] = recommendations['screening_criteria']
+            if recommendations.get('target_compositions_dict') is not None:
+                strategy['target_compositions_dict'] = list(recommendations['target_compositions_dict'])
 
         strategy['num_candidates'] = min(max(int(strategy.get('num_candidates', 15)), 1), 100)
         strategy['diversity_weight'] = min(max(float(strategy.get('diversity_weight', 0.3)), 0.0), 1.0)
@@ -515,6 +517,9 @@ Respond ONLY with JSON with keys:
             float(criteria.get('max_force_ev_per_angstrom', 500.0)), 100.0
         )
         strategy['screening_criteria'] = criteria
+
+        if 'target_compositions_dict' not in strategy:
+            strategy['target_compositions_dict'] = []
 
         return strategy
         
