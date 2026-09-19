@@ -9,13 +9,14 @@ max iteration count is reached or a success criterion is met.
 
 import argparse
 from collections import Counter
-import json
-import os
-import time
-import uuid
 from dataclasses import dataclass
+import json
+import math
+import os
 from pathlib import Path
+import time
 from typing import Any, Dict, List, Optional, Union
+import uuid
 
 from agents.orchestrator import OrchestratorAgent, CampaignObjective
 from agents.generator import GenerationAgent
@@ -33,6 +34,25 @@ from agents.provenance import (
     RunManifest,
     extract_candidate_id,
 )
+from agents.integrity import (
+    SCREENING_ENERGY_KEY,
+    VALIDATION_ENERGY_KEY,
+    RunMode,
+    ScientificValidity,
+    ScientificPreflightError,
+    build_scientific_preflight,
+    normalize_run_mode,
+    assert_schema_v2_compatible,
+)
+from agents.geometry import DEFAULT_MIN_DISTANCE_ANGSTROM, GeometryValidator
+from agents.budget import DualBudgetTracker
+from agents.thermodynamics import (
+    CHGNetRelaxationEvaluator,
+    ThermodynamicOracle,
+    load_frozen_reference_set,
+    threshold_sensitivity,
+)
+from agents.transferable_memory import MEMORY_MODES, prioritize_candidates
 
 
 @dataclass
@@ -42,10 +62,18 @@ class CampaignConfig:
     objective: CampaignObjective
     output_dir: Path
     master_seed: int = 42
-    career_db_path: str = "~/.matagent_career.db"
+    # A persistent home-directory database silently couples otherwise
+    # independent campaigns.  Experimental runners provide an explicit,
+    # run-local path; the campaign itself derives the same path when the
+    # caller intentionally leaves it unset.
+    career_db_path: Optional[str] = None
     checkpoint_interval: int = 5
     verbose: bool = True
     use_career_memory: bool = True
+    # Experimental memory view controls.  ``shuffled_control`` is explicitly
+    # invalid for scientific decision support and exists only for controls.
+    memory_mode: str = "structured_provenance"
+    memory_seed: int = 0
     use_validation: bool = True
     validation_top_k: int = 5
     use_synthesis: bool = True
@@ -57,6 +85,65 @@ class CampaignConfig:
     mattergen_batch_size: int = 16
     mattergen_sampling_config_path: Optional[str] = None
     mattergen_sampling_config_name: str = "default"
+    # Scientific execution boundary.  Development remains the backwards-
+    # compatible default; research is fail-closed until all capabilities are
+    # explicitly configured.
+    run_mode: RunMode = RunMode.DEVELOPMENT
+    validation_calculator: Any = "mock"
+    synthesis_mode: str = "mock"
+    require_thermodynamics: bool = True
+    thermodynamics_backend: Optional[str] = None
+    thermodynamics_reference_set_path: Optional[str] = None
+    thermodynamics_evaluator: Any = None
+    thermodynamics_available: bool = False
+    thermodynamics_retain_threshold_ev_per_atom: float = 0.10
+    thermodynamics_stable_threshold_ev_per_atom: float = 0.03
+    # Resource accounting.  ``None`` keeps the existing unlimited development
+    # behavior; research runs must provide explicit positive limits.
+    proposal_budget: Optional[int] = None
+    oracle_budget: Optional[int] = None
+    geometry_min_distance: float = DEFAULT_MIN_DISTANCE_ANGSTROM
+    geometry_minimum_distance: Optional[float] = None
+    # Common aliases accepted for JSON/CLI-era callers.
+    min_distance: Optional[float] = None
+    minimum_distance: Optional[float] = None
+    min_distance_angstrom: Optional[float] = None
+    locked_elements: Optional[List[str]] = None
+    allow_llm_orchestration: bool = True
+
+    def __post_init__(self) -> None:
+        self.run_mode = normalize_run_mode(self.run_mode)
+        if self.memory_mode not in MEMORY_MODES:
+            raise ValueError(f"memory_mode must be one of {MEMORY_MODES}")
+        if isinstance(self.memory_seed, bool):
+            raise ValueError("memory_seed must be an integer")
+        self.memory_seed = int(self.memory_seed)
+        for name in ("proposal_budget", "oracle_budget"):
+            value = getattr(self, name)
+            if value is not None and (isinstance(value, bool) or not isinstance(value, int) or value <= 0):
+                raise ValueError(f"{name} must be a positive integer when supplied")
+        if self.run_mode == RunMode.RESEARCH:
+            missing = [name for name in ("proposal_budget", "oracle_budget") if getattr(self, name) is None]
+            if missing:
+                raise ValueError("Research mode requires explicit positive proposal_budget and oracle_budget")
+        selected_distance = self.minimum_distance if self.minimum_distance is not None else self.min_distance
+        if self.min_distance_angstrom is not None:
+            selected_distance = self.min_distance_angstrom
+        if self.geometry_minimum_distance is not None:
+            selected_distance = self.geometry_minimum_distance
+        if selected_distance is not None:
+            self.geometry_min_distance = selected_distance
+        try:
+            self.geometry_min_distance = float(self.geometry_min_distance)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("geometry_min_distance must be finite and positive") from exc
+        if not __import__("math").isfinite(self.geometry_min_distance) or self.geometry_min_distance <= 0:
+            raise ValueError("geometry_min_distance must be finite and positive")
+        for name in ("thermodynamics_retain_threshold_ev_per_atom", "thermodynamics_stable_threshold_ev_per_atom"):
+            value = float(getattr(self, name))
+            if not __import__("math").isfinite(value) or value < 0:
+                raise ValueError(f"{name} must be finite and nonnegative")
+            setattr(self, name, value)
 
 
 class MaterialsDiscoveryCampaign:
@@ -64,28 +151,58 @@ class MaterialsDiscoveryCampaign:
     Autonomous materials discovery campaign with persistent CareerMemory and full Candidate Provenance.
     """
 
+    backend_generation_shortfall_debt: int = 0
+
     def __init__(self, config: CampaignConfig):
         self.config = config
+        self.config.run_mode = normalize_run_mode(self.config.run_mode)
+        self.budget_tracker = DualBudgetTracker(
+            proposal_budget=self.config.proposal_budget,
+            oracle_budget=self.config.oracle_budget,
+        )
+        self.geometry_validator = GeometryValidator(
+            min_distance=self.config.geometry_min_distance,
+        )
         self.iteration = 0
         self.results_history = []
         self.campaign_id = ""
+        self.termination_reason: Optional[str] = None
+        self.backend_generation_shortfall_debt = 0
+
+        # Build the execution boundary before opening persistent memory or
+        # creating output artifacts.  In research mode each component is
+        # initialized strictly and all failures are reported together.
+        if self.config.run_mode == RunMode.RESEARCH:
+            self._initialize_components_research()
+            self._run_research_preflight()
+        else:
+            self.thermodynamic_oracle = self._init_thermodynamic_oracle()
+            self.generator = self._init_generator()
+            self.screener = self._init_screener()
+            self.validator = self._init_validator()
+            self.synthesis = self._init_synthesis_agent()
+            self.analyzer = self._init_analysis_agent()
+            self.strategy = self._init_strategy_agent()
+            self.requested_backends = self._requested_backend_metadata()
+            self.actual_backends = self._actual_backend_metadata()
 
         # Career memory — persists across ALL campaigns
         if config.use_career_memory:
-            self.career_memory = CareerMemory(db_path=config.career_db_path)
+            memory_path = config.career_db_path
+            if not memory_path:
+                memory_path = str(Path(config.output_dir) / "career_memory.db")
+            self.career_memory = CareerMemory(db_path=memory_path)
         else:
             self.career_memory = None
 
         self.orchestrator = OrchestratorAgent(
             career_memory=self.career_memory,
-            api_key=os.environ.get('OPENAI_API_KEY')
+            api_key=os.environ.get('OPENAI_API_KEY') if self.config.allow_llm_orchestration else None,
+            memory_mode=self.config.memory_mode,
+            memory_seed=self.config.memory_seed,
+            allow_llm=self.config.allow_llm_orchestration,
+            locked_elements=self.config.locked_elements,
         )
-        self.generator = self._init_generator()
-        self.screener = self._init_screener()
-        self.validator = self._init_validator()
-        self.synthesis = self._init_synthesis_agent()
-        self.analyzer = self._init_analysis_agent()
-        self.strategy = self._init_strategy_agent()
         self.current_recommendations: Optional[Dict[str, Any]] = None
         self.distiller = ExperienceDistiller(
             career_memory=self.career_memory,
@@ -109,15 +226,138 @@ class MaterialsDiscoveryCampaign:
                 'mattergen_model_path': self.config.mattergen_model_path,
                 'mattergen_sampling_config_path': self.config.mattergen_sampling_config_path,
                 'mattergen_sampling_config_name': self.config.mattergen_sampling_config_name,
+                'run_mode': self.config.run_mode.value,
+                'validation_calculator': self._requested_validation_backend(),
+                'synthesis_mode': self.config.synthesis_mode,
+                'require_thermodynamics': self.config.require_thermodynamics,
+                'thermodynamics_backend': self.config.thermodynamics_backend,
+                'thermodynamics_reference_set_path': self.config.thermodynamics_reference_set_path,
+                'thermodynamics_retain_threshold_ev_per_atom': self.config.thermodynamics_retain_threshold_ev_per_atom,
+                'thermodynamics_stable_threshold_ev_per_atom': self.config.thermodynamics_stable_threshold_ev_per_atom,
                 'use_validation': self.config.use_validation,
                 'validation_top_k': self.config.validation_top_k,
                 'use_synthesis': self.config.use_synthesis,
                 'num_candidates': self.config.num_candidates,
                 'master_seed': getattr(self.config, "master_seed", 42),
+                'proposal_budget': self.config.proposal_budget,
+                'oracle_budget': self.config.oracle_budget,
+                'geometry_min_distance': self.config.geometry_min_distance,
+                'memory_mode': self.config.memory_mode,
+                'memory_seed': self.config.memory_seed,
+                'locked_elements': (
+                    list(getattr(self.config, 'locked_elements'))
+                    if getattr(self.config, 'locked_elements', None) is not None else None
+                ),
+                'allow_llm_orchestration': bool(getattr(self.config, 'allow_llm_orchestration', True)),
+                'memory_transfer_declaration': (
+                    self.config.objective.constraints.get('memory_transfer_declaration')
+                    or self.config.objective.constraints.get('transferability')
+                    or self.config.objective.constraints.get('memory_transfer')
+                ),
             },
             objective=self.config.objective.target_properties,
             constraints=self.config.objective.constraints,
+            run_mode=self.config.run_mode.value,
+            scientific_validity=(
+                ScientificValidity.RESEARCH_VALID.value
+                if self.config.run_mode == RunMode.RESEARCH
+                else ScientificValidity.DEMO_ONLY.value
+            ),
+            requested_backends=self.requested_backends,
+            actual_backends=self.actual_backends,
+            proposal_budget=self.config.proposal_budget,
+            oracle_budget=self.config.oracle_budget,
         )
+
+    def _requested_validation_backend(self) -> str:
+        """Stable metadata label for a configured validation backend."""
+        calculator = self.config.validation_calculator
+        return str(calculator) if isinstance(calculator, str) else "ase_calculator_object"
+
+    def _requested_backend_metadata(self) -> Dict[str, Any]:
+        """Describe requested scientific components before initialization."""
+        return {
+            "generation": "mattergen" if self.config.use_mattergen else "pymatgen_mock",
+            "screening": "chgnet",
+            "validation": self._requested_validation_backend() if self.config.use_validation else "disabled",
+            "synthesis": self.config.synthesis_mode if self.config.use_synthesis else "disabled",
+            "thermodynamics": (
+                self.config.thermodynamics_backend
+                if self.config.thermodynamics_backend
+                else ("required" if self.config.require_thermodynamics else "not_required")
+            ),
+        }
+
+    def _actual_backend_metadata(self) -> Dict[str, Any]:
+        """Read actual component identities without inferring scientific validity."""
+        generator_backend = getattr(self.generator, "backend_name", None)
+        screener_backend = getattr(self.screener, "last_backend_used", None)
+        if screener_backend in {None, "uninitialized"}:
+            screener_backend = "chgnet" if getattr(self.screener, "chgnet", None) is not None else "heuristic"
+        validator_info = self.validator.get_backend_info() if hasattr(self.validator, "get_backend_info") else {}
+        validation_backend = (
+            "disabled" if not self.config.use_validation
+            else validator_info.get("backend_type") or getattr(self.validator, "calculator_name", None)
+        )
+        synthesis_backend = "disabled" if not self.config.use_synthesis else getattr(self.synthesis, "mode", self.config.synthesis_mode)
+        return {
+            "generation": generator_backend or "unavailable",
+            "screening": screener_backend or "unavailable",
+            "validation": validation_backend or "unavailable",
+            "synthesis": synthesis_backend,
+            "thermodynamics": (
+                "certified_frozen_chgnet_hull"
+                if getattr(self, "thermodynamic_oracle", None) is not None
+                and self.thermodynamic_oracle.capability
+                else "not_configured"
+            ),
+        }
+
+    def _initialize_components_research(self) -> None:
+        """Initialize all research components while collecting failures."""
+        self.requested_backends = self._requested_backend_metadata()
+        self._component_init_errors: List[str] = []
+
+        def init(name: str, factory: Any, fallback: Any = None) -> Any:
+            try:
+                return factory()
+            except Exception as exc:
+                self._component_init_errors.append(f"{name}: {exc}")
+                return fallback
+
+        self.generator = init("generation", self._init_generator)
+        self.thermodynamic_oracle = init("thermodynamics", self._init_thermodynamic_oracle)
+        self.screener = init("screening", self._init_screener)
+        self.validator = (
+            init("validation", self._init_validator)
+            if self.config.use_validation else None
+        )
+        self.synthesis = (
+            init("synthesis", self._init_synthesis_agent)
+            if self.config.use_synthesis else None
+        )
+        # Analysis and strategy do not provide scientific evidence, but keep
+        # construction consistent for future successful research runs.
+        self.analyzer = self._init_analysis_agent()
+        self.strategy = self._init_strategy_agent()
+        self.actual_backends = self._actual_backend_metadata()
+
+    def _run_research_preflight(self) -> None:
+        """Apply the reusable fail-closed research gate."""
+        report = build_scientific_preflight(
+            run_mode=self.config.run_mode,
+            requested_backends=self.requested_backends,
+            actual_backends=self.actual_backends,
+            require_thermodynamics=self.config.require_thermodynamics,
+            thermodynamics_available=(
+                getattr(self, "thermodynamic_oracle", None) is not None
+                and self.thermodynamic_oracle.capability
+            ),
+        )
+        if self._component_init_errors:
+            report.errors = self._component_init_errors + report.errors
+        if not report.valid:
+            raise ScientificPreflightError(report)
         
     def run_campaign(self) -> Dict[str, Any]:
         """Execute the full discovery campaign with career memory and provenance tracking."""
@@ -141,6 +381,7 @@ class MaterialsDiscoveryCampaign:
 
         self.provenance.campaign_id = self.campaign_id
         self.provenance.manifest.campaign_id = self.campaign_id
+        self.provenance.sync_budget(self.budget_tracker)
         self.provenance.write_manifest()
 
         self._log(f"\nStarting campaign: {self.config.name}  [id={self.campaign_id}]")
@@ -148,8 +389,18 @@ class MaterialsDiscoveryCampaign:
         self._log(f"Target: {objective.target_properties}")
 
         start_time = time.time()
-
         while self.iteration < objective.max_iterations:
+            if self.budget_tracker.proposal_budget_remaining == 0:
+                self.termination_reason = "PROPOSAL_BUDGET_EXHAUSTED"
+                self.budget_tracker.set_termination(self.termination_reason)
+                break
+            if (
+                self.budget_tracker.oracle_budget_remaining == 0
+                and self.budget_tracker.proposal_budget_remaining is None
+            ):
+                self.termination_reason = "ORACLE_BUDGET_EXHAUSTED"
+                self.budget_tracker.set_termination(self.termination_reason)
+                break
             self._log(f"\n{'='*60}")
             self._log(f"ITERATION {self.iteration}")
             self._log(f"{'='*60}")
@@ -159,6 +410,9 @@ class MaterialsDiscoveryCampaign:
 
             should_stop, reason = self._check_termination(iteration_result)
             if should_stop:
+                self.termination_reason = reason
+                self.budget_tracker.set_termination(reason)
+                self.provenance.sync_budget(self.budget_tracker, iteration=self.iteration, termination_reason=reason)
                 self._log(f"\nCampaign terminated: {reason}")
                 break
 
@@ -166,6 +420,17 @@ class MaterialsDiscoveryCampaign:
                 self._save_checkpoint()
 
             self.iteration += 1
+
+        if self.termination_reason is None:
+            # Reaching max_iterations or budget exhaustion is a clean, explicit termination state.
+            if self.budget_tracker.proposal_budget_remaining == 0:
+                self.termination_reason = "PROPOSAL_BUDGET_EXHAUSTED"
+            elif self.budget_tracker.oracle_budget_remaining == 0:
+                self.termination_reason = "ORACLE_BUDGET_EXHAUSTED"
+            else:
+                self.termination_reason = "MAX_ITERATIONS_REACHED"
+            self.budget_tracker.set_termination(self.termination_reason)
+        self.provenance.sync_budget(self.budget_tracker, termination_reason=self.termination_reason)
 
         elapsed_time = time.time() - start_time
         final_results = self._generate_final_report(elapsed_time)
@@ -178,6 +443,7 @@ class MaterialsDiscoveryCampaign:
         
     def _run_iteration(self) -> Dict[str, Any]:
         """Execute one iteration: plan → generate → screen → validate → synthesize → distill → report."""
+        budget_before = self.budget_tracker.to_dict()
 
         # 1. Plan with career memory warm-start and strategy-agent recommendations
         self._log("\n[1/6] Planning...")
@@ -192,6 +458,33 @@ class MaterialsDiscoveryCampaign:
             # Only set user-configured batch size on the first iteration if no recommendation exists
             if self.iteration == 0 and not self.current_recommendations and self.config.num_candidates:
                 strategy['num_candidates'] = self.config.num_candidates
+
+        remaining_iterations = max(1, self.config.objective.max_iterations - self.iteration)
+        strategy_requested_num = strategy.get('num_candidates')
+        debt_before = self.backend_generation_shortfall_debt
+
+        if self.budget_tracker.proposal_budget_remaining is not None:
+            rem_prop = self.budget_tracker.proposal_budget_remaining
+            scheduled_remaining = max(0, rem_prop - debt_before)
+            if remaining_iterations == 1:
+                baseline_requested = scheduled_remaining
+            else:
+                baseline_requested = int(math.ceil(scheduled_remaining / remaining_iterations)) if remaining_iterations > 0 else scheduled_remaining
+
+            desired_total = min(rem_prop, baseline_requested + debt_before)
+            num_to_gen = self.budget_tracker.generation_capacity(desired_total)
+            budget_allocated_num = num_to_gen
+            recovery_requested = min(
+                debt_before,
+                max(0, num_to_gen - baseline_requested),
+            )
+        else:
+            strat_cand = strategy.get('num_candidates')
+            baseline_requested = strat_cand if strat_cand is not None else (self.config.num_candidates or 5)
+            budget_allocated_num = baseline_requested
+            num_to_gen = self.budget_tracker.generation_capacity(baseline_requested)
+            recovery_requested = 0
+
         self.provenance.record_strategy(self.iteration, strategy)
         self._log(f"  Elements: {strategy.get('elements', [])}")
         self._log(f"  Candidates: {strategy.get('num_candidates', self.config.num_candidates)}")
@@ -201,6 +494,13 @@ class MaterialsDiscoveryCampaign:
 
         # 2. Generate
         self._log("\n[2/6] Generating Candidates...")
+        if self.config.locked_elements is not None:
+            expected_elems = sorted(self.config.locked_elements)
+            strat_elems = sorted(strategy.get('elements', []))
+            if strat_elems != expected_elems:
+                raise RuntimeError(
+                    f"Strategy elements {strat_elems} do not match declared locked chemical system {expected_elems}"
+                )
         if (
             self.provenance
             and self.provenance.manifest.iteration_seeds
@@ -209,12 +509,51 @@ class MaterialsDiscoveryCampaign:
             iter_seed = self.provenance.manifest.iteration_seeds[self.iteration]
         else:
             iter_seed = getattr(self.config, "master_seed", 42) + self.iteration
-        num_to_gen = strategy.get('num_candidates', self.config.num_candidates)
         candidates = self.generator.generate_batch(
             elements=strategy.get('elements', ['Li', 'P', 'S', 'O']),
             num_candidates=num_to_gen,
             seed=iter_seed,
+            domain=self.config.objective.domain,
+            memory_directives=strategy.get('memory_directives', []),
         )
+        # A backend that overproduces has already consumed proposal resources,
+        # so silently slicing would make the accounting non-auditable.  Abort
+        # explicitly; callers can inspect the backend error and retry with a
+        # corrected adapter.
+        candidates = list(candidates or [])
+        if len(candidates) > num_to_gen:
+            raise RuntimeError(
+                f"Generation backend returned {len(candidates)} candidates for a request of {num_to_gen}; "
+                "overproduction cannot be silently discarded under the proposal budget."
+            )
+
+        actual = len(candidates)
+        baseline_fulfilled = min(actual, baseline_requested)
+        new_shortfall = max(0, baseline_requested - baseline_fulfilled)
+        actual_after_baseline = max(0, actual - baseline_fulfilled)
+        recovered = min(
+            debt_before,
+            recovery_requested,
+            actual_after_baseline,
+        )
+        debt_after = debt_before - recovered + new_shortfall
+        self.backend_generation_shortfall_debt = debt_after
+
+        if debt_before > 0 or new_shortfall > 0 or recovered > 0 or actual < num_to_gen:
+            if hasattr(self.provenance, "manifest") and hasattr(self.provenance.manifest, "generation_shortfall_events"):
+                self.provenance.manifest.generation_shortfall_events.append({
+                    "iteration": self.iteration,
+                    "requested_count": num_to_gen,
+                    "baseline_requested_count": baseline_requested,
+                    "recovery_requested_count": recovery_requested,
+                    "actual_count": actual,
+                    "new_shortfall": new_shortfall,
+                    "recovered_count": recovered,
+                    "outstanding_before": debt_before,
+                    "outstanding_after": debt_after,
+                    "shortfall": max(0, num_to_gen - actual),
+                })
+        self.budget_tracker.record_proposals(len(candidates))
         generation_backend = self.generator.last_generation_backend or getattr(self.generator, "backend_name", "stub")
         self.provenance.register_generation(
             candidates=candidates,
@@ -225,12 +564,34 @@ class MaterialsDiscoveryCampaign:
             parameters={
                 'elements': strategy.get('elements', []),
                 'num_candidates': len(candidates),
+                'strategy_requested_num_candidates': strategy_requested_num,
+                'budget_allocated_num_candidates': budget_allocated_num,
+                'actual_generated_num_candidates': len(candidates),
+                'requested_num_candidates': num_to_gen,
+                'proposal_budget_remaining': self.budget_tracker.proposal_budget_remaining,
+                'memory_directive_ids': [
+                    d.get('record_id') for d in strategy.get('memory_directives', [])
+                    if d.get('record_id')
+                ],
             },
             model_name_or_path=self.config.mattergen_model_path if generation_backend == "mattergen" else None,
             checkpoint=self.config.mattergen_pretrained if generation_backend == "mattergen" else None,
         )
+        # Memory affects only deterministic pre-oracle prioritization after all
+        # proposals are counted.  Geometry and thermodynamic gates still own
+        # validity, and every oracle admission remains one budget slot.
+        memory_directives = strategy.get('memory_directives', [])
+        candidates, memory_priority_audit = prioritize_candidates(candidates, memory_directives)
+        self.provenance.record_memory_prioritization(memory_priority_audit, iteration=self.iteration)
         self._log(f"  Generated: {len(candidates)} structures")
         self._log(f"  Generation backend: {generation_backend}")
+
+        if not candidates:
+            # Preserve a valid iteration record for an empty backend response;
+            # no screening/oracle call is made and the campaign can terminate
+            # deterministically.
+            self.provenance.sync_budget(self.budget_tracker, iteration=self.iteration)
+            return self._empty_iteration_result(generation_backend, strategy)
 
         # 3. Screen with CHGNet/M3GNet
         self._log("\n[3/6] Screening with ML Models...")
@@ -240,8 +601,13 @@ class MaterialsDiscoveryCampaign:
             criteria=screening_criteria,
             target_properties=self.config.objective.target_properties,
             deduplicate=False,
+            budget_tracker=self.budget_tracker,
+            memory_directives=strategy.get('memory_directives', []),
         )
-        screener_backend = "chgnet" if getattr(self.screener, "chgnet", None) is not None else "heuristic"
+        self.provenance.sync_budget(self.budget_tracker, iteration=self.iteration)
+        screener_backend = getattr(self.screener, "last_backend_used", None)
+        if not screener_backend or screener_backend == "uninitialized":
+            screener_backend = "chgnet" if getattr(self.screener, "chgnet", None) is not None else "heuristic"
         self.provenance.record_screening(
             screening_results=screened,
             criteria=screening_criteria,
@@ -251,7 +617,7 @@ class MaterialsDiscoveryCampaign:
         n_pass = sum(1 for _, r in screened if r.passes_filters)
         scores = [r.score for _, r in screened]
         best_score = max(scores) if scores else 0.0
-        avg_stability = sum(r.predictions.get('stability', 0) for _, r in screened) / max(len(screened), 1)
+        # Raw per-atom model energy is retained in provenance for audit only.
         self._log(f"  Screened: {len(screened)} total, {n_pass} passed filters")
         self._log(f"  Best score: {best_score:.3f}")
 
@@ -268,13 +634,8 @@ class MaterialsDiscoveryCampaign:
                 self.provenance.record_validation(validation_results, iteration=self.iteration)
                 n_converged = sum(1 for v in validation_results if v.converged)
                 total_cost = sum(v.cost_hours for v in validation_results)
-                best_validated = max(
-                    (v.properties.get('stability', float('-inf')) for v in validation_results),
-                    default=0.0
-                )
                 self._log(f"  Validated: {len(validation_results)} structures, {n_converged} converged")
                 self._log(f"  Validation cost: {total_cost:.1f} compute-hours")
-                self._log(f"  Best validated stability: {best_validated:.3f} eV/atom")
             else:
                 self._log("  No candidates passed screening filters; skipping validation.")
         else:
@@ -335,7 +696,11 @@ class MaterialsDiscoveryCampaign:
             iteration=self.iteration,
             candidates=candidates,
             screening_results=screened,
-            strategy=strategy
+            strategy=strategy,
+            fail_closed=self.config.run_mode == RunMode.RESEARCH,
+        )
+        self.provenance.record_memory_extraction_audit(
+            distill_result.get("transferable_memory_failures", []), iteration=self.iteration
         )
         self._log(f"  Principles written: {distill_result['principles_written']}")
         self._log(f"  Failures recorded: {distill_result['failures_recorded']}")
@@ -402,17 +767,17 @@ class MaterialsDiscoveryCampaign:
 
         n_converged = sum(1 for v in validation_results if v.converged)
         total_cost = sum(v.cost_hours for v in validation_results)
-        best_validated = max(
-            (v.properties.get('stability', float('-inf')) for v in validation_results),
-            default=0.0
-        )
-
         n_synthesis_feasible = sum(1 for s in synthesis_results if s.feasible)
         avg_synthesis_feasibility = sum(s.feasibility_score for s in synthesis_results) / max(len(synthesis_results), 1)
         best_synthesis = max(
             (s.feasibility_score for s in synthesis_results),
             default=0.0
         )
+        hull_values = [
+            result.predictions.get("predicted_energy_above_hull_ev_per_atom")
+            for _, result in screened
+            if result.predictions.get("predicted_energy_above_hull_ev_per_atom") is not None
+        ]
 
         insights = {
             'generation_backend': generation_backend,
@@ -422,11 +787,11 @@ class MaterialsDiscoveryCampaign:
             'success_rate': n_pass / max(len(screened), 1),
             'screening_rate': n_pass / max(len(screened), 1),
             'best_score': best_score,
-            'avg_stability': avg_stability,
+            'thermodynamics_metrics_available': bool(hull_values),
+            'predicted_hull_threshold_sensitivity': threshold_sensitivity(hull_values),
             'num_validated': len(validation_results),
             'num_converged': n_converged,
             'validation_cost_hours': total_cost,
-            'best_validated_stability': best_validated,
             'num_synthesis_assessed': len(synthesis_results),
             'num_synthesis_feasible': n_synthesis_feasible,
             'avg_synthesis_feasibility': avg_synthesis_feasibility,
@@ -436,6 +801,18 @@ class MaterialsDiscoveryCampaign:
             'ml_dft_mae': analysis_result.ml_vs_dft_mae if analysis_result else {},
             'principles_written': distill_result['principles_written'],
         }
+        budget_after = self.budget_tracker.to_dict()
+        budget_iteration = {
+            key: (
+                budget_after[key] - budget_before[key]
+                if key in {"proposals_generated", "geometry_valid", "invalid_geometry", "oracle_evaluations", "oracle_cache_hits"}
+                else budget_after[key]
+            )
+            for key in budget_after
+        }
+        # Iteration counters are deltas; remaining capacities are post-iteration state.
+        insights.update(budget_iteration)
+        self.provenance.sync_budget(self.budget_tracker, iteration=self.iteration)
 
         # LLM interpretation
         report = self.orchestrator.interpret_results(insights)
@@ -494,13 +871,55 @@ class MaterialsDiscoveryCampaign:
                 'insights': analysis_result.insights if analysis_result else [],
             },
             'insights': insights,
-            'strategy': strategy
+            'strategy': strategy,
+            **budget_iteration,
+        }
+
+    def _empty_iteration_result(self, generation_backend: str, strategy: Dict[str, Any]) -> Dict[str, Any]:
+        """Return a schema-compatible iteration result for an empty generation batch."""
+        snapshot = self.budget_tracker.to_dict()
+        insights = {
+            "generation_backend": generation_backend,
+            "num_generated": 0,
+            "num_screened": 0,
+            "num_passed": 0,
+            "best_score": 0.0,
+            "thermodynamics_metrics_available": False,
+            "num_validated": 0,
+            "num_converged": 0,
+            "num_synthesis_feasible": 0,
+            "principles_written": 0,
+            **snapshot,
+        }
+        self.provenance.sync_budget(self.budget_tracker, iteration=self.iteration)
+        return {
+            "iteration": self.iteration,
+            "generation_backend": generation_backend,
+            "num_generated": 0,
+            "num_screened": 0,
+            "num_validated": 0,
+            "validation_results": [],
+            "synthesis_results": [],
+            "analysis": {},
+            "insights": insights,
+            "strategy": strategy,
+            **snapshot,
         }
 
     def _check_termination(self, iteration_result: Dict[str, Any]) -> tuple:
         """Check if campaign should stop."""
         insights = iteration_result.get('insights', {})
         best_score = insights.get('best_score', 0)
+
+        if self.budget_tracker.proposal_budget_remaining == 0:
+            return True, "PROPOSAL_BUDGET_EXHAUSTED"
+        if (
+            self.budget_tracker.oracle_budget_remaining == 0
+            and self.budget_tracker.proposal_budget_remaining is None
+        ):
+            return True, "ORACLE_BUDGET_EXHAUSTED"
+        if iteration_result.get("num_generated", 0) == 0:
+            return True, "NO_CANDIDATES_GENERATED"
 
         min_score = self.config.objective.success_criteria.get('min_score', float('inf'))
         if best_score >= min_score:
@@ -520,10 +939,44 @@ class MaterialsDiscoveryCampaign:
             'iteration': self.iteration,
             'campaign_id': self.campaign_id,
             'results_history': self.results_history,
+            'backend_generation_shortfall_debt': getattr(self, 'backend_generation_shortfall_debt', 0),
             'config': {
                 'name': self.config.name,
                 'domain': self.config.objective.domain,
-            }
+                'proposal_budget': self.config.proposal_budget,
+                'oracle_budget': self.config.oracle_budget,
+                'geometry_min_distance': self.config.geometry_min_distance,
+                'thermodynamics_reference_set_path': self.config.thermodynamics_reference_set_path,
+                'thermodynamics_retain_threshold_ev_per_atom': self.config.thermodynamics_retain_threshold_ev_per_atom,
+                'thermodynamics_stable_threshold_ev_per_atom': self.config.thermodynamics_stable_threshold_ev_per_atom,
+                'memory_mode': self.config.memory_mode,
+                'memory_seed': self.config.memory_seed,
+                'locked_elements': (
+                    list(getattr(self.config, 'locked_elements'))
+                    if getattr(self.config, 'locked_elements', None) is not None else None
+                ),
+                'allow_llm_orchestration': bool(getattr(self.config, 'allow_llm_orchestration', True)),
+                'memory_transfer_declaration': (
+                    self.config.objective.constraints.get('memory_transfer_declaration')
+                    or self.config.objective.constraints.get('transferability')
+                    or self.config.objective.constraints.get('memory_transfer')
+                ),
+            },
+            'budget': self.budget_tracker.to_dict(termination_reason=self.termination_reason),
+            'memory': {
+                'mode': self.config.memory_mode,
+                'seed': self.config.memory_seed,
+                'transfer_declaration': self.provenance.manifest.memory_transfer_declaration,
+                'applied_directives': self.provenance.manifest.memory_directives_applied,
+                'rejected_directives': self.provenance.manifest.memory_directives_rejected,
+                'unsupported_directives': [
+                    item for strategy in self.provenance.manifest.strategies
+                    for item in (strategy.get('memory_directive_audit', {}) or {}).get('unsupported', [])
+                ],
+                'shuffle_audit': self.provenance.manifest.memory_shuffle_audit,
+                'extraction_failures': self.provenance.manifest.memory_extraction_failures,
+                'priority_audit': self.provenance.manifest.memory_priority_audit,
+            },
         }
         checkpoint_path = self.config.output_dir / f"checkpoint_{self.iteration}.json"
         with open(checkpoint_path, 'w') as f:
@@ -532,10 +985,20 @@ class MaterialsDiscoveryCampaign:
 
     def _generate_final_report(self, elapsed_time: float) -> Dict[str, Any]:
         """Generate final report and persist to disk using ProvenanceTracker as single source of truth."""
+        if hasattr(self.provenance, "manifest"):
+            final_debt = getattr(self, "backend_generation_shortfall_debt", 0)
+            remaining_budget = self.budget_tracker.proposal_budget_remaining
+            if remaining_budget is not None and final_debt > remaining_budget:
+                raise RuntimeError(
+                    f"Accounting error: outstanding backend debt ({final_debt}) exceeds remaining proposal budget ({remaining_budget})"
+                )
+            if final_debt > 0:
+                self.provenance.manifest.backend_generation_shortfall = final_debt
+            else:
+                self.provenance.manifest.backend_generation_shortfall = None
+        self.provenance.sync_budget(self.budget_tracker, termination_reason=self.termination_reason)
         stats = self.provenance.finalize(status="completed")
         total_principles = sum(r['insights'].get('principles_written', 0) for r in self.results_history)
-
-        # Career memory top candidates
         top_candidates = []
         if self.career_memory:
             top_candidates = self.career_memory.get_top_candidates_ever(
@@ -564,6 +1027,26 @@ class MaterialsDiscoveryCampaign:
             'elapsed_time_seconds': elapsed_time,
             'generation_backend': backend_name,
             'generation_backend_counts': backend_counts,
+            'generation_shortfall_events': (
+                getattr(self.provenance.manifest, "generation_shortfall_events", [])
+                if hasattr(self.provenance, "manifest") else []
+            ),
+            'backend_generation_shortfall': (
+                getattr(self.provenance.manifest, "backend_generation_shortfall", None)
+                if hasattr(self.provenance, "manifest") else None
+            ),
+            'run_mode': self.config.run_mode.value,
+            'scientific_validity': (
+                ScientificValidity.RESEARCH_VALID.value
+                if self.config.run_mode == RunMode.RESEARCH
+                else ScientificValidity.DEMO_ONLY.value
+            ),
+            'thermodynamics_metrics_available': any(
+                result.get("insights", {}).get("thermodynamics_metrics_available", False)
+                for result in self.results_history
+            ),
+            'requested_backends': self.requested_backends,
+            'actual_backends': self.actual_backends,
             'mattergen_pretrained': (
                 self.config.mattergen_pretrained if 'mattergen' in backend_counts else None
             ),
@@ -576,10 +1059,25 @@ class MaterialsDiscoveryCampaign:
             'total_synthesis_assessed': stats['total_synthesis_assessed'],
             'total_synthesis_feasible': stats['total_synthesis_feasible'],
             'best_score_ever': stats['best_score_ever'],
-            'best_validated_stability_ever': stats['best_validated_stability_ever'],
             'best_synthesis_feasibility_ever': stats['best_synthesis_feasibility_ever'],
             'principles_written_to_career': total_principles,
+            'memory_mode': self.config.memory_mode,
+            'memory_seed': self.config.memory_seed,
+            'memory_transfer_declaration': self.provenance.manifest.memory_transfer_declaration,
+            'memory_directives_applied': self.provenance.manifest.memory_directives_applied,
+            'memory_directives_rejected': self.provenance.manifest.memory_directives_rejected,
+            'memory_priority_audit': self.provenance.manifest.memory_priority_audit,
             'top_candidates': top_candidates,
+            'proposals_generated': self.budget_tracker.proposals_generated,
+            'geometry_valid': self.budget_tracker.geometry_valid,
+            'invalid_geometry': self.budget_tracker.invalid_geometry,
+            'oracle_evaluations': self.budget_tracker.oracle_evaluations,
+            'oracle_cache_hits': self.budget_tracker.oracle_cache_hits,
+            'proposal_budget': self.budget_tracker.proposal_budget,
+            'oracle_budget': self.budget_tracker.oracle_budget,
+            'proposal_budget_remaining': self.budget_tracker.proposal_budget_remaining,
+            'oracle_budget_remaining': self.budget_tracker.oracle_budget_remaining,
+            'termination_reason': self.termination_reason,
         }
 
         report_path = self.config.output_dir / f"report_{self.campaign_id}.json"
@@ -620,6 +1118,10 @@ class MaterialsDiscoveryCampaign:
             data = json.load(f)
 
         manifest = RunManifest.from_dict(data)
+        # A v1 manifest may be parsed for audit, but cannot be executed as a
+        # v2 scientific campaign.  This preserves the original artifact and
+        # prevents legacy energy semantics entering new retrieval/statistics.
+        assert_schema_v2_compatible(data, context="reproduction manifest")
         out_dir = Path(output_dir).resolve() if output_dir else manifest_file.parent / "reproduced"
 
         # Verify manifest integrity hash if present
@@ -648,6 +1150,10 @@ class MaterialsDiscoveryCampaign:
             output_dir=out_dir,
             master_seed=manifest.master_seed,
             use_career_memory=cfg_data.get('use_career_memory', False),
+            memory_mode=cfg_data.get('memory_mode', 'structured_provenance'),
+            memory_seed=cfg_data.get('memory_seed', 0),
+            locked_elements=cfg_data.get('locked_elements'),
+            allow_llm_orchestration=cfg_data.get('allow_llm_orchestration', True),
             use_validation=cfg_data.get('use_validation', True),
             validation_top_k=cfg_data.get('validation_top_k', 5),
             use_synthesis=cfg_data.get('use_synthesis', True),
@@ -658,6 +1164,23 @@ class MaterialsDiscoveryCampaign:
             mattergen_batch_size=cfg_data.get('mattergen_batch_size', 16),
             mattergen_sampling_config_path=cfg_data.get('mattergen_sampling_config_path', None),
             mattergen_sampling_config_name=cfg_data.get('mattergen_sampling_config_name', 'default'),
+            run_mode=cfg_data.get('run_mode', manifest.run_mode),
+            validation_calculator=cfg_data.get('validation_calculator', 'mock'),
+            synthesis_mode=cfg_data.get('synthesis_mode', 'mock'),
+            require_thermodynamics=cfg_data.get('require_thermodynamics', True),
+            thermodynamics_backend=cfg_data.get('thermodynamics_backend'),
+            thermodynamics_reference_set_path=cfg_data.get('thermodynamics_reference_set_path'),
+            thermodynamics_retain_threshold_ev_per_atom=cfg_data.get('thermodynamics_retain_threshold_ev_per_atom', 0.10),
+            thermodynamics_stable_threshold_ev_per_atom=cfg_data.get('thermodynamics_stable_threshold_ev_per_atom', 0.03),
+            # Legacy Boolean is intentionally ignored: capability must be
+            # established by loading the certified artifact and evaluator.
+            thermodynamics_available=False,
+            proposal_budget=cfg_data.get('proposal_budget', manifest.proposal_budget),
+            oracle_budget=cfg_data.get('oracle_budget', manifest.oracle_budget),
+            geometry_min_distance=cfg_data.get(
+                'geometry_min_distance',
+                cfg_data.get('min_distance', DEFAULT_MIN_DISTANCE_ANGSTROM),
+            ),
             verbose=True,
         )
 
@@ -697,19 +1220,62 @@ class MaterialsDiscoveryCampaign:
             mattergen_batch_size=self.config.mattergen_batch_size,
             mattergen_sampling_config_path=self.config.mattergen_sampling_config_path,
             mattergen_sampling_config_name=self.config.mattergen_sampling_config_name,
+            run_mode=self.config.run_mode,
         )
 
     def _init_screener(self):
         """Initialize screening agent with real CHGNet."""
-        return ScreeningAgent()
+        return ScreeningAgent(
+            run_mode=self.config.run_mode,
+            geometry_validator=self.geometry_validator,
+            thermodynamic_oracle=getattr(self, "thermodynamic_oracle", None),
+        )
+
+    def _init_thermodynamic_oracle(self):
+        """Load an immutable certified set; never retrieve references at runtime."""
+        path = self.config.thermodynamics_reference_set_path
+        evaluator = self.config.thermodynamics_evaluator
+        if not path:
+            if self.config.run_mode == RunMode.RESEARCH and self.config.require_thermodynamics:
+                raise RuntimeError("research thermodynamics requires thermodynamics_reference_set_path")
+            return None
+        configured_elements = self.config.objective.constraints.get("elements")
+        required_chemical_system = (
+            list(configured_elements)
+            if isinstance(configured_elements, (list, tuple, set)) and configured_elements
+            else None
+        )
+        frozen = load_frozen_reference_set(
+            path, required_chemical_system=required_chemical_system,
+        )
+        if evaluator is None:
+            evaluator = CHGNetRelaxationEvaluator(settings=frozen.relaxation_settings)
+        frozen = load_frozen_reference_set(
+            path, expected_model=evaluator.model_identity,
+            expected_settings=evaluator.relaxation_settings,
+            required_chemical_system=required_chemical_system,
+        )
+        return ThermodynamicOracle(
+            frozen, evaluator, research=self.config.run_mode == RunMode.RESEARCH,
+            geometry_min_distance=self.config.geometry_min_distance,
+            retain_threshold_ev_per_atom=self.config.thermodynamics_retain_threshold_ev_per_atom,
+            stable_threshold_ev_per_atom=self.config.thermodynamics_stable_threshold_ev_per_atom,
+        )
 
     def _init_validator(self):
         """Initialize validation agent (mock DFT by default)."""
-        return ValidationAgent(calculator="mock", n_workers=1)
+        return ValidationAgent(
+            calculator=self.config.validation_calculator,
+            n_workers=1,
+            run_mode=self.config.run_mode,
+        )
 
     def _init_synthesis_agent(self):
         """Initialize synthesis feasibility agent."""
-        return SynthesisFeasibilityAgent(mode="mock")
+        return SynthesisFeasibilityAgent(
+            mode=self.config.synthesis_mode,
+            run_mode=self.config.run_mode,
+        )
 
     def _init_strategy_agent(self):
         """Initialize adaptive strategy agent."""
@@ -717,7 +1283,11 @@ class MaterialsDiscoveryCampaign:
 
     def _init_analysis_agent(self):
         """Initialize ML-vs-DFT analysis agent."""
-        return AnalysisAgent(properties_to_compare=["formation_energy", "energy", "stability", "forces"])
+        return AnalysisAgent(properties_to_compare=[
+            "predicted_energy_per_atom_ev",
+            "energy_per_atom_ev",
+            "max_force_ev_per_angstrom",
+        ])
 
 
 def main():
@@ -730,13 +1300,31 @@ def main():
     parser.add_argument('--domain', default='li_solid_electrolyte')
     parser.add_argument('--iterations', type=int, default=3)
     parser.add_argument('--candidates', type=int, default=15)
+    parser.add_argument('--proposal-budget', type=int, default=None,
+                        help='Maximum generated proposals (paper default: 400; omitted means unlimited in development)')
+    parser.add_argument('--oracle-budget', type=int, default=None,
+                        help='Maximum geometrically valid oracle evaluations (paper default: 200; omitted means unlimited in development)')
+    parser.add_argument('--geometry-min-distance', '--min-distance', dest='geometry_min_distance', type=float, default=DEFAULT_MIN_DISTANCE_ANGSTROM,
+                        help='Absolute periodic minimum-distance threshold in Angstrom (default: 0.8)')
+    parser.add_argument('--thermodynamics-reference-set', type=str, default=None,
+                        help='Path to an offline certified frozen reference-set JSON (runtime never downloads references)')
+    parser.add_argument('--thermodynamics-retain-threshold', type=float, default=0.10,
+                        help='Maximum predicted energy above hull retained, eV/atom (default: 0.10)')
+    parser.add_argument('--thermodynamics-stable-threshold', type=float, default=0.03,
+                        help='Predicted-stable energy-above-hull threshold, eV/atom (default: 0.03)')
     parser.add_argument('--master-seed', type=int, default=42)
     parser.add_argument('--no-career-memory', action='store_true')
+    parser.add_argument('--memory-mode', choices=list(MEMORY_MODES), default='structured_provenance',
+                        help='CareerMemory view: none, text_summary, structured_provenance, or shuffled_control')
+    parser.add_argument('--memory-seed', type=int, default=0,
+                        help='Seed for deterministic CareerMemory control views')
     parser.add_argument('--no-validation', action='store_true')
     parser.add_argument('--validation-top-k', type=int, default=5)
     parser.add_argument('--no-synthesis', action='store_true')
+    parser.add_argument('--run-mode', choices=[mode.value for mode in RunMode], default=RunMode.DEVELOPMENT.value,
+                        help='Execution boundary: development permits deterministic mocks; research fails closed on missing scientific backends')
     parser.add_argument('--use-mattergen', action='store_true',
-                        help='Use the Microsoft MatterGen diffusion model for generation (falls back to mock if unavailable)')
+                        help='Use the Microsoft MatterGen diffusion model for generation')
     parser.add_argument('--mattergen-pretrained', type=str, default='mattergen_base',
                         help='MatterGen pretrained checkpoint name or "chemical_system" for element-conditioned generation')
     parser.add_argument('--mattergen-model-path', type=str, default=None,
@@ -759,7 +1347,7 @@ def main():
         return
 
     objective = CampaignObjective(
-        target_properties={'stability': -0.1, 'formation_energy': -2.0},
+        target_properties={},
         constraints={'elements': ['Li', 'P', 'S', 'O', 'Cl'], 'max_atoms': 20},
         success_criteria={'min_score': 999.0},
         domain=args.domain,
@@ -774,6 +1362,8 @@ def main():
         output_dir=out_dir,
         master_seed=args.master_seed,
         use_career_memory=not args.no_career_memory,
+        memory_mode=args.memory_mode,
+        memory_seed=args.memory_seed,
         verbose=True,
         use_validation=not args.no_validation,
         validation_top_k=args.validation_top_k,
@@ -785,6 +1375,13 @@ def main():
         mattergen_batch_size=args.mattergen_batch_size,
         mattergen_sampling_config_path=args.mattergen_sampling_config_path,
         mattergen_sampling_config_name=args.mattergen_sampling_config_name,
+        run_mode=args.run_mode,
+        proposal_budget=args.proposal_budget,
+        oracle_budget=args.oracle_budget,
+        geometry_min_distance=args.geometry_min_distance,
+        thermodynamics_reference_set_path=args.thermodynamics_reference_set,
+        thermodynamics_retain_threshold_ev_per_atom=args.thermodynamics_retain_threshold,
+        thermodynamics_stable_threshold_ev_per_atom=args.thermodynamics_stable_threshold,
     )
 
     campaign = MaterialsDiscoveryCampaign(config)

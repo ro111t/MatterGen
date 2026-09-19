@@ -9,6 +9,7 @@ import tempfile
 from campaign import MaterialsDiscoveryCampaign, CampaignConfig
 from agents.orchestrator import CampaignObjective
 from agents.screening import ScreeningAgent, ScreeningResult
+from agents.integrity import FORCE_KEY, SCREENING_ENERGY_KEY, STRESS_KEY
 
 
 class FakeScreener:
@@ -29,10 +30,9 @@ class FakeScreener:
             results.append((struct, ScreeningResult(
                 structure_id=sid,
                 predictions={
-                    "formation_energy": -2.0 - i * 0.1,
-                    "forces": 0.5,
-                    "stress": 0.05,
-                    "stability": -2.0 - i * 0.1,
+                    SCREENING_ENERGY_KEY: -2.0 - i * 0.1,
+                    FORCE_KEY: 0.5,
+                    STRESS_KEY: 0.05,
                 },
                 score=70.0 + i,
                 passes_filters=True,
@@ -50,7 +50,7 @@ class CampaignWithFakeScreener(MaterialsDiscoveryCampaign):
 
 def _make_campaign(tmp_path, **overrides):
     objective = CampaignObjective(
-        target_properties={"stability": -0.1, "formation_energy": -2.0},
+        target_properties={},
         constraints={"elements": ["Li", "P", "S"], "max_atoms": 10},
         success_criteria={"min_score": 999.0},
         domain="test_campaign",
@@ -101,7 +101,7 @@ def test_full_pipeline_runs_and_reports_expected_keys():
         expected_backend = campaign.generator.last_generation_backend
         assert results["generation_backend"] == expected_backend
         assert results["generation_backend_counts"] == {expected_backend: 1}
-        assert "best_validated_stability_ever" in results
+        assert results["thermodynamics_metrics_available"] is False
         assert "best_synthesis_feasibility_ever" in results
 
 
@@ -140,7 +140,7 @@ def test_report_uses_the_backend_that_generated_the_batch():
         _pin_batch_size(campaign, 2)
 
         # Simulate a configured MatterGen backend that fails at generation time.
-        # The adapter falls back for this batch, so the report must be mock-only.
+        # Development mode permits the deterministic fallback.
         campaign.generator.use_mattergen = True
         campaign.generator._mattergen = object()
 

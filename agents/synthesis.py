@@ -20,6 +20,8 @@ import hashlib
 import json
 import warnings
 
+from agents.integrity import RunMode, normalize_run_mode
+
 try:
     from pymatgen.core import Composition, Element, Structure
     from pymatgen.core.periodic_table import Element as PymatgenElement
@@ -76,8 +78,19 @@ class SynthesisFeasibilityAgent:
         'default': ('Solid-state reaction', 'Pelletize precursors and anneal at moderate temperature.'),
     }
 
-    def __init__(self, mode: str = "mock", precursor_db: Optional[str] = None):
+    def __init__(
+        self,
+        mode: str = "mock",
+        precursor_db: Optional[str] = None,
+        run_mode: RunMode | str = RunMode.DEVELOPMENT,
+        execution_mode: Optional[str] = None,
+    ):
+        self.run_mode = normalize_run_mode(execution_mode if execution_mode is not None else run_mode)
         self.mode = mode.lower()
+        if self.run_mode == RunMode.RESEARCH:
+            raise RuntimeError(
+                "Synthesis assessment is development-only and must be disabled in research mode."
+            )
         self.precursor_db = self._load_precursor_db(precursor_db)
 
     def _load_precursor_db(self, path: Optional[str]) -> Dict[str, Any]:
@@ -96,6 +109,8 @@ class SynthesisFeasibilityAgent:
         sid = structure_id or self._structure_id(structure)
         if self.mode == "mp":
             return self._assess_with_mp(structure, sid)
+        if self.mode != "mock":
+            raise ValueError(f"Unknown synthesis backend: {self.mode}")
         return self._mock_assess(structure, sid)
 
     def assess_batch(
@@ -232,8 +247,11 @@ class SynthesisFeasibilityAgent:
 
     def _assess_with_mp(self, structure: Any, structure_id: str) -> SynthesisAssessment:
         """Placeholder for Materials-Project-backed assessment."""
-        warnings.warn("Materials Project synthesis lookup not yet implemented; using mock assessment.")
-        return self._mock_assess(structure, structure_id)
+        # Sprint 1 does not permit an unimplemented backend to silently become
+        # a heuristic assessment.  A future connector can replace this body.
+        raise RuntimeError(
+            "Materials Project synthesis lookup is not implemented; no mock fallback is permitted for an explicit backend."
+        )
 
     @staticmethod
     def _classify_anions(elements: Set[str]) -> str:

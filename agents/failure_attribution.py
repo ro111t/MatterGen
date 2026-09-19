@@ -8,16 +8,19 @@ Called by ExperienceDistiller.distill_iteration() after each screening pass.
 from typing import Dict, List, Tuple, Any
 
 from agents.career_memory import CareerMemory
+from agents.integrity import FORCE_KEY, STRESS_KEY
 
 
 # Map filter reason keywords to canonical failure mode strings
 _FAILURE_MODE_KEYWORDS = {
-    'stability':      'thermodynamically_unstable',
-    'formation energy': 'high_formation_energy',
-    'energy too high':  'high_formation_energy',
     'band gap':       'wrong_band_gap',
+    'max_force_ev_per_angstrom': 'high_residual_forces',
+    'max force':      'high_residual_forces',
     'forces':         'high_residual_forces',
+    'max_stress_gpa': 'high_stress',
+    'max stress':     'high_stress',
     'stress':         'high_stress',
+    'geometry':       'invalid_geometry',
 }
 
 
@@ -38,21 +41,11 @@ def attribute_cause(
     domain: str,
 ) -> str:
     """Return a human-readable explanation for a canonical failure mode."""
-    fe   = predictions.get('formation_energy', 0.0)
-    stab = predictions.get('stability', 0.0)
-    f    = predictions.get('forces', 0.0)
-    s    = predictions.get('stress', 0.0)
+    f    = predictions.get(FORCE_KEY, predictions.get('forces', 0.0))
+    s    = predictions.get(STRESS_KEY, predictions.get('stress', 0.0))
     bg   = predictions.get('band_gap', 0.0)
 
     causes = {
-        'thermodynamically_unstable': (
-            f"Competing phases likely have lower energy; "
-            f"stability={stab:.3f} eV/atom above hull."
-        ),
-        'high_formation_energy': (
-            f"Formation energy {fe:.3f} eV/atom too high — "
-            f"composition may favour phase separation."
-        ),
         'wrong_band_gap': (
             f"Band gap {bg:.3f} eV outside target range for {domain}."
         ),
@@ -63,6 +56,10 @@ def attribute_cause(
         'high_stress': (
             f"Max stress {s:.3f} GPa — internal strain suggests "
             f"unrealistic bond lengths or angles."
+        ),
+        'invalid_geometry': (
+            f"Geometry validation failed for {domain}; inspect lattice, atom "
+            "positions, and periodic boundary conditions."
         ),
     }
     return causes.get(

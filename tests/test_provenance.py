@@ -23,6 +23,7 @@ from agents.orchestrator import CampaignObjective
 from agents.screening import ScreeningResult
 from agents.validation import ValidationResult
 from agents.synthesis import SynthesisAssessment
+from agents.integrity import FORCE_KEY, SCREENING_ENERGY_KEY, STRESS_KEY, VALIDATION_ENERGY_KEY
 
 
 def test_candidate_record_serialization_and_flat_dict():
@@ -41,14 +42,14 @@ def test_candidate_record_serialization_and_flat_dict():
         generation_seed=43,
         target_elements=["Li", "P", "S"],
         screening_backend="chgnet",
-        screening_predictions={"formation_energy": -2.15, "stability": -0.25, "forces": 0.04},
+        screening_predictions={SCREENING_ENERGY_KEY: -2.15, FORCE_KEY: 0.04, STRESS_KEY: 0.1},
         screening_score=88.5,
         passes_screening_filters=True,
         screening_filter_reasons=[],
         screening_rank=1,
         validation_calculator="mock",
         validation_converged=True,
-        validation_properties={"energy_per_atom": -5.12, "stability": -0.22},
+        validation_properties={VALIDATION_ENERGY_KEY: -5.12, FORCE_KEY: 0.04, STRESS_KEY: 0.1},
         validation_cost_hours=1.2,
         synthesis_mode="mock",
         synthesis_feasible=True,
@@ -67,7 +68,7 @@ def test_candidate_record_serialization_and_flat_dict():
     data = record.to_dict()
     assert data["candidate_id"] == "MAT-000137"
     assert data["status"] == "accepted"
-    assert data["screening_predictions"]["formation_energy"] == -2.15
+    assert data["screening_predictions"][SCREENING_ENERGY_KEY] == -2.15
 
     restored = CandidateRecord.from_dict(data)
     assert restored.candidate_id == record.candidate_id
@@ -78,8 +79,8 @@ def test_candidate_record_serialization_and_flat_dict():
     flat = record.to_flat_dict()
     assert flat["candidate_id"] == "MAT-000137"
     assert flat["elements"] == "Li;P;S"
-    assert flat["screening_formation_energy"] == -2.15
-    assert flat["validation_energy_per_atom"] == -5.12
+    assert flat["screening_predicted_energy_per_atom_ev"] == -2.15
+    assert flat["validation_energy_per_atom_ev"] == -5.12
     assert flat["synthesis_route"] == "solid_state"
     assert flat["stored_in_memory"] is True
 
@@ -129,7 +130,7 @@ def test_manifest_creation_and_persistence():
             output_dir=tmp_path,
             master_seed=1234,
             config={"num_candidates": 5},
-            objective={"stability": -0.1},
+        objective={},
             constraints={"elements": ["Li", "P", "S"]},
         )
         manifest_path = tracker.write_manifest()
@@ -191,7 +192,7 @@ def test_full_candidate_lifecycle_tracking():
         screening_res = [
             (dummy_candidates[0], ScreeningResult(
                 structure_id="MAT-000001",
-                predictions={"formation_energy": -2.1, "stability": -0.2},
+                predictions={SCREENING_ENERGY_KEY: -2.1, FORCE_KEY: 0.1, STRESS_KEY: 0.1},
                 score=85.0,
                 passes_filters=True,
                 filter_reasons=[],
@@ -209,7 +210,7 @@ def test_full_candidate_lifecycle_tracking():
                 structure=dummy_candidates[0],
                 calculator="mock",
                 converged=True,
-                properties={"stability": -0.19, "energy_per_atom": -4.8},
+                properties={VALIDATION_ENERGY_KEY: -4.8, FORCE_KEY: 0.1, STRESS_KEY: 0.1},
                 cost_hours=0.5,
             )
         ]
@@ -282,15 +283,15 @@ def test_failed_candidate_rejection_reasons():
         screening_res = [
             (candidates[0], ScreeningResult(
                 structure_id="MAT-000010",
-                predictions={"formation_energy": -0.31, "stability": 0.45},
+                predictions={SCREENING_ENERGY_KEY: -2.0, FORCE_KEY: 9.0, STRESS_KEY: 0.1},
                 score=35.0,
                 passes_filters=False,
-                filter_reasons=["formation_energy -0.31 > -0.50 eV/atom threshold"],
+                filter_reasons=["max_force_ev_per_angstrom 9.000 > 1.0"],
                 rank=3,
             )),
             (candidates[1], ScreeningResult(
                 structure_id="MAT-000011",
-                predictions={"formation_energy": -1.8, "stability": -0.1},
+                predictions={SCREENING_ENERGY_KEY: -1.8, FORCE_KEY: 0.1, STRESS_KEY: 0.1},
                 score=75.0,
                 passes_filters=True,
                 filter_reasons=[],
@@ -298,7 +299,7 @@ def test_failed_candidate_rejection_reasons():
             )),
             (candidates[2], ScreeningResult(
                 structure_id="MAT-000012",
-                predictions={"formation_energy": -1.9, "stability": -0.15},
+                predictions={SCREENING_ENERGY_KEY: -1.9, FORCE_KEY: 0.1, STRESS_KEY: 0.1},
                 score=78.0,
                 passes_filters=True,
                 filter_reasons=[],
@@ -309,7 +310,7 @@ def test_failed_candidate_rejection_reasons():
         rec10 = tracker.records["MAT-000010"]
         assert rec10.status == CandidateStatus.REJECTED.value
         assert rec10.rejection_stage == "screening"
-        assert "formation_energy -0.31 > -0.50 eV/atom" in rec10.rejection_reason
+        assert "max_force_ev_per_angstrom 9.000 > 1.0" in rec10.rejection_reason
 
         # 2. Candidate 11 fails validation (non-converged)
         val_res = [
@@ -390,7 +391,7 @@ def test_report_matches_provenance_source_of_truth():
     with tempfile.TemporaryDirectory() as tmp:
         tmp_path = Path(tmp)
         objective = CampaignObjective(
-            target_properties={"stability": -0.1, "formation_energy": -2.0},
+            target_properties={},
             constraints={"elements": ["Li", "P", "S"], "max_atoms": 10},
             success_criteria={"min_score": 999.0},
             domain="test_campaign",
@@ -473,7 +474,7 @@ def test_multi_campaign_career_memory_duplicate_candidate_ids(tmp_path):
         formula="Li3PS4",
         score=92.0,
         passed=True,
-        properties={"stability": -0.2},
+        properties={SCREENING_ENERGY_KEY: -2.0, FORCE_KEY: 0.1, STRESS_KEY: 0.1},
         hypothesis_ids=[],
         principle_ids=[],
         iteration=0,
@@ -488,11 +489,10 @@ def test_multi_campaign_career_memory_duplicate_candidate_ids(tmp_path):
         formula="Li10GeP2S12",
         score=95.0,
         passed=True,
-        properties={"stability": -0.25},
+        properties={SCREENING_ENERGY_KEY: -2.1, FORCE_KEY: 0.1, STRESS_KEY: 0.1},
         hypothesis_ids=[],
         principle_ids=[],
         iteration=0,
         candidate_id="MAT-000001",
     )
     assert id2 == "campaign_2_MAT-000001"
-

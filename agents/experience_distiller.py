@@ -16,6 +16,7 @@ from typing import Dict, List, Any, Optional, Tuple
 
 from agents.career_memory import CareerMemory
 from agents.failure_attribution import record_failures
+from agents.transferable_memory import applicability_from_declaration, extract_transferable_features
 
 
 KNOWN_DOMAIN_ANALOGIES = {
@@ -36,7 +37,7 @@ KNOWN_DOMAIN_ANALOGIES = {
     ),
     ("battery_cathode", "li_solid_electrolyte"): (
         "Layered oxide frameworks studied as cathodes share structural features with "
-        "lithium-conducting oxides; stability criteria overlap"
+        "lithium-conducting oxides; structural criteria overlap"
     ),
 }
 
@@ -57,7 +58,8 @@ class ExperienceDistiller:
                           iteration: int,
                           candidates: List[Any],
                           screening_results: List[Any],
-                          strategy: Dict[str, Any]) -> Dict[str, Any]:
+                          strategy: Dict[str, Any],
+                          fail_closed: bool = False) -> Dict[str, Any]:
         """
         Main entry point. Call after each campaign iteration.
 
@@ -106,16 +108,17 @@ class ExperienceDistiller:
 
         # 4. Store all candidates with full provenance
         current_hypotheses = self._get_current_hypotheses(campaign_id, iteration)
-        self._store_candidates_with_provenance(
+        extraction_failures = self._store_candidates_with_provenance(
             campaign_id, domain, iteration, screening_results,
-            principles_written, current_hypotheses
+            principles_written, current_hypotheses, strategy=strategy, fail_closed=fail_closed
         )
 
         return {
             'principles_written': len(principles_written),
             'failures_recorded': len(failures_recorded),
             'cross_domain_links': len(cross_links),
-            'top_principles': [p['statement'] for p in principles_written[:3]]
+            'top_principles': [p['statement'] for p in principles_written[:3]],
+            'transferable_memory_failures': extraction_failures,
         }
 
     def distill_campaign_end(self,
@@ -135,7 +138,9 @@ class ExperienceDistiller:
         # Aggregate stats
         total_generated = sum(r.get('num_generated', 0) for r in all_results)
         total_screened = sum(r.get('num_screened', 0) for r in all_results)
-        best_scores = [r.get('insights', {}).get('avg_stability', 0) for r in all_results]
+        # Screening score is a neutral structural/target-quality score; raw
+        # per-atom energy is deliberately not used as a memory signal.
+        best_scores = [r.get('insights', {}).get('best_score', 0) for r in all_results]
         improving = len(best_scores) > 2 and best_scores[-1] > best_scores[0]
 
         # Build summary for LLM
@@ -178,7 +183,7 @@ class ExperienceDistiller:
             p_id = self.memory.store_principle(
                 domain=domain,
                 statement=p['statement'],
-                property_target=p.get('property_target', 'stability'),
+                property_target=p.get('property_target', 'screening_quality'),
                 structural_motif=p.get('structural_motif', 'unknown'),
                 campaign_id=campaign_id,
                 confidence=p.get('confidence', 0.5),
@@ -215,9 +220,9 @@ class ExperienceDistiller:
             principles.append({
                 'statement': (
                     f"In {domain}, combinations including {elem_str} consistently "
-                    f"pass stability screening — prioritize these in generation"
+                    f"pass diagnostic screening — prioritize these in generation"
                 ),
-                'property_target': 'stability',
+                'property_target': 'screening_quality',
                 'structural_motif': elem_str,
                 'confidence': min(0.7, 0.4 + 0.05 * len(passing))
             })
@@ -231,7 +236,7 @@ class ExperienceDistiller:
                     f"Iteration {domain} screening achieved avg score {avg_score:.2f} "
                     f"with elements {elements} — continue prioritizing this space"
                 ),
-                'property_target': list(target_props.keys())[0] if target_props else 'stability',
+                'property_target': list(target_props.keys())[0] if target_props else 'screening_quality',
                 'structural_motif': '+'.join(elements[:3]) if elements else 'mixed',
                 'confidence': 0.45
             })
@@ -355,9 +360,18 @@ Respond as JSON array:
         screening_results: List[Tuple],
         principles: List[Dict],
         hypothesis_ids: List[str],
-    ):
+        strategy: Optional[Dict[str, Any]] = None,
+        fail_closed: bool = False,
+    ) -> List[Dict[str, Any]]:
         """Store all screened candidates with full provenance."""
         principle_ids = [p['id'] for p in principles if 'id' in p]
+        failures: List[Dict[str, Any]] = []
+        strategy = strategy or {}
+        declaration = (
+            strategy.get("memory_transfer_declaration")
+            or strategy.get("transferability")
+            or strategy.get("memory_transfer")
+        )
         for struct, result in screening_results:
             cand_id = getattr(result, 'structure_id', None)
             if not cand_id and isinstance(struct, dict):
@@ -376,6 +390,40 @@ Respond as JSON array:
                 iteration=iteration,
                 candidate_id=cand_id,
             )
+            # Store a structure-aware evidence record alongside the historical
+            # formula/score row.  The record remains warm-start ineligible
+            # until ``CareerMemory.end_campaign`` finalizes its source run.
+            try:
+                explicit_applicability = applicability_from_declaration(
+                    declaration, source_features=extract_transferable_features(struct)
+                )
+                self.memory.store_transferable_evidence(
+                    campaign_id=campaign_id,
+                    domain=domain,
+                    structure=struct,
+                    result=result,
+                    principle_id=principle_ids[0] if principle_ids else None,
+                    source_candidate_id=cand_id,
+                    applicability=explicit_applicability,
+                    finalized=False,
+                )
+            except Exception as exc:
+                # Evidence extraction is additive and must not make the core
+                # campaign lifecycle fail for an incomplete/stub structure.
+                failure = {
+                    "candidate_id": cand_id,
+                    "iteration": iteration,
+                    "code": "TRANSFERABLE_FEATURE_EXTRACTION_FAILED",
+                    "reason": str(exc),
+                    "scientific_decision_support": False,
+                }
+                failures.append(failure)
+                if fail_closed:
+                    raise RuntimeError(
+                        f"Transferable memory extraction failed in research mode for {cand_id}: {exc}"
+                    ) from exc
+                print(f"  [Distiller] Transferable feature extraction skipped: {failure}")
+        return failures
 
     # -------------------------------------------------------------------------
     # Campaign-level summaries

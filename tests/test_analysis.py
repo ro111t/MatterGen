@@ -8,6 +8,7 @@ from dataclasses import dataclass, field
 from typing import Any, Dict
 
 from agents.analysis import AnalysisAgent
+from agents.integrity import SCREENING_ENERGY_KEY, VALIDATION_ENERGY_KEY
 
 
 @dataclass
@@ -27,24 +28,24 @@ class FakeValidationResult:
 
 
 def test_analysis_computes_mae():
-    a = AnalysisAgent(properties_to_compare=["formation_energy"])
+    a = AnalysisAgent(properties_to_compare=[SCREENING_ENERGY_KEY])
 
     screening_results = [
-        (None, FakeScreeningResult("s1", predictions={"formation_energy": -2.0})),
-        (None, FakeScreeningResult("s2", predictions={"formation_energy": -3.0})),
+        (None, FakeScreeningResult("s1", predictions={SCREENING_ENERGY_KEY: -2.0})),
+        (None, FakeScreeningResult("s2", predictions={SCREENING_ENERGY_KEY: -3.0})),
     ]
     validation_results = [
-        FakeValidationResult("s1", properties={"formation_energy": -2.5}),
-        FakeValidationResult("s2", properties={"formation_energy": -3.5}),
+        FakeValidationResult("s1", properties={VALIDATION_ENERGY_KEY: -2.5}),
+        FakeValidationResult("s2", properties={VALIDATION_ENERGY_KEY: -3.5}),
     ]
 
     result = a.analyze_batch(screening_results, validation_results)
 
     assert result.num_validated == 2
     assert result.num_converged == 2
-    assert "formation_energy" in result.ml_vs_dft_mae
+    assert SCREENING_ENERGY_KEY in result.ml_vs_dft_mae
     # MAE should be 0.5 for both
-    assert abs(result.ml_vs_dft_mae["formation_energy"] - 0.5) < 1e-6
+    assert abs(result.ml_vs_dft_mae[SCREENING_ENERGY_KEY] - 0.5) < 1e-6
     assert result.top_candidate_id in ("s1", "s2")
 
 
@@ -57,14 +58,14 @@ def test_analysis_no_validation_data():
 
 
 def test_analysis_detects_bias():
-    a = AnalysisAgent(properties_to_compare=["formation_energy"])
+    a = AnalysisAgent(properties_to_compare=[SCREENING_ENERGY_KEY])
     screening_results = [
-        (None, FakeScreeningResult("s1", predictions={"formation_energy": -1.0})),
-        (None, FakeScreeningResult("s2", predictions={"formation_energy": -1.0})),
+        (None, FakeScreeningResult("s1", predictions={SCREENING_ENERGY_KEY: -1.0})),
+        (None, FakeScreeningResult("s2", predictions={SCREENING_ENERGY_KEY: -1.0})),
     ]
     validation_results = [
-        FakeValidationResult("s1", properties={"formation_energy": -3.0}),
-        FakeValidationResult("s2", properties={"formation_energy": -3.0}),
+        FakeValidationResult("s1", properties={VALIDATION_ENERGY_KEY: -3.0}),
+        FakeValidationResult("s2", properties={VALIDATION_ENERGY_KEY: -3.0}),
     ]
 
     result = a.analyze_batch(screening_results, validation_results)

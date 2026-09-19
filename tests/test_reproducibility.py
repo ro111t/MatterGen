@@ -24,7 +24,7 @@ def test_campaign_reproduction_from_manifest():
         run2_dir = base_dir / "run2"
 
         objective = CampaignObjective(
-            target_properties={"stability": -0.1, "formation_energy": -2.0},
+            target_properties={},
             constraints={"elements": ["Li", "P", "S"], "max_atoms": 10},
             success_criteria={"min_score": 999.0},
             domain="repro_domain",
@@ -85,7 +85,7 @@ def test_manifest_iteration_seeds_preserved():
     with tempfile.TemporaryDirectory() as tmp:
         run_dir = Path(tmp) / "seed_test"
         objective = CampaignObjective(
-            target_properties={"stability": -0.1},
+            target_properties={},
             constraints={"elements": ["Li", "P", "S"]},
             success_criteria={"min_score": 999.0},
             domain="seed_domain",
@@ -160,7 +160,7 @@ def test_reproduction_detects_configuration_tampering():
         domain="li_battery",
         master_seed=42,
         iteration_seeds=[42, 43],
-        objective={"stability": -0.1},
+        objective={},
         constraints={"elements": ["Li", "P", "S"]},
         config={"num_candidates": 10},
     )
@@ -169,7 +169,7 @@ def test_reproduction_detects_configuration_tampering():
         domain="li_battery",
         master_seed=999,  # tampered seed
         iteration_seeds=[42, 43],
-        objective={"stability": -0.5},  # tampered objective
+        objective={"domain_target": "tampered"},  # tampered objective
         constraints={"elements": ["Li", "P", "S"]},
         config={"num_candidates": 10},
     )
@@ -188,7 +188,7 @@ def test_reproduce_from_manifest_raises_on_tampered_hash(tmp_path):
         domain="li_solid_electrolyte",
         master_seed=42,
         iteration_seeds=[42],
-        objective={"stability": -0.1},
+        objective={},
         constraints={"elements": ["Li", "P", "S"]},
     )
     manifest.manifest_hash = manifest.compute_manifest_hash()
@@ -211,7 +211,7 @@ def test_reproduce_dynamic_batch_sizes_candidate_count_parity(tmp_path):
     run2_dir = tmp_path / "run2"
 
     objective = CampaignObjective(
-        target_properties={"stability": -0.1},
+        target_properties={},
         constraints={"elements": ["Li", "P", "S"]},
         success_criteria={"min_score": 999.0},
         domain="dynamic_batch_test",
