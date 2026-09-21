@@ -110,11 +110,14 @@ class CampaignConfig:
     min_distance_angstrom: Optional[float] = None
     locked_elements: Optional[List[str]] = None
     allow_llm_orchestration: bool = True
+    strategy_mode: str = "adaptive"
 
     def __post_init__(self) -> None:
         self.run_mode = normalize_run_mode(self.run_mode)
         if self.memory_mode not in MEMORY_MODES:
             raise ValueError(f"memory_mode must be one of {MEMORY_MODES}")
+        if self.strategy_mode not in {"fixed", "adaptive"}:
+            raise ValueError("strategy_mode must be one of {'fixed', 'adaptive'}")
         if isinstance(self.memory_seed, bool):
             raise ValueError("memory_seed must be an integer")
         self.memory_seed = int(self.memory_seed)
@@ -249,6 +252,7 @@ class MaterialsDiscoveryCampaign:
                     if getattr(self.config, 'locked_elements', None) is not None else None
                 ),
                 'allow_llm_orchestration': bool(getattr(self.config, 'allow_llm_orchestration', True)),
+                'strategy_mode': getattr(self.config, 'strategy_mode', 'adaptive'),
                 'memory_transfer_declaration': (
                     self.config.objective.constraints.get('memory_transfer_declaration')
                     or self.config.objective.constraints.get('transferability')
@@ -441,23 +445,73 @@ class MaterialsDiscoveryCampaign:
 
         return final_results
         
+    def _recommend_policy(self, strategy: Dict[str, Any], iter_seed: int) -> Dict[str, Any]:
+        if self.config.strategy_mode == "fixed":
+            return {
+                "diversity_weight": strategy["diversity_weight"],
+                "target_compositions_dict": [],
+                "num_memory_guided_proposals": 0,
+                "num_exploratory_proposals": strategy["num_candidates"],
+            }
+        return self.strategy.recommend(
+            objective=self.config.objective,
+            history=self.results_history,
+            directives=strategy.get("memory_directives", []),
+            seed=iter_seed,
+        )
+
+    def _update_strategy_state(self, strategy: Dict[str, Any], insights: Dict[str, Any]) -> None:
+        if self.config.strategy_mode == "fixed":
+            self.current_recommendations = None
+            return
+        self.strategy.update(iteration=self.iteration, strategy=strategy, insights=insights)
+        next_iter_seed = getattr(self.config, "master_seed", 42) + self.iteration + 1
+        self.current_recommendations = self.strategy.recommend(
+            objective=self.config.objective,
+            history=self.results_history,
+            directives=strategy.get("memory_directives", []),
+            seed=next_iter_seed,
+        )
+        self._log(f"\n[Strategy] Next iteration recommendation: {self.current_recommendations['rationale']}")
+
     def _run_iteration(self) -> Dict[str, Any]:
         """Execute one iteration: plan → generate → screen → validate → synthesize → distill → report."""
         budget_before = self.budget_tracker.to_dict()
 
         # 1. Plan with career memory warm-start and strategy-agent recommendations
         self._log("\n[1/6] Planning...")
-        strategy = self.orchestrator.plan_iteration(
-            objective=self.config.objective,
-            history=self.results_history,
-            campaign_id=self.campaign_id,
-            iteration=self.iteration,
-            recommendations=self.current_recommendations,
-        )
-        if not strategy.get("_replayed"):
-            # Only set user-configured batch size on the first iteration if no recommendation exists
-            if self.iteration == 0 and not self.current_recommendations and self.config.num_candidates:
-                strategy['num_candidates'] = self.config.num_candidates
+        if self.config.strategy_mode == "fixed":
+            strategy = {
+                "elements": list(self.config.locked_elements or self.config.objective.constraints.get("elements", [])),
+                "num_candidates": self.config.num_candidates,
+                "screening_criteria": {"max_force_ev_per_angstrom": 500.0},
+                "diversity_weight": 0.4,
+                "memory_directives": [],
+                "target_compositions_dict": [],
+                "num_memory_guided_proposals": 0,
+                "num_exploratory_proposals": self.config.num_candidates,
+                "memory_directive_audit": {
+                    "mode": "none", "seed": self.config.memory_seed, "applied": [],
+                    "rejected": [], "unsupported": [], "eligible_record_ids": [],
+                    "shuffle_audit": None, "text_policy_artifact": None,
+                },
+                "memory_policy": {"applied": [], "supported_effects": [], "control_only": False},
+                "strategy_mode": "fixed",
+                "rationale": "fixed non-adaptive MatterGen baseline",
+                "hypothesis": None,
+            }
+        else:
+            strategy = self.orchestrator.plan_iteration(
+                objective=self.config.objective,
+                history=self.results_history,
+                campaign_id=self.campaign_id,
+                iteration=self.iteration,
+                recommendations=self.current_recommendations,
+            )
+            strategy["strategy_mode"] = "adaptive"
+            if not strategy.get("_replayed"):
+                if self.iteration == 0 and not self.current_recommendations and self.config.num_candidates:
+                    strategy['num_candidates'] = self.config.num_candidates
 
         # Deterministic seed for this iteration; used by the generator and for
         # the exploratory target-composition sampling in the strategy policy.
@@ -473,20 +527,16 @@ class MaterialsDiscoveryCampaign:
         # Allow the in-campaign policy to consume the structured memory
         # directives retrieved by the orchestrator.  It produces the concrete
         # target-composition conditioning for the generator.
-        policy_recommendations = self.strategy.recommend(
-            objective=self.config.objective,
-            history=self.results_history,
-            directives=strategy.get("memory_directives", []),
-            seed=iter_seed,
-        )
-        if policy_recommendations.get("diversity_weight") is not None:
-            strategy["diversity_weight"] = float(policy_recommendations["diversity_weight"])
-        if policy_recommendations.get("target_compositions_dict") is not None:
-            strategy["target_compositions_dict"] = list(policy_recommendations["target_compositions_dict"])
-        if policy_recommendations.get("num_memory_guided_proposals") is not None:
-            strategy["num_memory_guided_proposals"] = int(policy_recommendations["num_memory_guided_proposals"])
-        if policy_recommendations.get("num_exploratory_proposals") is not None:
-            strategy["num_exploratory_proposals"] = int(policy_recommendations["num_exploratory_proposals"])
+        policy_recommendations = self._recommend_policy(strategy, iter_seed)
+        if self.config.strategy_mode == "adaptive":
+            if policy_recommendations.get("diversity_weight") is not None:
+                strategy["diversity_weight"] = float(policy_recommendations["diversity_weight"])
+            if policy_recommendations.get("target_compositions_dict") is not None:
+                strategy["target_compositions_dict"] = list(policy_recommendations["target_compositions_dict"])
+            if policy_recommendations.get("num_memory_guided_proposals") is not None:
+                strategy["num_memory_guided_proposals"] = int(policy_recommendations["num_memory_guided_proposals"])
+            if policy_recommendations.get("num_exploratory_proposals") is not None:
+                strategy["num_exploratory_proposals"] = int(policy_recommendations["num_exploratory_proposals"])
 
         remaining_iterations = max(1, self.config.objective.max_iterations - self.iteration)
         strategy_requested_num = strategy.get('num_candidates')
@@ -613,6 +663,12 @@ class MaterialsDiscoveryCampaign:
                 'memory_directive_hashes': [
                     _stable_hash(d) for d in strategy.get('memory_directives', [])
                 ],
+                'eligible_memory_record_ids': list(
+                    (strategy.get('memory_directive_audit', {}) or {}).get('eligible_record_ids', [])
+                ),
+                'text_policy_artifact': (
+                    strategy.get('memory_directive_audit', {}) or {}
+                ).get('text_policy_artifact'),
                 'diversity_weight': float(strategy.get('diversity_weight', 0.4)),
                 'target_compositions_dict': requested_target_compositions,
                 'num_memory_guided_proposals': num_memory_guided,
@@ -864,20 +920,7 @@ class MaterialsDiscoveryCampaign:
         report = self.orchestrator.interpret_results(insights)
         self._log(f"\n  {report}")
 
-        # Update adaptive strategy agent and get recommendation for next iteration
-        self.strategy.update(
-            iteration=self.iteration,
-            strategy=strategy,
-            insights=insights,
-        )
-        next_iter_seed = getattr(self.config, "master_seed", 42) + self.iteration + 1
-        self.current_recommendations = self.strategy.recommend(
-            objective=self.config.objective,
-            history=self.results_history,
-            directives=strategy.get("memory_directives", []),
-            seed=next_iter_seed,
-        )
-        self._log(f"\n[Strategy] Next iteration recommendation: {self.current_recommendations['rationale']}")
+        self._update_strategy_state(strategy, insights)
 
         return {
             'iteration': self.iteration,
@@ -1005,6 +1048,7 @@ class MaterialsDiscoveryCampaign:
                     if getattr(self.config, 'locked_elements', None) is not None else None
                 ),
                 'allow_llm_orchestration': bool(getattr(self.config, 'allow_llm_orchestration', True)),
+                'strategy_mode': getattr(self.config, 'strategy_mode', 'adaptive'),
                 'memory_transfer_declaration': (
                     self.config.objective.constraints.get('memory_transfer_declaration')
                     or self.config.objective.constraints.get('transferability')
@@ -1203,6 +1247,7 @@ class MaterialsDiscoveryCampaign:
             memory_seed=cfg_data.get('memory_seed', 0),
             locked_elements=cfg_data.get('locked_elements'),
             allow_llm_orchestration=cfg_data.get('allow_llm_orchestration', True),
+            strategy_mode=cfg_data.get('strategy_mode', 'adaptive'),
             use_validation=cfg_data.get('use_validation', True),
             validation_top_k=cfg_data.get('validation_top_k', 5),
             use_synthesis=cfg_data.get('use_synthesis', True),

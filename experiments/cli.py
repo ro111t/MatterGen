@@ -504,6 +504,7 @@ def _build_run_spec(spec: ExperimentSpec, node: DAGNode, dag: ExperimentDAG) -> 
         # The benchmark pipeline always disables LLM orchestration so that the
         # memory ablation is a deterministic, reproducible policy comparison.
         allow_llm_orchestration=False,
+        strategy_mode=("fixed" if payload.get("condition") == "random_mattergen" else "adaptive"),
     )
 
 

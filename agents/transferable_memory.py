@@ -41,6 +41,7 @@ except Exception:
 
 
 TRANSFERABLE_SCHEMA_VERSION = SCHEMA_VERSION
+TEXT_POLICY_TRANSLATOR_VERSION = "1.0.0"
 MEMORY_MODES = ("none", "text_summary", "structured_provenance", "shuffled_control")
 RELATIONSHIPS = (
     "same_system",
@@ -768,10 +769,20 @@ def applicability_from_declaration(
         source_system = sorted(source_features.element_classes)
     target_system = raw.get("target_chemical_system", raw.get("target_elements", []))
     ranges = raw.get("feature_ranges", {})
+    allowed_classes = {
+        str(k): list(v)
+        for k, v in (raw.get("allowed_element_classes", raw.get("element_class_mapping", {})) or {}).items()
+    }
+    if not allowed_classes and relationship in {
+        "chalcogen_substitution", "alkali_substitution", "isoelectronic_substitution",
+        "homologous_series", "element_class_mapping",
+    }:
+        for symbol in _normalize_chemical_system(target_system):
+            allowed_classes.setdefault(_periodic_class(symbol), []).append(symbol)
     return ApplicabilityConstraint(
         allowed_relationship=str(relationship),
         feature_ranges={str(k): tuple(v) for k, v in ranges.items()},
-        allowed_element_classes={str(k): list(v) for k, v in (raw.get("allowed_element_classes", raw.get("element_class_mapping", {})) or {}).items()},
+        allowed_element_classes=allowed_classes,
         source_chemical_system=_normalize_chemical_system(source_system),
         target_chemical_system=_normalize_chemical_system(target_system),
         min_evidence=max(1, int(raw.get("min_evidence", 1))),
@@ -1182,6 +1193,67 @@ def summarize_records(records: Sequence[TransferableMemoryRecord]) -> str:
     """Compact deterministic text view used in prompts and audit logs."""
     view = view_records(records, "text_summary")
     return str(view.get("text", ""))
+
+
+def translate_text_policy(text: str) -> Dict[str, Any]:
+    """Translate only frozen text bytes into a coarse deterministic policy."""
+    entries = []
+    pattern = re.compile(
+        r"^(?P<record>[^:]+): outcome=(?P<outcome>[^;]+); "
+        r"anonymous_stoichiometry=(?P<stoichiometry>[^;]+); prototype=(?P<prototype>.+)$"
+    )
+    for line in str(text).splitlines():
+        match = pattern.fullmatch(line.strip())
+        if not match:
+            continue
+        stoichiometry = match.group("stoichiometry").strip()
+        prototype = match.group("prototype").strip()
+        entries.append({
+            "record": match.group("record").strip(),
+            "stoichiometry": None if stoichiometry in {"None", ""} else stoichiometry,
+            "prototype": None if prototype in {"None", ""} else prototype,
+        })
+    unique_preferences = {
+        (entry["stoichiometry"], entry["prototype"]) for entry in entries
+        if entry["stoichiometry"] or entry["prototype"]
+    }
+    exploration = min(0.7, max(0.2, 0.6 - 0.05 * len(unique_preferences)))
+    directives = []
+    for index, entry in enumerate(entries):
+        directives.append({
+            "record_id": f"text_policy_{index:04d}",
+            "preferred_anonymous_stoichiometries": (
+                [entry["stoichiometry"]] if entry["stoichiometry"] else []
+            ),
+            "preferred_prototypes": [entry["prototype"]] if entry["prototype"] else [],
+            "exploration_weight": exploration,
+            "exploitation_weight": 1.0 - exploration,
+            "supported_policy_effects": ["exploration_weight", "exploitation_weight", "text_prioritization"],
+            "unsupported_policy_effects": ["concrete_target_composition_mapping"],
+            "bounded": True,
+            "bypasses_geometry_gate": False,
+            "bypasses_thermodynamic_gate": False,
+        })
+    policy = {
+        "translator_version": TEXT_POLICY_TRANSLATOR_VERSION,
+        "directives": directives,
+    }
+    policy["policy_sha256"] = _stable_hash(policy)
+    return policy
+
+
+def build_text_policy_artifact(records: Sequence[TransferableMemoryRecord]) -> Dict[str, Any]:
+    text = summarize_records(records)
+    policy = translate_text_policy(text)
+    return {
+        "artifact_schema_version": "1.0.0",
+        "translator_version": TEXT_POLICY_TRANSLATOR_VERSION,
+        "text": text,
+        "text_sha256": hashlib.sha256(text.encode("utf-8")).hexdigest(),
+        "policy": policy,
+        "policy_sha256": policy["policy_sha256"],
+        "eligible_record_ids": [record.record_id for record in records],
+    }
 
 
 def directive_match_score(structure: Any, directives: Sequence[Mapping[str, Any]]) -> Tuple[float, List[str]]:

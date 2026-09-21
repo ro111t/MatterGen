@@ -15,6 +15,7 @@ from agents.transferable_memory import (
     TransferableFeatures,
     TransferableMemoryRecord,
     applicability_check,
+    build_text_policy_artifact,
     extract_transferable_features,
     make_directive,
     view_records,
@@ -22,6 +23,7 @@ from agents.transferable_memory import (
 from agents.screening import ScreeningResult
 from agents.thermodynamics import ThermodynamicResult
 from agents.orchestrator import CampaignObjective, OrchestratorAgent
+from agents.strategy import StrategyAgent
 from agents.transferable_memory import prioritize_candidates
 from agents.provenance import ProvenanceTracker
 from agents.budget import DualBudgetTracker
@@ -350,7 +352,15 @@ def test_memory_modes_reach_distinct_planning_context_and_policy(tmp_path):
     memory.end_campaign(source, {})
     objective = CampaignObjective(
         target_properties={"screening_quality": 1.0},
-        constraints={"elements": ["Li", "P", "S"]},
+        constraints={
+            "elements": ["Li", "P", "S"],
+            "memory_transfer_declaration": {
+                "allowed_relationship": "same_system",
+                "source_chemical_system": ["Li", "P", "S"],
+                "target_chemical_system": ["Li", "P", "S"],
+                "confidence": 0.8,
+            },
+        },
         success_criteria={},
         domain="x",
     )
@@ -368,10 +378,110 @@ def test_memory_modes_reach_distinct_planning_context_and_policy(tmp_path):
     assert "STRUCTURED TRANSFERABLE MEMORY" in prompts["structured_provenance"]
     assert "invalid for scientific decisions" in prompts["shuffled_control"]
     assert strategies["none"]["memory_policy"]["applied"] == []
-    assert strategies["text_summary"]["memory_policy"]["applied"] == []
+    assert strategies["text_summary"]["memory_policy"]["applied"]
+    assert strategies["text_summary"]["memory_directive_audit"]["text_policy_artifact"]["text_sha256"]
     assert strategies["structured_provenance"]["memory_policy"]["applied"]
     assert strategies["shuffled_control"]["memory_policy"]["applied"]
+    audits = [
+        strategies[mode]["memory_directive_audit"]
+        for mode in ("text_summary", "structured_provenance", "shuffled_control")
+    ]
+    assert audits[0]["eligible_record_ids"] == audits[1]["eligible_record_ids"] == audits[2]["eligible_record_ids"]
+    structured_directives = strategies["structured_provenance"]["memory_directives"]
+    shuffled_directives = strategies["shuffled_control"]["memory_directives"]
+    assert len(structured_directives) == len(shuffled_directives) == 3
+    assert sorted(d["exploration_weight"] for d in structured_directives) == sorted(
+        d["exploration_weight"] for d in shuffled_directives
+    )
+    assert audits[2]["shuffle_audit"]["fixed_points"] == 0
     assert strategies["shuffled_control"]["memory_directive_audit"]["scientific_decision_support"] is False
+
+
+def test_text_policy_depends_only_on_frozen_text_representation():
+    features = extract_transferable_features(_structure())
+    first = TransferableMemoryRecord(
+        record_id="same", outcome_label="stable", features=features,
+        applicability=ApplicabilityConstraint(confidence=0.2),
+        directive=TransferDirective(exploration_weight=0.1),
+    )
+    second = TransferableMemoryRecord(
+        record_id="same", outcome_label="stable", features=features,
+        applicability=ApplicabilityConstraint(confidence=0.9),
+        directive=TransferDirective(exploration_weight=0.8, preferred_coordination_motifs=["hidden"]),
+    )
+    first_artifact = build_text_policy_artifact([first])
+    second_artifact = build_text_policy_artifact([second])
+    assert first_artifact["text"] == second_artifact["text"]
+    assert first_artifact["policy"] == second_artifact["policy"]
+
+
+def test_memory_representations_share_authorized_eligible_corpus(tmp_path):
+    memory = CareerMemory(str(tmp_path / "eligible.db"))
+    source = memory.start_campaign("Li-P-S source", "materials", {})
+    features = extract_transferable_features(_structure())
+    for record_id, outcome in (("p1", "stable"), ("p2", "retained"), ("negative", "failed")):
+        memory.store_transferable_record(TransferableMemoryRecord(
+            record_id=record_id,
+            campaign_ids=[source],
+            source_domain="materials",
+            source_formulas=["Li2PS3"],
+            outcome_label=outcome,
+            finalized=False,
+            features=TransferableFeatures(**{
+                **features.to_dict(), "structural_prototype": f"prototype-{record_id}"
+            }),
+            applicability=ApplicabilityConstraint(confidence=0.8),
+            directive=TransferDirective(exploration_weight=0.3),
+        ))
+    memory.end_campaign(source, {})
+    unrelated = memory.start_campaign("unrelated", "materials", {})
+    memory.store_transferable_record(TransferableMemoryRecord(
+        record_id="unrelated", campaign_ids=[unrelated], source_domain="materials",
+        source_formulas=["NaCl"], outcome_label="stable", finalized=False,
+        features=extract_transferable_features(_structure("NaCl", ["Na", "Cl"], "unrelated")),
+        applicability=ApplicabilityConstraint(confidence=0.8),
+    ))
+    memory.end_campaign(unrelated, {})
+    current = memory.start_campaign("current", "materials", {})
+    memory.store_transferable_record(TransferableMemoryRecord(
+        record_id="current", campaign_ids=[current], source_domain="materials",
+        source_formulas=["Li2PS3"], outcome_label="stable", finalized=False,
+        features=features, applicability=ApplicabilityConstraint(confidence=0.8),
+    ))
+    objective = CampaignObjective(
+        target_properties={"screening_quality": 1.0},
+        constraints={
+            "elements": ["Li", "P", "Se"],
+            "memory_transfer_declaration": {
+                "allowed_relationship": "homologous_series",
+                "source_chemical_system": ["Li", "P", "S"],
+                "target_chemical_system": ["Li", "P", "Se"],
+                "confidence": 0.8,
+            },
+        },
+        success_criteria={}, domain="materials",
+    )
+    strategies = {}
+    for mode in ("text_summary", "structured_provenance", "shuffled_control"):
+        agent = OrchestratorAgent(memory, memory_mode=mode, memory_seed=7, allow_llm=False)
+        assert agent.llm_available is False
+        strategies[mode] = agent.plan_iteration(objective, [], campaign_id=current, iteration=0)
+    audits = {mode: strategy["memory_directive_audit"] for mode, strategy in strategies.items()}
+    eligible_ids = audits["structured_provenance"]["eligible_record_ids"]
+    assert set(eligible_ids) == {"p1", "p2"}
+    assert audits["text_summary"]["eligible_record_ids"] == eligible_ids
+    assert audits["shuffled_control"]["eligible_record_ids"] == eligible_ids
+    assert all(len(strategies[mode]["memory_directives"]) == 2 for mode in strategies)
+    structured_policy = StrategyAgent().recommend(
+        objective, [], directives=strategies["structured_provenance"]["memory_directives"], seed=7
+    )
+    assert structured_policy["target_compositions_dict"]
+    assert audits["shuffled_control"]["shuffle_audit"]["fixed_points"] == 0
+    assert sorted(d["exploration_weight"] for d in strategies["structured_provenance"]["memory_directives"]) == sorted(
+        d["exploration_weight"] for d in strategies["shuffled_control"]["memory_directives"]
+    )
+    rejected = {item["record_id"] for item in audits["structured_provenance"]["rejected"]}
+    assert {"negative", "current", "unrelated"} <= rejected
 
 
 def test_pre_oracle_priority_is_bounded_and_changes_order_without_gate_changes():

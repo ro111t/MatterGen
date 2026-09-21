@@ -489,14 +489,10 @@ class CampaignRunner:
                 allow_llm_orchestration=(
                     False if spec.condition in FIVE_CONDITIONS
                     else getattr(spec, "allow_llm_orchestration", True)
-                ))
+                ),
+                strategy_mode=spec.strategy_mode)
             start = time.time()
             campaign = MaterialsDiscoveryCampaign(config=config)
-            if spec.condition == "random_mattergen":
-                campaign.orchestrator.plan_iteration = lambda **kwargs: {
-                    "elements": list(spec.elements), "num_candidates": target_candidates_per_iter,
-                    "screening_criteria": {}, "memory_directives": [],
-                    "rationale": "fixed random MatterGen baseline", "hypothesis": None}
             campaign.run_campaign()
 
             if spec.condition in MEMORY_ARMS:

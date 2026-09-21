@@ -241,6 +241,7 @@ class RunSpec:
     validation_calculator: str = "mock"
     synthesis_mode: str = "mock"
     allow_llm_orchestration: bool = True
+    strategy_mode: str = "adaptive"
 
     def __post_init__(self):
         valid_conditions = FIVE_CONDITIONS + ("source_neutral",)
@@ -258,6 +259,13 @@ class RunSpec:
             raise ExperimentSpecError("run_mode must be 'development' or 'research'")
         if self.generation_backend not in {"mock", "mattergen"}:
             raise ExperimentSpecError("generation_backend must be one of {'mock', 'mattergen'}")
+        if self.strategy_mode not in {"fixed", "adaptive"}:
+            raise ExperimentSpecError("strategy_mode must be one of {'fixed', 'adaptive'}")
+        expected_strategy_mode = "fixed" if self.condition == "random_mattergen" else "adaptive"
+        if self.strategy_mode != expected_strategy_mode:
+            raise ExperimentSpecError(
+                f"Condition '{self.condition}' requires strategy_mode='{expected_strategy_mode}'"
+            )
         if self.run_mode == "research" and self.generation_backend != "mattergen":
             raise ExperimentSpecError("research runs require generation_backend='mattergen'")
         if self.run_mode == "research":

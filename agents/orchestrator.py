@@ -10,7 +10,14 @@ except ImportError:
     HAS_OPENAI = False
 
 from agents.career_memory import CareerMemory
-from agents.transferable_memory import TransferableFeatures, extract_transferable_features
+from agents.transferable_memory import (
+    TransferableFeatures,
+    TransferableMemoryRecord,
+    build_text_policy_artifact,
+    extract_transferable_features,
+    make_directive,
+    view_records,
+)
 
 
 @dataclass
@@ -81,6 +88,8 @@ class OrchestratorAgent:
             "scientific_decision_support": transfer.get("scientific_decision_support", True),
             "unsupported": transfer.get("unsupported", []),
             "shuffle_audit": transfer.get("shuffle_audit"),
+            "eligible_record_ids": transfer.get("eligible_record_ids", []),
+            "text_policy_artifact": transfer.get("text_policy_artifact"),
         }
         if self.locked_elements is not None:
             strategy["elements"] = list(self.locked_elements)
@@ -201,6 +210,8 @@ Example:
             "scientific_decision_support": transfer.get("scientific_decision_support", True),
             "unsupported": transfer.get("unsupported", []),
             "shuffle_audit": transfer.get("shuffle_audit"),
+            "eligible_record_ids": transfer.get("eligible_record_ids", []),
+            "text_policy_artifact": transfer.get("text_policy_artifact"),
         }
 
         # Record hypothesis in career memory
@@ -343,42 +354,67 @@ Focus on: what worked, what failed, one concrete recommendation."""
         else:
             elements = constraints.get("elements", [])
             target_features = extract_transferable_features({"elements": elements})
+        declaration = (
+            constraints.get("memory_transfer_declaration")
+            or constraints.get("transferability")
+            or constraints.get("memory_transfer")
+        )
+        if not declaration:
+            empty["rejected"].append({
+                "record_id": "TRANSFER_CORPUS",
+                "reasons": ["EXPLICIT_TRANSFER_DECLARATION_REQUIRED"],
+            })
+            return empty
+        selection = self.career_memory.get_authorized_transferable_memories(
+            target_features=target_features,
+            target_domain=objective.domain,
+            target_elements=constraints.get("elements"),
+            transfer_declaration=dict(declaration),
+            target_campaign_id=target_campaign_id,
+        )
+        records = [
+            TransferableMemoryRecord.from_dict(item["record"])
+            for item in selection["applied"]
+        ]
+        empty["applied"] = [
+            {"record_id": record.record_id, "reasons": ["APPLICABLE"]}
+            for record in records
+        ]
+        empty["rejected"] = selection["rejected"]
+        empty["record_count"] = selection["record_count"]
+        empty["eligible_record_ids"] = [record.record_id for record in records]
         if self.memory_mode == "text_summary":
-            # Text is useful context for an LLM but cannot be converted back
-            # into an executable scientific directive.
-            view = self.career_memory.memory_view(self.memory_mode, seed=self.memory_seed, target_campaign_id=target_campaign_id)
-            empty["text_summary"] = view.get("text", "")
-            empty["rejected"] = view.get("chronology_rejected", [])
+            artifact = build_text_policy_artifact(records)
+            empty["text_summary"] = artifact["text"]
+            empty["text_policy_artifact"] = artifact
+            empty["directives"] = list(artifact["policy"]["directives"])
             return empty
         if self.memory_mode == "shuffled_control":
-            view = self.career_memory.memory_view(self.memory_mode, seed=self.memory_seed, target_campaign_id=target_campaign_id)
+            view = view_records(records, self.memory_mode, seed=self.memory_seed)
             empty["memory_view"] = view
             audit = view.get("shuffle_audit")
             empty["shuffle_audit"] = audit
-            empty["rejected"] = view.get("chronology_rejected", [])
             valid_derangement = bool(
                 isinstance(audit, dict) and audit.get("valid") is True
                 and int(audit.get("fixed_points", -1)) == 0
             )
             if view.get("records") and valid_derangement:
-                from agents.transferable_memory import TransferableMemoryRecord, make_directive
-                empty["directives"] = [make_directive(TransferableMemoryRecord.from_dict(item)) for item in view["records"]]
-                empty["applied"] = [{"record_id": d["record_id"], "reasons": ["SHUFFLED_CONTROL_POLICY_ONLY"]} for d in empty["directives"]]
-                empty["unsupported"] = [{"record_id": d["record_id"], "reasons": ["CONTROL_ONLY_NOT_SCIENTIFIC_DECISION_SUPPORT"]} for d in empty["directives"]]
-            elif view.get("records"):
-                empty["rejected"].append({
-                    "record_id": "SHUFFLED_CONTROL",
-                    "reasons": ["INVALID_OR_NON_DERANGED_SHUFFLE_AUDIT"],
-                })
+                empty["directives"] = [
+                    make_directive(TransferableMemoryRecord.from_dict(item))
+                    for item in view["records"]
+                ]
+                empty["unsupported"] = [
+                    {"record_id": directive["record_id"], "reasons": ["CONTROL_ONLY_NOT_SCIENTIFIC_DECISION_SUPPORT"]}
+                    for directive in empty["directives"]
+                ]
             return empty
-        result = self.career_memory.get_transferable_directives(
-            target_features=target_features,
-            target_domain=objective.domain,
-            target_elements=constraints.get("elements"),
-            target_campaign_id=target_campaign_id,
-        )
-        result["scientific_decision_support"] = True
-        return result
+        empty["directives"] = [make_directive(record) for record in records]
+        empty["unsupported"] = [
+            {"record_id": directive["record_id"], "reasons": [f"UNSUPPORTED_EFFECT:{name}" for name in directive["unsupported_policy_effects"]]}
+            for directive in empty["directives"] if directive.get("unsupported_policy_effects")
+        ]
+        empty["scientific_decision_support"] = True
+        return empty
 
     @staticmethod
     def _apply_transfer_policy(strategy: Dict[str, Any], transfer: Dict[str, Any]) -> Dict[str, Any]:

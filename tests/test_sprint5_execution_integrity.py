@@ -300,10 +300,13 @@ def test_run_spec_condition_configuration_is_distinct(tmp_path):
         thermodynamics_stable_threshold_ev_per_atom=.03, run_mode="development",
         generation_backend="mock", memory_seed=1, output_dir=str(tmp_path),
     )
-    random = RunSpec(condition="random_mattergen", memory_mode="none", **base)
+    random = RunSpec(condition="random_mattergen", memory_mode="none", strategy_mode="fixed", **base)
     adaptive = RunSpec(condition="adaptive_no_memory", memory_mode="none", **base)
     assert random.condition != adaptive.condition
     assert random.memory_mode == adaptive.memory_mode == "none"
+    assert random.strategy_mode == "fixed"
+    assert adaptive.strategy_mode == "adaptive"
+    assert random.spec_hash != adaptive.spec_hash
 
 
 def _memory_run_spec(output_dir: Path, snapshot: Path, snapshot_sha: str) -> RunSpec:

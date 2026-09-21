@@ -34,6 +34,7 @@ from agents.transferable_memory import (
     TransferableMemoryRecord,
     TransferDirective,
     applicability_check,
+    applicability_from_declaration,
     evidence_fingerprint,
     extract_transferable_features,
     make_directive,
@@ -804,9 +805,80 @@ class CareerMemory:
             (applied if ok else rejected).append(item)
         return {"applied": applied, "rejected": rejected, "record_count": len(applied) + len(rejected)}
 
+    def get_authorized_transferable_memories(
+        self,
+        *,
+        target_features: TransferableFeatures,
+        target_domain: Optional[str],
+        target_elements: Optional[List[str]],
+        transfer_declaration: Dict[str, Any],
+        target_campaign_id: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """Select one frozen corpus using an explicit target transfer declaration."""
+        applied, rejected = [], []
+        target_start_time = None
+        if target_campaign_id:
+            row = self.conn.cursor().execute(
+                "SELECT start_time FROM campaigns WHERE id=?", (target_campaign_id,)
+            ).fetchone()
+            target_start_time = row[0] if row else None
+        for stored in self.get_transferable_records(finalized_only=False):
+            if target_campaign_id and target_campaign_id in stored.campaign_ids:
+                rejected.append({"record_id": stored.record_id, "reasons": ["CURRENT_CAMPAIGN_EXCLUDED"], "record": stored.to_dict()})
+                continue
+            chronology_reason = self._prior_campaign_reason(
+                stored.campaign_ids, target_campaign_id, target_start_time
+            )
+            if chronology_reason is not None:
+                rejected.append({"record_id": stored.record_id, "reasons": [chronology_reason], "record": stored.to_dict()})
+                continue
+            outcome_reason = _directive_outcome_rejection_reason(stored.outcome_label)
+            if outcome_reason is not None:
+                rejected.append({"record_id": stored.record_id, "reasons": [outcome_reason], "record": stored.to_dict()})
+                continue
+            record = TransferableMemoryRecord.from_dict(stored.to_dict())
+            authorized = applicability_from_declaration(
+                transfer_declaration, source_features=record.features
+            )
+            if authorized is None:
+                rejected.append({"record_id": record.record_id, "reasons": ["EXPLICIT_TRANSFER_DECLARATION_REQUIRED"], "record": record.to_dict()})
+                continue
+            stored_applicability = record.applicability
+            authorized.feature_ranges = {
+                **stored_applicability.feature_ranges,
+                **authorized.feature_ranges,
+            }
+            authorized.min_evidence = max(
+                stored_applicability.min_evidence, authorized.min_evidence
+            )
+            authorized.evidence_count = stored_applicability.evidence_count
+            authorized.confidence = min(
+                stored_applicability.confidence, authorized.confidence
+            )
+            authorized.uncertainty = stored_applicability.uncertainty
+            authorized.observed_outcome_direction = stored_applicability.observed_outcome_direction
+            record.applicability = authorized
+            ok, reasons = applicability_check(
+                record,
+                target_features,
+                target_domain=target_domain,
+                target_elements=target_elements,
+            )
+            item = {"record_id": record.record_id, "reasons": reasons, "record": record.to_dict()}
+            (applied if ok else rejected).append(item)
+        applied.sort(key=lambda item: str(item["record_id"]))
+        rejected.sort(key=lambda item: str(item["record_id"]))
+        return {"applied": applied, "rejected": rejected, "record_count": len(applied) + len(rejected)}
+
     def get_transferable_directives(self, **kwargs: Any) -> Dict[str, Any]:
         """Convenience wrapper yielding planner directives plus audit reasons."""
-        selection = self.get_applicable_transferable_memories(**kwargs)
+        transfer_declaration = kwargs.pop("transfer_declaration", None)
+        if transfer_declaration:
+            selection = self.get_authorized_transferable_memories(
+                transfer_declaration=transfer_declaration, **kwargs
+            )
+        else:
+            selection = self.get_applicable_transferable_memories(**kwargs)
         directives = []
         unsupported = []
         eligible_items = []

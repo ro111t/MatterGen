@@ -2,12 +2,14 @@
 
 import random
 from dataclasses import dataclass
+from types import SimpleNamespace
 from typing import Any, Dict, List
 from unittest.mock import MagicMock
 
 import pytest
 
 from agents.generator import GenerationAgent, MattergenGenerator
+from campaign import MaterialsDiscoveryCampaign
 from agents.orchestrator import OrchestratorAgent
 from agents.strategy import (
     StrategyAgent,
@@ -15,7 +17,11 @@ from agents.strategy import (
     _normalize_composition,
     _parse_anonymous_pattern,
 )
-from agents.transferable_memory import _element_order_for_anonymous_pattern, _parse_formula
+from agents.transferable_memory import (
+    _element_order_for_anonymous_pattern,
+    _parse_formula,
+    translate_text_policy,
+)
 
 
 @dataclass
@@ -125,14 +131,22 @@ class TestStrategyAgentMemoryConditioning:
         assert rec["num_memory_guided_proposals"] == 0
         assert rec["num_exploratory_proposals"] == rec["num_candidates"]
 
-    def test_text_summary_does_not_affect_executable_policy(self) -> None:
+    def test_text_summary_produces_deterministic_coarse_policy(self) -> None:
+        text = "r1: outcome=stable; anonymous_stoichiometry=A4B3C2; prototype=orthorhombic"
+        first = translate_text_policy(text)
+        second = translate_text_policy(text)
+        changed = translate_text_policy(
+            "r1: outcome=stable; anonymous_stoichiometry=A2BC; prototype=cubic"
+        )
+        assert first == second
+        assert first["policy_sha256"] != changed["policy_sha256"]
+        assert first["directives"][0]["preferred_anonymous_stoichiometries"] == ["A4B3C2"]
         agent = StrategyAgent()
         rec = agent.recommend(
-            make_fake_objective(["Li", "P", "Se"]),
-            [],
-            directives=[{"record_id": "text-1", "text_summary": "Li-P-S is promising"}],
-            seed=1,
+            make_fake_objective(["Li", "P", "Se"]), [],
+            directives=first["directives"], seed=1,
         )
+        assert rec["diversity_weight"] != 0.4
         assert rec["target_compositions_dict"] == []
 
     def test_structured_memory_produces_targets(self) -> None:
@@ -244,6 +258,44 @@ class TestMockGenerator:
         agent = GenerationAgent(use_mattergen=False)
         structs = agent._generate_pymatgen_fallback(["Li", "P", "Se"], 5, 42)
         assert len(structs) == 5
+
+
+class TestCampaignStrategyModes:
+    def test_fixed_mode_never_calls_adaptive_recommend_or_update(self) -> None:
+        campaign = MaterialsDiscoveryCampaign.__new__(MaterialsDiscoveryCampaign)
+        campaign.config = SimpleNamespace(
+            strategy_mode="fixed", objective=make_fake_objective(["Li", "P", "Se"]), master_seed=42
+        )
+        campaign.strategy = MagicMock()
+        campaign.results_history = [{"different": "outcome"}]
+        campaign.current_recommendations = {"stale": True}
+        campaign.iteration = 1
+        campaign._log = MagicMock()
+        strategy = {"diversity_weight": 0.4, "num_candidates": 10, "memory_directives": []}
+        first = campaign._recommend_policy(strategy, 43)
+        second = campaign._recommend_policy(strategy, 99)
+        campaign._update_strategy_state(strategy, {"best_score": 100})
+        assert first == second
+        assert campaign.current_recommendations is None
+        campaign.strategy.recommend.assert_not_called()
+        campaign.strategy.update.assert_not_called()
+
+    def test_adaptive_mode_still_recommends_and_updates(self) -> None:
+        campaign = MaterialsDiscoveryCampaign.__new__(MaterialsDiscoveryCampaign)
+        campaign.config = SimpleNamespace(
+            strategy_mode="adaptive", objective=make_fake_objective(["Li", "P", "Se"]), master_seed=42
+        )
+        campaign.strategy = MagicMock()
+        campaign.strategy.recommend.return_value = {"rationale": "adaptive"}
+        campaign.results_history = []
+        campaign.current_recommendations = None
+        campaign.iteration = 1
+        campaign._log = MagicMock()
+        strategy = {"memory_directives": []}
+        campaign._recommend_policy(strategy, 43)
+        campaign._update_strategy_state(strategy, {"best_score": 1})
+        assert campaign.strategy.recommend.call_count == 2
+        campaign.strategy.update.assert_called_once()
 
 
 class TestMattergenAdapter:
