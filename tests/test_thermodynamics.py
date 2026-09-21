@@ -5,11 +5,14 @@ import json
 from pathlib import Path
 import subprocess
 import sys
+from types import SimpleNamespace
 
 import numpy as np
 import pytest
 
+import agents.thermodynamics as thermodynamics
 from agents.thermodynamics import (
+    CHGNetRelaxationEvaluator,
     ModelIdentity,
     ReferencePhaseInput,
     ReferenceSetError,
@@ -123,6 +126,52 @@ class FakeEvaluator:
         }
 
 
+def test_chgnet_relaxation_uses_optimizer_filtered_convergence_and_reports_raw_force():
+    state = {}
+
+    class Optimizable:
+        def get_gradient(self):
+            return np.array([0.0489908861, 0.0, 0.0])
+
+        def gradient_norm(self, gradient):
+            return np.linalg.norm(gradient.reshape(-1, 3), axis=1).max()
+
+    class FIRE:
+        def run(self, *, fmax, steps):
+            assert fmax == 0.05
+            assert steps == 500
+            return True
+
+    optimizer_class = thermodynamics._tracking_optimizer_class(FIRE, state)
+
+    class StructOptimizer:
+        def relax(self, value, **kwargs):
+            optimizer = optimizer_class()
+            optimizer.optimizable = Optimizable()
+            optimizer.run(fmax=kwargs["fmax"], steps=kwargs["steps"])
+            return {
+                "final_structure": value,
+                "trajectory": SimpleNamespace(
+                    forces=[np.array([[0.0515690555, 0.0, 0.0]])],
+                    stresses=[np.zeros((3, 3))],
+                    energies=[-1.0],
+                ),
+            }
+
+    evaluator = CHGNetRelaxationEvaluator.__new__(CHGNetRelaxationEvaluator)
+    evaluator.relaxation_settings = SETTINGS
+    evaluator._optimizer_run_state = state
+    evaluator.optimizer = StructOptimizer()
+
+    result = evaluator.relax(structure("Li"))
+
+    assert result["converged"] is True
+    assert result["convergence_criterion"] == "ase_optimizer_filtered_gradient_max_norm"
+    assert result["optimizer_max_force_ev_per_angstrom"] == pytest.approx(0.0489908861)
+    assert result["max_force_ev_per_angstrom"] == pytest.approx(0.0489908861)
+    assert result["raw_atomic_max_force_ev_per_angstrom"] == pytest.approx(0.0515690555)
+
+
 class FixedThermodynamicGenerator:
     """Small deterministic generator for campaign-level thermodynamics tests."""
 
@@ -151,6 +200,39 @@ def build_binary(tmp_path, *, evaluator=None, created="2026-08-29T00:00:00+00:00
         evaluator=evaluator, output_path=path, created_at_iso=created,
     )
     return path, frozen, evaluator
+
+
+def test_reference_certification_uses_optimizer_force_and_preserves_raw_atomic_force(tmp_path):
+    class FilteredConvergenceEvaluator(FakeEvaluator):
+        def relax(self, value):
+            result = super().relax(value)
+            result.update({
+                "convergence_criterion": "ase_optimizer_filtered_gradient_max_norm",
+                "max_force_ev_per_angstrom": 0.0489908861,
+                "optimizer_max_force_ev_per_angstrom": 0.0489908861,
+                "raw_atomic_max_force_ev_per_angstrom": 0.0515690555,
+            })
+            return result
+
+    evaluator = FilteredConvergenceEvaluator({
+        "Li-ref": -1.0, "O-ref": -2.0, "LiO-ref": -2.0, "candidate": -1.9,
+    })
+    _, frozen, _ = build_binary(tmp_path, evaluator=evaluator)
+
+    assert frozen.certification.certified
+    for phase in frozen.phases:
+        assert phase.success
+        assert phase.max_force_ev_per_angstrom == pytest.approx(0.0489908861)
+        assert phase.optimizer_max_force_ev_per_angstrom == pytest.approx(0.0489908861)
+        assert phase.raw_atomic_max_force_ev_per_angstrom == pytest.approx(0.0515690555)
+        assert phase.convergence_criterion == "ase_optimizer_filtered_gradient_max_norm"
+
+    result = ThermodynamicOracle(frozen, evaluator).evaluate(structure("LiO", "candidate"))
+    assert result.success
+    assert result.max_force_ev_per_angstrom == pytest.approx(0.0489908861)
+    assert result.optimizer_max_force_ev_per_angstrom == pytest.approx(0.0489908861)
+    assert result.raw_atomic_max_force_ev_per_angstrom == pytest.approx(0.0515690555)
+    assert result.convergence_criterion == "ase_optimizer_filtered_gradient_max_norm"
 
 
 def test_binary_hull_uses_total_energies_and_reports_true_quantities(tmp_path):

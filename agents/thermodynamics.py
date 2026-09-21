@@ -113,6 +113,9 @@ class ReferencePhaseRecord:
     total_energy_ev: Optional[float] = None
     atom_count: Optional[float] = None
     max_force_ev_per_angstrom: Optional[float] = None
+    optimizer_max_force_ev_per_angstrom: Optional[float] = None
+    raw_atomic_max_force_ev_per_angstrom: Optional[float] = None
+    convergence_criterion: Optional[str] = None
     max_stress_gpa: Optional[float] = None
 
 
@@ -187,6 +190,9 @@ class ThermodynamicResult:
     decomposition_products: List[Dict[str, Any]] = field(default_factory=list)
     relaxed_structure: Any = None
     max_force_ev_per_angstrom: Optional[float] = None
+    optimizer_max_force_ev_per_angstrom: Optional[float] = None
+    raw_atomic_max_force_ev_per_angstrom: Optional[float] = None
+    convergence_criterion: Optional[str] = None
     max_stress_gpa: Optional[float] = None
     reference_set_id: Optional[str] = None
     reference_set_hash: Optional[str] = None
@@ -219,6 +225,20 @@ class StructureEvaluator(Protocol):
     def relax(self, structure: Any) -> Mapping[str, Any]: ...
 
 
+def _tracking_optimizer_class(optimizer_class: Any, state: Dict[str, Any]) -> Any:
+    class TrackingOptimizer(optimizer_class):
+        def run(self, *args: Any, **kwargs: Any) -> bool:
+            converged = super().run(*args, **kwargs)
+            gradient = self.optimizable.get_gradient()
+            state["converged"] = bool(converged)
+            state["optimizer_max_force_ev_per_angstrom"] = float(
+                self.optimizable.gradient_norm(gradient)
+            )
+            return converged
+
+    return TrackingOptimizer
+
+
 class CHGNetRelaxationEvaluator:
     """Pinned CHGNet/StructOptimizer adapter used by builder and candidates."""
 
@@ -244,9 +264,14 @@ class CHGNetRelaxationEvaluator:
         if checkpoint_sha256 is not None and checkpoint_sha256 != actual_hash:
             raise ReferenceSetError("Loaded CHGNet weights do not match checkpoint_sha256")
         self.model_identity = ModelIdentity(model_name, version, actual_hash)
+        self._optimizer_run_state: Dict[str, Any] = {}
         self.optimizer = StructOptimizer(model=self.model)
+        self.optimizer.optimizer_class = _tracking_optimizer_class(
+            self.optimizer.optimizer_class, self._optimizer_run_state
+        )
 
     def relax(self, structure: Any) -> Mapping[str, Any]:
+        self._optimizer_run_state.clear()
         result = self.optimizer.relax(
             structure, fmax=self.relaxation_settings.fmax_ev_per_angstrom,
             steps=self.relaxation_settings.max_steps,
@@ -256,13 +281,17 @@ class CHGNetRelaxationEvaluator:
         trajectory = result["trajectory"]
         forces = trajectory.forces[-1]
         stresses = trajectory.stresses[-1]
-        max_force = float(max((sum(float(v) ** 2 for v in row) ** 0.5 for row in forces), default=math.inf))
+        raw_max_force = float(max((sum(float(v) ** 2 for v in row) ** 0.5 for row in forces), default=math.inf))
         max_stress = float(max((abs(float(value)) for value in stresses.ravel()), default=math.inf)) * 160.21766208
+        optimizer_max_force = float(self._optimizer_run_state["optimizer_max_force_ev_per_angstrom"])
         return {
-            "converged": max_force <= self.relaxation_settings.fmax_ev_per_angstrom + 1e-12,
+            "converged": self._optimizer_run_state["converged"],
+            "convergence_criterion": "ase_optimizer_filtered_gradient_max_norm",
             "relaxed_structure": relaxed,
             "total_energy_ev": float(trajectory.energies[-1]),
-            "max_force_ev_per_angstrom": max_force,
+            "max_force_ev_per_angstrom": optimizer_max_force,
+            "optimizer_max_force_ev_per_angstrom": optimizer_max_force,
+            "raw_atomic_max_force_ev_per_angstrom": raw_max_force,
             "max_stress_gpa": max_stress,
         }
 
@@ -445,20 +474,31 @@ def _relax_record(item: ReferencePhaseInput, evaluator: StructureEvaluator,
         return ReferencePhaseRecord(**base, failure_code=ThermodynamicFailureCode.NONFINITE_ENERGY.value,
                                     failure_message="energy_per_atom_ev and total_energy_ev are inconsistent",
                                     relaxed_structure=relaxed, atom_count=atom_count)
-    observed_force = _finite_optional(
-        outcome.get("max_force_ev_per_angstrom", outcome.get("max_force"))
-    )
+    observed_force = _finite_optional(outcome.get(
+        "optimizer_max_force_ev_per_angstrom",
+        outcome.get("max_force_ev_per_angstrom", outcome.get("max_force")),
+    ))
+    raw_atomic_force = _finite_optional(outcome.get(
+        "raw_atomic_max_force_ev_per_angstrom", outcome.get("max_force_ev_per_angstrom")
+    ))
+    convergence_criterion = outcome.get("convergence_criterion", "reported_max_force")
     if observed_force is None or observed_force > evaluator.relaxation_settings.fmax_ev_per_angstrom + 1e-12:
         return ReferencePhaseRecord(**base, failure_code=ThermodynamicFailureCode.RELAXATION_FAILED.value,
                                     failure_message="relaxation did not meet the configured force tolerance",
                                     relaxed_structure=relaxed, atom_count=atom_count,
-                                    max_force_ev_per_angstrom=observed_force)
+                                    max_force_ev_per_angstrom=observed_force,
+                                    optimizer_max_force_ev_per_angstrom=observed_force,
+                                    raw_atomic_max_force_ev_per_angstrom=raw_atomic_force,
+                                    convergence_criterion=str(convergence_criterion))
     success_values = dict(base)
     success_values["success"] = True
     return ReferencePhaseRecord(
         **success_values, relaxed_structure=relaxed, energy_per_atom_ev=energy_pa,
         total_energy_ev=total, atom_count=atom_count,
         max_force_ev_per_angstrom=observed_force,
+        optimizer_max_force_ev_per_angstrom=observed_force,
+        raw_atomic_max_force_ev_per_angstrom=raw_atomic_force,
+        convergence_criterion=str(convergence_criterion),
         max_stress_gpa=_finite_optional(outcome.get("max_stress_gpa")),
     )
 
@@ -909,9 +949,14 @@ class ThermodynamicOracle:
         if outcome.get("converged") is not True:
             return self._failure(ThermodynamicFailureCode.RELAXATION_FAILED,
                                  str(outcome.get("error", "relaxation did not converge")), cache_key=key)
-        observed_force = _finite_optional(
-            outcome.get("max_force_ev_per_angstrom", outcome.get("max_force"))
-        )
+        observed_force = _finite_optional(outcome.get(
+            "optimizer_max_force_ev_per_angstrom",
+            outcome.get("max_force_ev_per_angstrom", outcome.get("max_force")),
+        ))
+        raw_atomic_force = _finite_optional(outcome.get(
+            "raw_atomic_max_force_ev_per_angstrom", outcome.get("max_force_ev_per_angstrom")
+        ))
+        convergence_criterion = outcome.get("convergence_criterion", "reported_max_force")
         if observed_force is None or observed_force > self.reference_set.relaxation_settings.fmax_ev_per_angstrom + 1e-12:
             return self._failure(ThermodynamicFailureCode.RELAXATION_FAILED,
                                  "relaxation did not meet the configured force tolerance", cache_key=key)
@@ -1003,6 +1048,9 @@ class ThermodynamicOracle:
             decomposition_products=decomposition_products,
             relaxed_structure=relaxed,
             max_force_ev_per_angstrom=observed_force,
+            optimizer_max_force_ev_per_angstrom=observed_force,
+            raw_atomic_max_force_ev_per_angstrom=raw_atomic_force,
+            convergence_criterion=str(convergence_criterion),
             max_stress_gpa=_finite_optional(outcome.get("max_stress_gpa")),
             reference_set_id=self.reference_set.reference_set_id,
             reference_set_hash=self.reference_set.reference_set_hash,
