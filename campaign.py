@@ -622,9 +622,10 @@ class MaterialsDiscoveryCampaign:
             model_name_or_path=self.config.mattergen_model_path if generation_backend == "mattergen" else None,
             checkpoint=self.config.mattergen_pretrained if generation_backend == "mattergen" else None,
         )
-        # Memory affects only deterministic pre-oracle prioritization after all
-        # proposals are counted.  Geometry and thermodynamic gates still own
-        # validity, and every oracle admission remains one budget slot.
+        # Transferable memory can condition generation through target compositions
+        # and exploration policy, and may also affect deterministic pre-oracle
+        # prioritization. Geometry and thermodynamic gates still own validity,
+        # and every oracle admission remains one budget slot.
         memory_directives = strategy.get('memory_directives', [])
         candidates, memory_priority_audit = prioritize_candidates(candidates, memory_directives)
         self.provenance.record_memory_prioritization(memory_priority_audit, iteration=self.iteration)
