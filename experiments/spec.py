@@ -282,7 +282,13 @@ class RunSpec:
 
     @property
     def spec_hash(self) -> str:
-        return compute_sha256(asdict(self))
+        return compute_sha256(self.identity_dict())
+
+    def identity_dict(self) -> Dict[str, Any]:
+        value = asdict(self)
+        for field_name in ("output_dir", "career_db_path", "source_memory_snapshot_path"):
+            value.pop(field_name, None)
+        return value
 
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)

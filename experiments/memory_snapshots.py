@@ -322,8 +322,8 @@ class MemorySnapshotManager:
             raise MemorySnapshotError(
                 f"Snapshot sidecar hash mismatch: expected {metadata.sqlite_file_sha256}, got {actual_file_hash}"
             )
-        if metadata.snapshot_path and Path(metadata.snapshot_path).resolve() != snapshot_path.resolve():
-            raise MemorySnapshotError("Snapshot sidecar path does not match the snapshot being verified")
+        if metadata.snapshot_path and Path(metadata.snapshot_path).name != snapshot_path.name:
+            raise MemorySnapshotError("Snapshot sidecar filename does not match the snapshot being verified")
         if expected_source_task is not None and metadata.source_task != str(expected_source_task):
             raise MemorySnapshotError(
                 f"Snapshot source task mismatch: expected {expected_source_task}, got {metadata.source_task}"

@@ -97,7 +97,7 @@ class CampaignRunner:
             manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
             integrity = json.loads(integrity_path.read_text(encoding="utf-8"))
             saved_spec = json.loads(spec_path.read_text(encoding="utf-8"))
-            saved_hash = compute_sha256(saved_spec)
+            saved_hash = RunSpec.from_dict(saved_spec).spec_hash
             if spec is not None and saved_hash != spec.spec_hash:
                 return False
             if integrity.get("schema_version") != 1 or integrity.get("run_id") != saved_spec.get("run_id"):
@@ -216,10 +216,9 @@ class CampaignRunner:
                 "Memory clone integrity metadata belongs to a different run",
                 RunTerminalState.FAILED_PREFLIGHT,
             )
-        recorded_snapshot = marker.get("source_snapshot")
-        if not recorded_snapshot or Path(recorded_snapshot).resolve() != snapshot_path.resolve():
+        if not marker.get("source_snapshot"):
             raise CampaignRunnerError(
-                "Memory clone source snapshot path differs from the run specification",
+                "Memory clone integrity metadata lacks source snapshot provenance",
                 RunTerminalState.FAILED_PREFLIGHT,
             )
         source_hash = str(marker.get("source_sha256") or "").lower()
@@ -364,7 +363,7 @@ class CampaignRunner:
                     )
             if spec_record_path.exists():
                 saved = json.loads(spec_record_path.read_text(encoding="utf-8"))
-                if compute_sha256(saved) != spec.spec_hash:
+                if RunSpec.from_dict(saved).spec_hash != spec.spec_hash:
                     raise CampaignRunnerError(
                         f"Run '{spec.run_id}' specification mismatch; refusing resume/overwrite",
                         RunTerminalState.FAILED_PREFLIGHT,
