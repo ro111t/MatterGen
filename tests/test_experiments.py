@@ -4,6 +4,7 @@ import json
 from pathlib import Path
 import pytest
 
+from experiments.cli import _canonical_spec_identity_hash, _shard_manifest_payload, merge_shard_outputs
 from experiments.dag import DAGNode, DAGValidationError, ExperimentDAG, NodeType
 from experiments.memory_snapshots import (
     MemorySnapshotError,
@@ -106,6 +107,119 @@ def test_dag_construction_exact_run_counts_and_validation():
     dag.nodes["node_preflight"].dependencies.add("node_report_generation")
     with pytest.raises(DAGValidationError, match="Cycle detected"):
         dag.validate()
+
+
+def _write_shard_fixture(root, spec, seeds, worker_id, *, shared_content="shared"):
+    dag = ExperimentDAG(spec, seed_subset=seeds, worker_id=worker_id)
+    run_nodes = [
+        node for node in dag.nodes.values()
+        if node.node_type in {NodeType.SOURCE_MEMORY_RUN, NodeType.TARGET_CAMPAIGN_RUN}
+    ]
+    for node in run_nodes:
+        relative = Path(str(node.expected_output_path)).relative_to(Path(spec.output_root))
+        path = root / relative
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps({"node_id": node.node_id}), encoding="utf-8")
+    shared = root / "references" / "shared.json"
+    shared.parent.mkdir(parents=True, exist_ok=True)
+    shared.write_text(shared_content, encoding="utf-8")
+    manifest = {
+        "manifest_schema_version": "1.0.0",
+        "experiment_id": spec.experiment_id,
+        "spec_hash": spec.spec_hash,
+        "canonical_spec_hash": _canonical_spec_identity_hash(spec),
+        "spec_code_commit": spec.code_commit,
+        "code_commit": "a" * 40,
+        "canonical_master_seeds": list(spec.master_seeds),
+        "executed_seeds": list(seeds),
+        "worker_id": worker_id,
+        "completed": True,
+        "run_node_ids": sorted(node.node_id for node in run_nodes),
+        "successful_node_ids": sorted(dag.nodes),
+    }
+    (root / "shard_manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
+    return dag
+
+
+def test_seed_shards_partition_canonical_run_nodes_and_omit_analysis(tmp_path):
+    seeds = [42, 137, 2024, 777, 999, 31415, 27182, 16180]
+    spec = ExperimentSpec(experiment_id="sharded", master_seeds=seeds, output_root=str(tmp_path / "merged"))
+    rohit = ExperimentDAG(spec, seed_subset=[999, 31415, 27182, 16180], worker_id="rohit")
+    joe = ExperimentDAG(spec, seed_subset=[42, 137, 2024, 777], worker_id="joe")
+    canonical = ExperimentDAG(spec)
+    run_types = {NodeType.SOURCE_MEMORY_RUN, NodeType.TARGET_CAMPAIGN_RUN}
+    analysis_types = {
+        NodeType.AGGREGATION, NodeType.STATISTICAL_ANALYSIS, NodeType.QE_AUDIT_SELECTION,
+        NodeType.QE_AUDIT_EXECUTION, NodeType.REPORT_GENERATION,
+    }
+    rohit_runs = {node.node_id for node in rohit.nodes.values() if node.node_type in run_types}
+    joe_runs = {node.node_id for node in joe.nodes.values() if node.node_type in run_types}
+    canonical_runs = {node.node_id for node in canonical.nodes.values() if node.node_type in run_types}
+    assert rohit_runs | joe_runs == canonical_runs
+    assert rohit_runs.isdisjoint(joe_runs)
+    assert not any(node.node_type in analysis_types for node in rohit.nodes.values())
+    assert not any(node.node_type in analysis_types for node in joe.nodes.values())
+    assert spec.master_seeds == seeds
+    manifest = _shard_manifest_payload(spec, rohit, completed=False)
+    assert manifest["canonical_master_seeds"] == seeds
+    assert manifest["executed_seeds"] == [999, 31415, 27182, 16180]
+    assert manifest["worker_id"] == "rohit"
+    assert manifest["completed"] is False
+    assert manifest["runtime"]["git_commit"]
+    assert isinstance(manifest["runtime"]["git_dirty"], bool)
+    assert set(manifest["run_node_ids"]) == rohit_runs
+    restored = ExperimentDAG.from_dict(rohit.to_dict(), spec)
+    assert restored.seed_subset == [999, 31415, 27182, 16180]
+    assert restored.worker_id == "rohit"
+    assert set(restored.nodes) == set(rohit.nodes)
+    with pytest.raises(DAGValidationError, match="duplicates"):
+        ExperimentDAG(spec, seed_subset=[42, 42], worker_id="bad")
+    with pytest.raises(DAGValidationError, match="not present"):
+        ExperimentDAG(spec, seed_subset=[123456], worker_id="bad")
+    with pytest.raises(DAGValidationError, match="non-empty"):
+        ExperimentDAG(spec, seed_subset=[], worker_id="bad")
+
+
+def test_merge_shards_requires_complete_coverage_and_deduplicates_identical_overlap(tmp_path):
+    seeds = [42, 137, 2024, 777, 999, 31415, 27182, 16180]
+    output_root = tmp_path / "merged"
+    spec = ExperimentSpec(experiment_id="merge", master_seeds=seeds, output_root=str(output_root))
+    first_root, second_root = tmp_path / "first", tmp_path / "second"
+    _write_shard_fixture(first_root, spec, seeds[:5], "rohit")
+    _write_shard_fixture(second_root, spec, seeds[4:], "joe")
+
+    result = merge_shard_outputs(spec, [first_root, second_root], output_root)
+
+    canonical_runs = {
+        node.node_id for node in ExperimentDAG(spec).nodes.values()
+        if node.node_type in {NodeType.SOURCE_MEMORY_RUN, NodeType.TARGET_CAMPAIGN_RUN}
+    }
+    assert result["merged_seeds"] == sorted(seeds)
+    assert set(result["run_node_ids"]) == canonical_runs
+    assert "references/shared.json" in result["deduplicated"]
+    assert any(path.endswith("/999/manifest.json") for path in result["deduplicated"])
+    merge_manifest = json.loads((output_root / "merge_manifest.json").read_text(encoding="utf-8"))
+    assert merge_manifest["merged_run_node_ids"] == sorted(canonical_runs)
+    assert merge_manifest["expected_run_node_ids"] == sorted(canonical_runs)
+
+    incomplete_root = tmp_path / "incomplete"
+    incomplete_spec = ExperimentSpec(
+        experiment_id="incomplete", master_seeds=seeds, output_root=str(tmp_path / "incomplete-merged")
+    )
+    _write_shard_fixture(incomplete_root, incomplete_spec, seeds[:4], "partial")
+    with pytest.raises(RuntimeError, match="missing canonical seeds"):
+        merge_shard_outputs(incomplete_spec, [incomplete_root], Path(incomplete_spec.output_root))
+
+
+def test_merge_shards_rejects_divergent_collision(tmp_path):
+    seeds = [42, 137]
+    output_root = tmp_path / "merged"
+    spec = ExperimentSpec(experiment_id="collision", master_seeds=seeds, output_root=str(output_root))
+    first_root, second_root = tmp_path / "first", tmp_path / "second"
+    _write_shard_fixture(first_root, spec, [42], "first", shared_content="first")
+    _write_shard_fixture(second_root, spec, [137], "second", shared_content="second")
+    with pytest.raises(RuntimeError, match="divergent content"):
+        merge_shard_outputs(spec, [first_root, second_root], output_root)
 
 
 def test_source_snapshot_immutability_and_byte_identity(tmp_path):

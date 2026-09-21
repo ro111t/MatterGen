@@ -143,13 +143,50 @@ def validate_and_normalize_artifact_map(node_id: str, artifacts: Any) -> Dict[st
 
 
 class ExperimentDAG:
-    """Directed Acyclic Graph orchestrator for benchmark experiments."""
+    """Directed Acyclic Graph orchestrator for benchmark experiments.
 
-    def __init__(self, spec: ExperimentSpec):
+    Seed sharding partitions execution only. The canonical ExperimentSpec and
+    its complete master-seed set remain unchanged, while shard DAGs omit every
+    downstream analysis node that requires the complete paired experiment.
+    """
+
+    def __init__(
+        self,
+        spec: ExperimentSpec,
+        seed_subset: Optional[Sequence[int]] = None,
+        worker_id: Optional[str] = None,
+    ):
         self.spec = spec
+        self.worker_id = worker_id
+        if seed_subset is not None:
+            seeds = [int(seed) for seed in seed_subset]
+            if not seeds:
+                raise DAGValidationError("seed_subset must be non-empty")
+            if len(set(seeds)) != len(seeds):
+                raise DAGValidationError(f"seed_subset contains duplicates: {seeds}")
+            unknown = sorted(set(seeds) - set(spec.master_seeds))
+            if unknown:
+                raise DAGValidationError(
+                    f"seed_subset contains seeds not present in canonical master_seeds: {unknown}"
+                )
+            if not worker_id:
+                raise DAGValidationError("worker_id is required for seed-shard execution")
+            self.seed_subset: Optional[List[int]] = seeds
+        else:
+            if worker_id is not None:
+                raise DAGValidationError("worker_id is valid only with seed_subset")
+            self.seed_subset = None
         self.nodes: Dict[str, DAGNode] = {}
         self._build_graph()
         self.validate()
+
+    @property
+    def run_seeds(self) -> List[int]:
+        return list(self.seed_subset if self.seed_subset is not None else self.spec.master_seeds)
+
+    @property
+    def is_shard(self) -> bool:
+        return self.seed_subset is not None
 
     def add_node(self, node: DAGNode) -> None:
         if node.node_id in self.nodes:
@@ -211,6 +248,7 @@ class ExperimentDAG:
     def _build_graph(self) -> None:
         spec = self.spec
         output_root = Path(spec.output_root)
+        run_seeds = self.run_seeds
 
         # 1. Preflight Node
         preflight_id = "node_preflight"
@@ -245,7 +283,7 @@ class ExperimentDAG:
 
         # 3. Neutral Source Memory Runs & Snapshots per Master Seed
         source_snapshot_node_ids: Dict[int, str] = {}
-        for seed in spec.master_seeds:
+        for seed in run_seeds:
             # Source campaign run (neutral fixed policy for Li-P-S)
             source_run_id = f"run_source_{spec.source_task.task_id}_seed{seed}"
             source_run_node_id = f"node_{source_run_id}"
@@ -270,6 +308,8 @@ class ExperimentDAG:
                     "reference_set_sha256": spec.source_task.reference_set_sha256,
                     "reference_set_certified": spec.source_task.reference_set_certified,
                     "source_memory_snapshot_sha256": None,
+                    "worker_id": self.worker_id,
+                    "canonical_master_seeds": list(spec.master_seeds),
                 },
                 expected_output_path=f"{source_run_dir}/manifest.json",
             ))
@@ -303,7 +343,7 @@ class ExperimentDAG:
         target_run_node_ids: Set[str] = set()
         for target_task in spec.target_tasks:
             for cond in spec.conditions:
-                for seed in spec.master_seeds:
+                for seed in run_seeds:
                     run_id = f"run_{cond}_{target_task.task_id}_seed{seed}"
                     target_node_id = f"node_{run_id}"
                     target_run_dir = str(output_root / "runs" / cond / target_task.task_id / str(seed)).replace("\\", "/")
@@ -358,10 +398,15 @@ class ExperimentDAG:
                             "proposal_budget": spec.proposals_per_run,
                             "oracle_budget": spec.oracle_budget_per_run,
                             "output_dir": target_run_dir,
+                            "worker_id": self.worker_id,
+                            "canonical_master_seeds": list(spec.master_seeds),
                         },
                         expected_output_path=f"{target_run_dir}/manifest.json",
                     ))
                     target_run_node_ids.add(target_node_id)
+
+        if self.is_shard:
+            return
 
         # 5. Aggregation Node
         agg_node_id = "node_aggregation"
@@ -452,14 +497,14 @@ class ExperimentDAG:
             raise DAGValidationError("Cycle detected in experiment DAG")
 
         # 3. Exact run count calculation
-        expected_target_runs = len(self.spec.target_tasks) * len(self.spec.conditions) * len(self.spec.master_seeds)
+        expected_target_runs = len(self.spec.target_tasks) * len(self.spec.conditions) * len(self.run_seeds)
         actual_target_nodes = sum(1 for n in self.nodes.values() if n.node_type == NodeType.TARGET_CAMPAIGN_RUN)
         if actual_target_nodes != expected_target_runs:
             raise DAGValidationError(
                 f"Target run count mismatch: expected {expected_target_runs}, found {actual_target_nodes}"
             )
 
-        expected_source_runs = len(self.spec.master_seeds)
+        expected_source_runs = len(self.run_seeds)
         actual_source_nodes = sum(1 for n in self.nodes.values() if n.node_type == NodeType.SOURCE_MEMORY_RUN)
         if actual_source_nodes != expected_source_runs:
             raise DAGValidationError(
@@ -509,6 +554,8 @@ class ExperimentDAG:
         return {
             "experiment_id": self.spec.experiment_id,
             "spec_hash": self.spec.spec_hash,
+            "seed_subset": self.seed_subset,
+            "worker_id": self.worker_id,
             "total_nodes": len(self.nodes),
             "total_runs": self.total_run_count,
             "nodes": {nid: n.to_dict() for nid, n in sorted(self.nodes.items())},
@@ -529,7 +576,13 @@ class ExperimentDAG:
             raise DAGValidationError(
                 f"Existing DAG experiment_id mismatch: expected {spec.experiment_id}, got {stored_exp_id}"
             )
-        dag = cls(spec)
+        stored_subset = data.get("seed_subset")
+        stored_worker = data.get("worker_id")
+        dag = cls(
+            spec,
+            seed_subset=[int(seed) for seed in stored_subset] if stored_subset is not None else None,
+            worker_id=str(stored_worker) if stored_worker is not None else None,
+        )
         nodes_data = data.get("nodes")
         if not isinstance(nodes_data, Mapping):
             raise DAGValidationError("Existing DAG missing valid 'nodes' mapping")

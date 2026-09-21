@@ -19,7 +19,7 @@ import shutil
 import subprocess
 import sys
 import time
-from typing import Any, Dict, List, Mapping, Optional, Set
+from typing import Any, Dict, List, Mapping, Optional, Sequence, Set
 
 from experiments.dag import DAGNode, DAGValidationError, ExperimentDAG, NodeType, REQUIRED_NODE_ARTIFACTS
 from experiments.memory_snapshots import MemorySnapshotManager
@@ -29,6 +29,7 @@ from experiments.runner import CampaignRunner
 from experiments.spec import (
     BASE_COMMIT_SHA,
     calculate_minimum_exact_test_sample_size,
+    compute_sha256,
     ExperimentSpec,
     FIVE_CONDITIONS,
     RunSpec,
@@ -814,11 +815,72 @@ def _verify_and_hydrate_completed_node(
                 raise RuntimeError(f"Node '{node.node_id}' missing report artifact '{fp}'")
 
 
+def _canonical_spec_identity_hash(spec: ExperimentSpec) -> str:
+    data = spec.to_dict()
+    data["output_root"] = "<canonical>"
+    return compute_sha256(data)
+
+
+def _runtime_metadata() -> Dict[str, Any]:
+    repo_root = Path(__file__).resolve().parents[1]
+    commit = subprocess.run(
+        ["git", "-C", str(repo_root), "rev-parse", "HEAD"],
+        capture_output=True, text=True, check=True,
+    ).stdout.strip()
+    status = subprocess.run(
+        ["git", "-C", str(repo_root), "status", "--porcelain"],
+        capture_output=True, text=True, check=True,
+    ).stdout.splitlines()
+    return {
+        "git_commit": commit,
+        "git_dirty": bool(status),
+        "git_dirty_entries": status,
+        "python": sys.version,
+        "executable": sys.executable,
+        "platform": platform.platform(),
+        "machine": platform.machine(),
+        "processor": platform.processor(),
+        "hostname": platform.node(),
+    }
+
+
+def _shard_manifest_payload(spec: ExperimentSpec, dag: ExperimentDAG, *, completed: bool) -> Dict[str, Any]:
+    run_nodes = sorted(
+        node.node_id for node in dag.nodes.values()
+        if node.node_type in {NodeType.SOURCE_MEMORY_RUN, NodeType.TARGET_CAMPAIGN_RUN}
+    )
+    return {
+        "manifest_schema_version": "1.0.0",
+        "experiment_id": spec.experiment_id,
+        "spec_hash": spec.spec_hash,
+        "canonical_spec_hash": _canonical_spec_identity_hash(spec),
+        "spec_code_commit": spec.code_commit,
+        "code_commit": _runtime_metadata()["git_commit"],
+        "canonical_master_seeds": list(spec.master_seeds),
+        "executed_seeds": dag.run_seeds,
+        "worker_id": dag.worker_id,
+        "schema_version": spec.schema_version,
+        "run_mode": spec.run_mode,
+        "completed": completed,
+        "total_nodes": len(dag.nodes),
+        "total_runs": dag.total_run_count,
+        "node_ids": sorted(dag.nodes),
+        "run_node_ids": run_nodes,
+        "successful_node_ids": sorted(
+            node.node_id for node in dag.nodes.values() if node.executed and node.success
+        ),
+        "runtime": _runtime_metadata(),
+        "updated_unix": time.time(),
+    }
+
+
 def execute_full_experiment_pipeline(
     spec: ExperimentSpec,
     force_rerun: bool = False,
+    seed_subset: Optional[Sequence[int]] = None,
+    worker_id: Optional[str] = None,
 ) -> Dict[str, Any]:
-    """Execute the entire benchmark DAG end-to-end."""
+    """Execute the complete benchmark DAG or one whole-seed execution shard."""
     logger.info(f"Starting Experiment '{spec.experiment_id}'...")
     from experiments.qe_audit import QEAuditRunner, select_audit_candidates
     output_root = Path(spec.output_root)
@@ -831,6 +893,12 @@ def execute_full_experiment_pipeline(
         except Exception as exc:
             raise DAGValidationError(f"Existing experiment DAG manifest '{dag_path}' is malformed JSON: {exc}") from exc
         dag = ExperimentDAG.from_dict(existing_dag_data, spec)
+        requested_seeds = [int(seed) for seed in seed_subset] if seed_subset is not None else None
+        if requested_seeds != dag.seed_subset or worker_id != dag.worker_id:
+            raise DAGValidationError(
+                f"Requested shard identity ({requested_seeds}, {worker_id!r}) does not match "
+                f"existing DAG ({dag.seed_subset}, {dag.worker_id!r})"
+            )
         logger.info(f"Loaded existing experiment DAG with {len(dag.nodes)} nodes.")
     else:
         if force_rerun and output_root.exists() and any(output_root.iterdir()):
@@ -838,10 +906,15 @@ def execute_full_experiment_pipeline(
                 "force_rerun requires a fresh, empty experiment output directory; "
                 "existing run databases/artifacts will never be reused"
             )
-        dag = ExperimentDAG(spec)
+        dag = ExperimentDAG(spec, seed_subset=seed_subset, worker_id=worker_id)
         logger.info(f"Experiment DAG constructed with {len(dag.nodes)} nodes and {dag.total_run_count} runs.")
 
     output_root.mkdir(parents=True, exist_ok=True)
+    if dag.is_shard:
+        _atomic_write_json(
+            output_root / "shard_manifest.json",
+            _shard_manifest_payload(spec, dag, completed=False),
+        )
     if not dag_path.exists():
         _atomic_write_json(dag_path, dag.to_dict())
 
@@ -1167,12 +1240,19 @@ def execute_full_experiment_pipeline(
             _persist_dag()
             raise
 
+    if dag.is_shard:
+        _atomic_write_json(
+            output_root / "shard_manifest.json",
+            _shard_manifest_payload(spec, dag, completed=True),
+        )
     logger.info("Experiment pipeline finished successfully.")
     return {
         "status": "SUCCESS",
         "experiment_id": spec.experiment_id,
         "runs_completed": len(all_runs_metrics),
         "candidates_evaluated": len(all_candidates),
+        "seed_subset": dag.seed_subset,
+        "worker_id": dag.worker_id,
     }
 
 
@@ -1182,6 +1262,135 @@ def _file_sha256(path: Path) -> str:
         for chunk in iter(lambda: f.read(1024 * 1024), b""):
             h.update(chunk)
     return h.hexdigest()
+
+
+def merge_shard_outputs(
+    spec: ExperimentSpec,
+    shard_roots: Sequence[str | Path],
+    output_root: Path,
+) -> Dict[str, Any]:
+    output_root = Path(output_root)
+    roots = [Path(root) for root in shard_roots]
+    if not roots:
+        raise RuntimeError("At least one shard root is required")
+    manifests: List[Dict[str, Any]] = []
+    expected_canonical_hash = _canonical_spec_identity_hash(spec)
+    runtime_commits: Set[str] = set()
+    merged_seeds: Set[int] = set()
+    merged_run_nodes: Set[str] = set()
+    for root in roots:
+        manifest_path = root / "shard_manifest.json"
+        if not manifest_path.is_file():
+            raise RuntimeError(f"Shard root '{root}' is missing shard_manifest.json")
+        try:
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        except Exception as exc:
+            raise RuntimeError(f"Shard manifest '{manifest_path}' is malformed JSON: {exc}") from exc
+        for field_name, expected in (
+            ("experiment_id", spec.experiment_id),
+            ("canonical_spec_hash", expected_canonical_hash),
+            ("spec_code_commit", spec.code_commit),
+            ("canonical_master_seeds", list(spec.master_seeds)),
+        ):
+            if manifest.get(field_name) != expected:
+                raise RuntimeError(
+                    f"Shard '{root}' {field_name} mismatch: expected {expected}, got {manifest.get(field_name)}"
+                )
+        if manifest.get("completed") is not True:
+            raise RuntimeError(f"Shard '{root}' is not marked completed")
+        seeds = manifest.get("executed_seeds")
+        if not isinstance(seeds, list) or not seeds:
+            raise RuntimeError(f"Shard '{root}' has no executed seed subset")
+        if len({int(seed) for seed in seeds}) != len(seeds):
+            raise RuntimeError(f"Shard '{root}' executed seed subset contains duplicates")
+        shard_seeds = {int(seed) for seed in seeds}
+        if not shard_seeds <= set(spec.master_seeds):
+            raise RuntimeError(f"Shard '{root}' contains noncanonical seeds")
+        worker_id = manifest.get("worker_id")
+        expected_dag = ExperimentDAG(spec, seed_subset=seeds, worker_id=str(worker_id))
+        expected_run_nodes = {
+            node.node_id for node in expected_dag.nodes.values()
+            if node.node_type in {NodeType.SOURCE_MEMORY_RUN, NodeType.TARGET_CAMPAIGN_RUN}
+        }
+        if set(manifest.get("run_node_ids", [])) != expected_run_nodes:
+            raise RuntimeError(f"Shard '{root}' run-node set does not match its complete seed subset")
+        if not set(manifest.get("successful_node_ids", [])) >= set(expected_dag.nodes):
+            raise RuntimeError(f"Shard '{root}' did not successfully complete every shard DAG node")
+        for node in expected_dag.nodes.values():
+            if node.node_type not in {NodeType.SOURCE_MEMORY_RUN, NodeType.TARGET_CAMPAIGN_RUN}:
+                continue
+            relative = Path(str(node.expected_output_path)).relative_to(Path(spec.output_root))
+            if not (root / relative).is_file():
+                raise RuntimeError(f"Shard '{root}' is missing run artifact '{relative}'")
+        runtime_commit = manifest.get("code_commit")
+        if not isinstance(runtime_commit, str) or not runtime_commit:
+            raise RuntimeError(f"Shard '{root}' is missing its runtime code commit")
+        runtime_commits.add(runtime_commit)
+        merged_seeds.update(shard_seeds)
+        merged_run_nodes.update(expected_run_nodes)
+        manifests.append({
+            "root": str(root),
+            "manifest": manifest,
+            "manifest_sha256": _file_sha256(manifest_path),
+        })
+    if len(runtime_commits) != 1:
+        raise RuntimeError(f"Shard runtime code commits differ: {sorted(runtime_commits)}")
+    missing_seeds = sorted(set(spec.master_seeds) - merged_seeds)
+    if missing_seeds:
+        raise RuntimeError(f"Cannot finalize shards; missing canonical seeds: {missing_seeds}")
+    canonical_dag = ExperimentDAG(spec)
+    expected_run_nodes = {
+        node.node_id for node in canonical_dag.nodes.values()
+        if node.node_type in {NodeType.SOURCE_MEMORY_RUN, NodeType.TARGET_CAMPAIGN_RUN}
+    }
+    if merged_run_nodes != expected_run_nodes:
+        missing = sorted(expected_run_nodes - merged_run_nodes)
+        extra = sorted(merged_run_nodes - expected_run_nodes)
+        raise RuntimeError(f"Merged run-node coverage mismatch; missing={missing}, extra={extra}")
+
+    copied: List[str] = []
+    deduplicated: List[str] = []
+    for entry in manifests:
+        root = Path(entry["root"])
+        for subdir in ("runs", "memory_snapshots", "references"):
+            source_dir = root / subdir
+            if not source_dir.is_dir():
+                continue
+            for source in sorted(path for path in source_dir.rglob("*") if path.is_file()):
+                relative = source.relative_to(root)
+                destination = output_root / relative
+                if destination.exists():
+                    if _file_sha256(destination) != _file_sha256(source):
+                        raise RuntimeError(f"Merge collision at '{relative}' has divergent content")
+                    deduplicated.append(str(relative).replace("\\", "/"))
+                    continue
+                destination.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copyfile(source, destination)
+                copied.append(str(relative).replace("\\", "/"))
+    output_root.mkdir(parents=True, exist_ok=True)
+    merge_manifest = {
+        "manifest_schema_version": "1.0.0",
+        "experiment_id": spec.experiment_id,
+        "spec_hash": spec.spec_hash,
+        "canonical_spec_hash": expected_canonical_hash,
+        "spec_code_commit": spec.code_commit,
+        "code_commit": next(iter(runtime_commits)),
+        "canonical_master_seeds": list(spec.master_seeds),
+        "merged_seeds": sorted(merged_seeds),
+        "expected_run_node_ids": sorted(expected_run_nodes),
+        "merged_run_node_ids": sorted(merged_run_nodes),
+        "shards": manifests,
+        "copied_files": copied,
+        "deduplicated_files": deduplicated,
+        "created_unix": time.time(),
+    }
+    _atomic_write_json(output_root / "merge_manifest.json", merge_manifest)
+    return {
+        "copied": copied,
+        "deduplicated": deduplicated,
+        "merged_seeds": sorted(merged_seeds),
+        "run_node_ids": sorted(merged_run_nodes),
+    }
 
 
 def main():
@@ -1196,6 +1405,15 @@ def main():
     p_run = subparsers.add_parser("run", help="Run full experiment pipeline")
     p_run.add_argument("--spec-file", type=str, help="Path to ExperimentSpec JSON file")
     p_run.add_argument("--force-rerun", action="store_true", help="Force rerun of completed runs")
+    p_run.add_argument("--seeds", type=str, default=None,
+                       help="Comma-separated canonical master-seed subset for this worker")
+    p_run.add_argument("--worker-id", type=str, default=None,
+                       help="Worker identifier required for seed-shard execution")
+
+    p_merge = subparsers.add_parser("merge", help="Merge complete seed shards and finalize the canonical experiment")
+    p_merge.add_argument("--spec-file", type=str, required=True)
+    p_merge.add_argument("--shard-roots", type=str, nargs="+", required=True)
+    p_merge.add_argument("--output-root", type=str, default=None)
 
     # Dry-run
     p_dry = subparsers.add_parser("dry-run", help="Run tiny injected-backend experiment offline")
@@ -1222,7 +1440,32 @@ def main():
         if args.command == "preflight":
             print(json.dumps(run_preflight_check(spec), indent=2))
         else:
-            print(json.dumps(execute_full_experiment_pipeline(spec, force_rerun=args.force_rerun), indent=2))
+            seed_subset = None
+            if args.seeds is not None:
+                raw_seeds = [value.strip() for value in args.seeds.split(",")]
+                if not raw_seeds or any(not value for value in raw_seeds):
+                    parser.error("--seeds must contain a non-empty comma-separated seed subset")
+                try:
+                    seed_subset = [int(value) for value in raw_seeds]
+                except ValueError:
+                    parser.error("--seeds values must be integers")
+                if not args.worker_id:
+                    parser.error("--seeds requires --worker-id")
+            elif args.worker_id:
+                parser.error("--worker-id requires --seeds")
+            print(json.dumps(execute_full_experiment_pipeline(
+                spec,
+                force_rerun=args.force_rerun,
+                seed_subset=seed_subset,
+                worker_id=args.worker_id,
+            ), indent=2))
+    elif args.command == "merge":
+        spec_data = json.loads(Path(args.spec_file).read_text(encoding="utf-8"))
+        output_root = Path(args.output_root) if args.output_root else Path(spec_data["output_root"])
+        spec_data["output_root"] = str(output_root)
+        spec = ExperimentSpec.from_dict(spec_data)
+        merge_shard_outputs(spec, args.shard_roots, output_root)
+        print(json.dumps(execute_full_experiment_pipeline(spec), indent=2))
 
 
 if __name__ == "__main__":
