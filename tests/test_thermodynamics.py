@@ -6,6 +6,7 @@ from pathlib import Path
 import subprocess
 import sys
 
+import numpy as np
 import pytest
 
 from agents.thermodynamics import (
@@ -19,6 +20,7 @@ from agents.thermodynamics import (
     build_frozen_reference_set as _build_frozen_reference_set,
     canonical_json,
     load_frozen_reference_set,
+    serialize_structure,
     sha256_payload,
     threshold_sensitivity,
 )
@@ -77,6 +79,21 @@ def structure(formula, candidate_id=None, lattice=None, positions=None):
         "lattice": lattice or [[8.0, 0, 0], [0, 8.0, 0], [0, 0, 8.0]],
         "positions": positions,
     }
+
+
+def test_serialize_structure_converts_numpy_lattice_pbc_to_json_native_values():
+    from pymatgen.core import Lattice, Structure
+
+    value = Structure(Lattice.cubic(3.0), ["Li"], [[0.0, 0.0, 0.0]])
+    value.lattice._pbc = tuple(np.bool_(flag) for flag in (True, True, False))
+    assert all(isinstance(flag, np.bool_) for flag in value.as_dict()["lattice"]["pbc"])
+
+    serialized = serialize_structure(value)
+    pbc = serialized["data"]["lattice"]["pbc"]
+
+    assert pbc == [True, True, False]
+    assert all(type(flag) is bool for flag in pbc)
+    assert json.loads(canonical_json(serialized))["data"]["lattice"]["pbc"] == [True, True, False]
 
 
 class FakeEvaluator:

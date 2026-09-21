@@ -35,8 +35,10 @@ DEFAULT_SENSITIVITY_THRESHOLDS = (0.03, 0.05, 0.10)
 try:
     import numpy as np
     _BOOL_TYPES = (bool, np.bool_)
+    _NUMPY_SCALAR_TYPES = (np.generic,)
 except Exception:
     _BOOL_TYPES = (bool,)
+    _NUMPY_SCALAR_TYPES = ()
 
 
 class ThermodynamicFailureCode(str, Enum):
@@ -273,13 +275,23 @@ def sha256_payload(payload: Mapping[str, Any]) -> str:
     return hashlib.sha256((canonical_json(payload) + "\n").encode("utf-8")).hexdigest()
 
 
+def _json_native(value: Any) -> Any:
+    if isinstance(value, _NUMPY_SCALAR_TYPES):
+        return value.item()
+    if isinstance(value, Mapping):
+        return {key: _json_native(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_json_native(item) for item in value]
+    return value
+
+
 def serialize_structure(structure: Any) -> Any:
     if structure is None:
         return None
     if hasattr(structure, "as_dict"):
-        return {"format": "pymatgen", "data": structure.as_dict()}
+        return {"format": "pymatgen", "data": _json_native(structure.as_dict())}
     if isinstance(structure, Mapping):
-        return {"format": "dict", "data": dict(structure)}
+        return {"format": "dict", "data": _json_native(dict(structure))}
     raise TypeError(f"Unsupported structure type: {type(structure).__name__}")
 
 
