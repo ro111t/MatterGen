@@ -424,3 +424,78 @@ def test_completed_run_with_spec_or_artifact_mismatch_is_not_skippable(tmp_path)
 def test_career_memory_rejects_implicit_home_database():
     with pytest.raises(ValueError, match="explicit run-local"):
         CareerMemory("~/.matagent_career.db")
+
+
+
+def test_preflight_qe_version_probe_closes_stdin(tmp_path, monkeypatch):
+    """QE version probing must send EOF because pw.x otherwise waits for input."""
+    from types import SimpleNamespace
+
+    qe_executable = tmp_path / "pw.x"
+    qe_executable.write_text("fake qe executable")
+    expected_sha = hashlib.sha256(qe_executable.read_bytes()).hexdigest()
+
+    class FakeSpec:
+        output_root = str(tmp_path / "output")
+        source_task = SimpleNamespace(
+            task_id="source",
+            reference_set_path=None,
+            reference_set_sha256=None,
+            reference_set_certified=False,
+        )
+        target_tasks = []
+
+        mattergen_model_path = None
+        mattergen_checkpoint_sha256 = None
+        mattergen_sampling_config_path = None
+        mattergen_sampling_config_sha256 = None
+
+        schema_version = experiment_cli.SPEC_SCHEMA_VERSION
+        code_commit = experiment_cli.BASE_COMMIT_SHA
+        run_mode = "development"
+
+        conditions = list(experiment_cli.FIVE_CONDITIONS)
+        master_seeds = [42]
+        proposals_per_run = 2
+        oracle_budget_per_run = 1
+
+        pinned_model_identity = None
+        pinned_relaxation_settings = None
+
+        validation_calculator = "disabled"
+        synthesis_mode = "disabled"
+        generation_backend = "mattergen"
+        spec_hash = "qe-preflight-regression"
+
+        qe_audit_config = SimpleNamespace(
+            qe_executable=str(qe_executable),
+            qe_executable_version="7.5",
+            qe_executable_sha256=expected_sha,
+            sssp_manifest_path=None,
+            sssp_manifest_sha256=None,
+            mock_execution=False,
+        )
+
+    real_run = experiment_cli.subprocess.run
+
+    def fake_run(args, **kwargs):
+        if args == [str(qe_executable), "-h"]:
+            assert kwargs.get("input") == ""
+            assert kwargs.get("capture_output") is True
+            assert kwargs.get("text") is True
+            assert kwargs.get("timeout") == 10
+            assert kwargs.get("check") is False
+            return subprocess.CompletedProcess(
+                args=args,
+                returncode=1,
+                stdout="Program PWSCF v.7.5 starts",
+                stderr="",
+            )
+        return real_run(args, **kwargs)
+
+    monkeypatch.setattr(experiment_cli.subprocess, "run", fake_run)
+
+    result = run_preflight_check(FakeSpec())
+
+    assert result["status"] == "PASSED"
+    assert result["checks"]["qe_executable_ok"] is True

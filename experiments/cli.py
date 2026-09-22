@@ -181,7 +181,7 @@ def run_preflight_check(spec: ExperimentSpec) -> Dict[str, Any]:
     if qe_executable_path:
         try:
             proc = subprocess.run(
-                [qe_executable_path, "-h"], capture_output=True, text=True,
+                [qe_executable_path, "-h"], input="", capture_output=True, text=True,
                 timeout=10, check=False,
             )
             qe_version_text = (proc.stdout or "") + (proc.stderr or "")
