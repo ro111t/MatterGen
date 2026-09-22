@@ -44,6 +44,7 @@ from agents.integrity import (
     normalize_run_mode,
     assert_schema_v2_compatible,
 )
+from agents.research_execution import VerifiedResearchExecution
 from agents.geometry import DEFAULT_MIN_DISTANCE_ANGSTROM, GeometryValidator
 from agents.budget import DualBudgetTracker
 from agents.thermodynamics import (
@@ -111,6 +112,12 @@ class CampaignConfig:
     locked_elements: Optional[List[str]] = None
     allow_llm_orchestration: bool = True
     strategy_mode: str = "adaptive"
+    # Authoritative research boundary.  ``research_execution`` is issued only
+    # by CampaignRunner after pinned file/model verification and is bound to
+    # ``research_spec_hash`` (the exact RunSpec.spec_hash that was verified).
+    # run_mode="research" alone can never satisfy this boundary.
+    research_execution: Optional[VerifiedResearchExecution] = None
+    research_spec_hash: Optional[str] = None
 
     def __post_init__(self) -> None:
         self.run_mode = normalize_run_mode(self.run_mode)
@@ -129,6 +136,11 @@ class CampaignConfig:
             missing = [name for name in ("proposal_budget", "oracle_budget") if getattr(self, name) is None]
             if missing:
                 raise ValueError("Research mode requires explicit positive proposal_budget and oracle_budget")
+            if self.thermodynamics_evaluator is not None:
+                raise ValueError(
+                    "Research campaigns must consume the verified evaluator from a "
+                    "VerifiedResearchExecution; caller-injected thermodynamic evaluators are not allowed"
+                )
         selected_distance = self.minimum_distance if self.minimum_distance is not None else self.min_distance
         if self.min_distance_angstrom is not None:
             selected_distance = self.min_distance_angstrom
@@ -171,6 +183,7 @@ class MaterialsDiscoveryCampaign:
         self.campaign_id = ""
         self.termination_reason: Optional[str] = None
         self.backend_generation_shortfall_debt = 0
+        self._research_execution: Optional[VerifiedResearchExecution] = None
 
         # Build the execution boundary before opening persistent memory or
         # creating output artifacts.  In research mode each component is
@@ -253,6 +266,10 @@ class MaterialsDiscoveryCampaign:
                 ),
                 'allow_llm_orchestration': bool(getattr(self.config, 'allow_llm_orchestration', True)),
                 'strategy_mode': getattr(self.config, 'strategy_mode', 'adaptive'),
+                'research_execution': (
+                    self._research_execution.receipt().__dict__
+                    if self._research_execution is not None else None
+                ),
                 'memory_transfer_declaration': (
                     self.config.objective.constraints.get('memory_transfer_declaration')
                     or self.config.objective.constraints.get('transferability')
@@ -266,6 +283,10 @@ class MaterialsDiscoveryCampaign:
                 ScientificValidity.RESEARCH_VALID.value
                 if self.config.run_mode == RunMode.RESEARCH
                 else ScientificValidity.DEMO_ONLY.value
+            ),
+            research_verification=(
+                self._research_execution.receipt()
+                if self._research_execution is not None else None
             ),
             requested_backends=self.requested_backends,
             actual_backends=self.actual_backends,
@@ -317,10 +338,61 @@ class MaterialsDiscoveryCampaign:
             ),
         }
 
+    def _verify_research_context(self, ctx: VerifiedResearchExecution) -> List[str]:
+        """Check campaign invariants against the verified execution context."""
+        errors: List[str] = []
+        if not isinstance(ctx, VerifiedResearchExecution):
+            return ["research_execution is not a VerifiedResearchExecution issued by CampaignRunner"]
+        if not ctx.spec_hash or self.config.research_spec_hash != ctx.spec_hash:
+            errors.append(
+                "research_execution is not bound to this run's RunSpec.spec_hash "
+                "(research_spec_hash missing or mismatched)"
+            )
+        if not self.config.use_mattergen:
+            errors.append("research campaigns require MatterGen generation")
+        if not self.config.require_thermodynamics:
+            errors.append("research campaigns require thermodynamics")
+        if self.config.use_validation:
+            errors.append("campaign validation must be disabled in research mode")
+        if self.config.use_synthesis:
+            errors.append("campaign synthesis must be disabled in research mode")
+        if not ctx.validation_disabled:
+            errors.append("verified research execution did not disable campaign validation")
+        if not ctx.synthesis_disabled:
+            errors.append("verified research execution did not disable campaign synthesis")
+
+        def _same_path(configured: Optional[str], verified: Optional[str]) -> bool:
+            if configured is None and verified is None:
+                return True
+            if configured is None or verified is None:
+                return False
+            return Path(configured).resolve() == Path(verified).resolve()
+
+        if not _same_path(self.config.mattergen_model_path, ctx.mattergen_model_path):
+            errors.append("configured MatterGen checkpoint path differs from the verified execution")
+        if not _same_path(self.config.mattergen_sampling_config_path, ctx.mattergen_sampling_config_path):
+            errors.append("configured MatterGen sampling config differs from the verified execution")
+        if not _same_path(self.config.thermodynamics_reference_set_path, ctx.reference_set_path):
+            errors.append("configured reference set path differs from the verified execution")
+        return errors
+
     def _initialize_components_research(self) -> None:
         """Initialize all research components while collecting failures."""
         self.requested_backends = self._requested_backend_metadata()
         self._component_init_errors: List[str] = []
+        self._research_execution: Optional[VerifiedResearchExecution] = None
+
+        ctx = self.config.research_execution
+        if ctx is None:
+            self._component_init_errors.append(
+                "research campaigns require a VerifiedResearchExecution issued by "
+                "CampaignRunner; a thermodynamics_reference_set_path or backend name "
+                "alone cannot grant research validity"
+            )
+        else:
+            self._component_init_errors.extend(self._verify_research_context(ctx))
+            if not self._component_init_errors:
+                self._research_execution = ctx
 
         def init(name: str, factory: Any, fallback: Any = None) -> Any:
             try:
@@ -330,7 +402,18 @@ class MaterialsDiscoveryCampaign:
                 return fallback
 
         self.generator = init("generation", self._init_generator)
-        self.thermodynamic_oracle = init("thermodynamics", self._init_thermodynamic_oracle)
+        if self._research_execution is not None:
+            # Consume the verified frozen reference/evaluator dependencies; a
+            # research campaign never opens an independent unpinned scientific
+            # path and never loads CHGNet a second time.
+            self.thermodynamic_oracle = init(
+                "thermodynamics", self._init_verified_thermodynamic_oracle
+            )
+        else:
+            self.thermodynamic_oracle = None
+            self._component_init_errors.append(
+                "thermodynamics: no verified frozen reference set/evaluator available"
+            )
         self.screener = init("screening", self._init_screener)
         self.validator = (
             init("validation", self._init_validator)
@@ -1215,6 +1298,15 @@ class MaterialsDiscoveryCampaign:
         # v2 scientific campaign.  This preserves the original artifact and
         # prevents legacy energy semantics entering new retrieval/statistics.
         assert_schema_v2_compatible(data, context="reproduction manifest")
+        if str(manifest.run_mode) == "research":
+            # A loose CampaignConfig can never reacquire research validity; a
+            # research run must be replayed through fresh scientific
+            # verification in the authoritative experiment pipeline.
+            raise RuntimeError(
+                "Research manifests cannot be reproduced through the direct campaign path; "
+                "rerun the run through experiments.cli / CampaignRunner so the "
+                "VerifiedResearchExecution boundary is re-verified."
+            )
         out_dir = Path(output_dir).resolve() if output_dir else manifest_file.parent / "reproduced"
 
         # Verify manifest integrity hash if present
@@ -1228,6 +1320,12 @@ class MaterialsDiscoveryCampaign:
         obj_data = manifest.objective or {}
         constr_data = manifest.constraints or {}
         cfg_data = manifest.config or {}
+        if str(cfg_data.get('run_mode', manifest.run_mode)) == "research":
+            raise RuntimeError(
+                "Research manifests cannot be reproduced through the direct campaign path; "
+                "rerun the run through experiments.cli / CampaignRunner so the "
+                "VerifiedResearchExecution boundary is re-verified."
+            )
 
         objective = CampaignObjective(
             target_properties=obj_data.get('target_properties', obj_data),
@@ -1325,8 +1423,27 @@ class MaterialsDiscoveryCampaign:
             thermodynamic_oracle=getattr(self, "thermodynamic_oracle", None),
         )
 
+    def _init_verified_thermodynamic_oracle(self):
+        """Build the research oracle strictly from the verified execution."""
+        ctx = self._research_execution
+        if ctx is None:
+            raise RuntimeError("research thermodynamics requires a VerifiedResearchExecution")
+        return ThermodynamicOracle(
+            ctx.frozen_reference_set, ctx.evaluator, research=True,
+            geometry_min_distance=self.config.geometry_min_distance,
+            retain_threshold_ev_per_atom=self.config.thermodynamics_retain_threshold_ev_per_atom,
+            stable_threshold_ev_per_atom=self.config.thermodynamics_stable_threshold_ev_per_atom,
+        )
+
     def _init_thermodynamic_oracle(self):
         """Load an immutable certified set; never retrieve references at runtime."""
+        if self.config.run_mode == RunMode.RESEARCH:
+            # The unpinned loader path is development-only.  Research mode must
+            # consume the already-verified dependencies of the execution
+            # context instead of opening an independent scientific path.
+            raise RuntimeError(
+                "research thermodynamics requires a VerifiedResearchExecution"
+            )
         path = self.config.thermodynamics_reference_set_path
         evaluator = self.config.thermodynamics_evaluator
         if not path:
@@ -1430,6 +1547,14 @@ def main():
     parser.add_argument('--mattergen-sampling-config-name', type=str, default='default',
                         help='Name of the sampling config YAML file to use (default or csp)')
     args = parser.parse_args()
+
+    if args.run_mode == RunMode.RESEARCH.value:
+        parser.error(
+            "The direct campaign CLI cannot establish a verified research execution. "
+            "Use the experiment pipeline (experiments.cli / CampaignRunner), which "
+            "performs pinned file/model verification before issuing a "
+            "VerifiedResearchExecution to the campaign."
+        )
 
     if args.reproduce:
         print(f"Reproducing campaign from manifest: {args.reproduce}")

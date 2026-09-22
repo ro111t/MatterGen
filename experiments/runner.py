@@ -15,6 +15,7 @@ from typing import Any, Dict, Mapping, Optional
 
 from agents.integrity import RunMode
 from agents.orchestrator import CampaignObjective
+from agents.research_execution import VerifiedResearchExecution
 from agents.thermodynamics import load_frozen_reference_set
 from campaign import CampaignConfig, MaterialsDiscoveryCampaign
 from experiments.memory_snapshots import MemorySnapshotManager, compute_file_sha256
@@ -447,6 +448,21 @@ class CampaignRunner:
                 else:
                     cls._verify_memory_clone(spec, output_dir, memory_db_path)
 
+            # The verified execution is the campaign-level research boundary.
+            # It is issued only after every file/hash/certification check above
+            # has succeeded, is bound to this exact RunSpec.spec_hash, and
+            # carries the verified frozen reference set + CHGNet evaluator so
+            # the campaign never opens an independent unpinned scientific path.
+            research_execution = None
+            if spec.run_mode == "research":
+                try:
+                    research_execution = VerifiedResearchExecution.verify(spec)
+                except Exception as exc:
+                    raise CampaignRunnerError(
+                        f"Research execution verification failed: {exc}",
+                        RunTerminalState.FAILED_PREFLIGHT,
+                    ) from exc
+
             objective = CampaignObjective(
                 target_properties=dict(spec.target_properties),
                 constraints={
@@ -486,6 +502,8 @@ class CampaignRunner:
                 validation_calculator=spec.validation_calculator,
                 synthesis_mode=spec.synthesis_mode,
                 locked_elements=list(spec.elements),
+                research_execution=research_execution,
+                research_spec_hash=(spec.spec_hash if spec.run_mode == "research" else None),
                 allow_llm_orchestration=(
                     False if spec.condition in FIVE_CONDITIONS
                     else getattr(spec, "allow_llm_orchestration", True)

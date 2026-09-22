@@ -117,6 +117,19 @@ class ScreeningAgent:
         self.last_geometry_results: Dict[str, GeometryValidationResult] = {}
         self.last_budget_snapshot: Dict[str, Any] = {}
         self.last_memory_directives: List[Dict[str, Any]] = []
+        if self.run_mode == RunMode.RESEARCH and (
+            self.thermodynamic_oracle is None
+            or not isinstance(self.thermodynamic_oracle, ThermodynamicOracle)
+            or not getattr(self.thermodynamic_oracle, "research", False)
+        ):
+            # Research screening must consume the verified/certified oracle
+            # issued through the research execution boundary.  A raw CHGNet
+            # load would be an independent unpinned scientific path.
+            raise RuntimeError(
+                "Research screening requires the verified research-mode "
+                "ThermodynamicOracle supplied through the canonical "
+                "VerifiedResearchExecution boundary"
+            )
         if self.thermodynamic_oracle is not None:
             self.last_backend_used = "chgnet_thermodynamic_oracle"
         else:

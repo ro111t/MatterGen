@@ -12,6 +12,7 @@ import numpy as np
 from agents.budget import DualBudgetTracker
 from agents.geometry import closest_lattice_image
 from agents.provenance import CandidateStatus, CandidateRecord, ProvenanceTracker
+from agents.research_execution import ResearchVerificationReceipt
 from agents.thermodynamics import (
     ModelIdentity,
     ReferencePhaseInput,
@@ -2239,6 +2240,22 @@ def test_end_to_end_full_acceptance_gate(tmp_path, monkeypatch):
         constraints={"elements": ["Na", "Cl"]},
         run_mode="research",
         scientific_validity="research_valid",
+        research_verification=ResearchVerificationReceipt(
+            spec_hash="e" * 64,
+            run_id="run_nacl",
+            mattergen_model_path="models/mattergen.pt",
+            mattergen_checkpoint_sha256="0" * 64,
+            mattergen_sampling_config_path=None,
+            mattergen_sampling_config_sha256=None,
+            reference_set_path=str(ref_path),
+            reference_set_sha256=ref_set.reference_set_hash,
+            model_name=ref_set.model.name,
+            model_version=ref_set.model.version,
+            model_checkpoint_sha256=ref_set.model.checkpoint_sha256,
+            relaxation_settings=dict(ref_set.relaxation_settings.__dict__),
+            validation_disabled=True,
+            synthesis_disabled=True,
+        ),
         actual_backends={"screening": "chgnet_thermodynamic_oracle"},
     )
     tracker.register_generation(

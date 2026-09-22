@@ -86,10 +86,15 @@ def test_composition_only_dict_is_invalid_in_canonical_validator():
     assert result.code == GeometryFailureCode.INVALID_LATTICE_SHAPE.value
 
 
-def test_research_composition_only_dict_never_reaches_predict(monkeypatch):
-    # Bypass model initialization only to exercise the geometry gate itself.
-    monkeypatch.setattr("agents.screening.ScreeningAgent._init_models", lambda self: None)
-    agent = ScreeningAgent(run_mode="research")
+def test_research_composition_only_dict_never_reaches_predict(tmp_path):
+    # Research screening requires the verified oracle boundary; a certified
+    # frozen set with a pinned evaluator supplies it here.
+    from agents.thermodynamics import ThermodynamicOracle
+    from tests.test_thermodynamics import FakeEvaluator, build_binary
+
+    _, frozen, evaluator = build_binary(tmp_path)
+    oracle = ThermodynamicOracle(frozen, evaluator, research=True)
+    agent = ScreeningAgent(run_mode="research", thermodynamic_oracle=oracle)
     calls = []
     agent._predict = lambda *args: calls.append(args)
     result = agent.screen_batch([{"candidate_id": "composition-only", "composition": "LiPS"}], {})[0][1]

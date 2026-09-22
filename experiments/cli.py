@@ -233,10 +233,12 @@ def run_preflight_check(spec: ExperimentSpec) -> Dict[str, Any]:
         "sssp_manifest_ok": sssp_ok,
         "qe_executable_ok": qe_executable_ok,
         "mattergen_sampling_config_ok": sampling_ok,
-        "no_research_mocks": not (
-            spec.qe_audit_config.mock_execution
-            or str(spec.validation_calculator).lower() in {"mock", "fake", "stub"}
-            or str(spec.synthesis_mode).lower() in {"mock", "fake", "stub"}
+        # Campaign-level validation/synthesis must be declared "disabled" in
+        # research specs; naming an unverified backend is not acceptable.
+        "no_research_mocks": (
+            not spec.qe_audit_config.mock_execution
+            and str(spec.validation_calculator).lower() == "disabled"
+            and str(spec.synthesis_mode).lower() == "disabled"
         ),
         "research_backend_ok": spec.generation_backend == "mattergen",
         "environment_ok": bool(sys.version and platform.platform()),

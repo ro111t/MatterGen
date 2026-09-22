@@ -283,6 +283,12 @@ class RunSpec:
                 )
             if not self.mattergen_model_path or not self.mattergen_checkpoint_sha256:
                 raise ExperimentSpecError("research runs require a local MatterGen checkpoint and SHA256")
+            for stage_field in ("validation_calculator", "synthesis_mode"):
+                if str(getattr(self, stage_field)).lower() != "disabled":
+                    raise ExperimentSpecError(
+                        f"research runs require {stage_field}='disabled'; campaign-level "
+                        "validation/synthesis are intentionally disabled in the controlled experiment"
+                    )
         if self.mattergen_checkpoint_sha256:
             digest = str(self.mattergen_checkpoint_sha256).lower()
             if len(digest) != 64 or any(c not in "0123456789abcdef" for c in digest):
@@ -372,8 +378,8 @@ class ExperimentSpec:
     mattergen_sampling_config_path: Optional[str] = None
     mattergen_sampling_config_sha256: Optional[str] = None
     mattergen_batch_size: int = 16
-    validation_calculator: str = "mock"
-    synthesis_mode: str = "mock"
+    validation_calculator: str = "disabled"
+    synthesis_mode: str = "disabled"
     allow_llm_orchestration: bool = True
 
     def __post_init__(self):
@@ -437,10 +443,19 @@ class ExperimentSpec:
                 raise ExperimentSpecError("research mode requires a pinned SSSP manifest and SHA256")
             if not self.qe_audit_config.qe_executable_version or not self.qe_audit_config.qe_executable_sha256:
                 raise ExperimentSpecError("research mode requires a pinned QE executable version and SHA256")
-            if str(self.validation_calculator).lower() in {"mock", "fake", "stub"}:
-                raise ExperimentSpecError("research mode is incompatible with mock validation")
-            if str(self.synthesis_mode).lower() in {"mock", "fake", "stub"}:
-                raise ExperimentSpecError("research mode is incompatible with mock synthesis")
+            # The canonical runner deliberately disables campaign-level
+            # validation and synthesis; research identity must state that
+            # explicitly rather than naming unverified backends.
+            if str(self.validation_calculator).lower() != "disabled":
+                raise ExperimentSpecError(
+                    "research mode requires validation_calculator='disabled' "
+                    "(campaign-level validation is disabled, not mock or self-reported)"
+                )
+            if str(self.synthesis_mode).lower() != "disabled":
+                raise ExperimentSpecError(
+                    "research mode requires synthesis_mode='disabled' "
+                    "(campaign-level synthesis is disabled, not mock or self-reported)"
+                )
             try:
                 min_seeds = calculate_minimum_exact_test_sample_size(len(self.target_tasks))
             except ValueError as exc:

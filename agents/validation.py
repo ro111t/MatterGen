@@ -92,6 +92,18 @@ class ValidationAgent:
         mode: Optional[str] = None,
     ):
         self.run_mode = normalize_run_mode(mode if mode is not None else run_mode)
+        if self.run_mode == RunMode.RESEARCH:
+            # Campaign-level validation is not a verified scientific dependency
+            # of the controlled experiment.  An ASE Calculator instance, a
+            # backend string, or any self-reported identity proves interface
+            # compatibility only — never pinned executable/pseudopotential
+            # identity — so every research-mode calculator is rejected here.
+            raise RuntimeError(
+                "Research-mode campaign validation requires a verified validation "
+                "execution context (pinned executable/input/pseudopotential identity). "
+                "No such context exists; the canonical experiment intentionally "
+                "disables campaign validation."
+            )
         self.calculator_name = calculator if isinstance(calculator, str) else "ase"
         self.calculator = calculator if not isinstance(calculator, str) else None
         self.n_workers = max(1, n_workers)

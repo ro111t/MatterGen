@@ -89,7 +89,7 @@ with st.sidebar:
     memory_seed = st.number_input("Career memory seed", value=0, step=1, disabled=not use_career_memory)
     run_mode = st.selectbox(
         "Run mode", options=["development", "research"], index=0,
-        help="Research mode fails closed unless MatterGen, CHGNet, scientific validation, and required thermodynamics are configured.",
+        help="Research execution is only available through the verified experiment pipeline (experiments.cli / CampaignRunner); this UI runs development campaigns only.",
     )
 
     st.subheader("Pipeline Stages")
@@ -209,6 +209,13 @@ def _run_campaign_ui(
 
 
 if run_button:
+    if run_mode == "research":
+        st.error(
+            "Research execution cannot be launched from this UI: the generic "
+            "campaign path cannot supply a VerifiedResearchExecution. Use the "
+            "experiment pipeline (experiments.cli / CampaignRunner) instead."
+        )
+        st.stop()
     element_list = [e.strip() for e in elements.split(",") if e.strip()]
 
     progress = st.progress(0, text="Starting campaign...")

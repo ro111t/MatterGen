@@ -637,6 +637,7 @@ class ProvenanceTracker:
         actual_backends: Optional[Dict[str, Any]] = None,
         proposal_budget: Optional[int] = None,
         oracle_budget: Optional[int] = None,
+        research_verification: Optional[Any] = None,
     ):
         self.campaign_id = campaign_id
         self.campaign_name = campaign_name
@@ -647,11 +648,25 @@ class ProvenanceTracker:
         self.objective_dict = objective or {}
         self.constraints_dict = constraints or {}
         self.run_mode = str(run_mode)
-        self.scientific_validity = scientific_validity or (
-            ScientificValidity.RESEARCH_VALID.value
-            if self.run_mode == "research"
-            else ScientificValidity.DEMO_ONLY.value
-        )
+        # research_valid is never derivable from the run_mode string or a
+        # caller-supplied validity label; it requires a verification receipt
+        # issued by a VerifiedResearchExecution.
+        if (
+            self.run_mode == "research"
+            or scientific_validity == ScientificValidity.RESEARCH_VALID.value
+        ):
+            from agents.research_execution import ResearchVerificationReceipt
+            if not isinstance(research_verification, ResearchVerificationReceipt):
+                raise ValueError(
+                    "research_valid provenance requires a ResearchVerificationReceipt "
+                    "issued by a VerifiedResearchExecution; run_mode alone cannot "
+                    "grant scientific validity"
+                )
+            self.scientific_validity = ScientificValidity.RESEARCH_VALID.value
+            self.research_verification = research_verification
+        else:
+            self.scientific_validity = scientific_validity or ScientificValidity.DEMO_ONLY.value
+            self.research_verification = None
         self.requested_backends = dict(requested_backends or {})
         self.actual_backends = dict(actual_backends or {})
 
