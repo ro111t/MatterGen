@@ -18,6 +18,7 @@ import re
 import shutil
 import subprocess
 import sys
+import tempfile
 import time
 from typing import Any, Dict, List, Mapping, Optional, Sequence, Set
 
@@ -180,10 +181,16 @@ def run_preflight_check(spec: ExperimentSpec) -> Dict[str, Any]:
     qe_version_text = ""
     if qe_executable_path:
         try:
-            proc = subprocess.run(
-                [qe_executable_path, "-h"], input="", capture_output=True, text=True,
-                timeout=10, check=False,
-            )
+            # pw.x may create CRASH/input_tmp.in even for -h. Keep its working
+            # files outside the authorized research tree and remove them on exit.
+            qe_executable_path = str(Path(qe_executable_path).resolve())
+            with tempfile.TemporaryDirectory(prefix="qe-preflight-") as probe_dir:
+                if Path(probe_dir).resolve().is_relative_to(repo_root.resolve()):
+                    raise RuntimeError("QE preflight directory is inside the research tree")
+                proc = subprocess.run(
+                    [qe_executable_path, "-h"], input="", capture_output=True, text=True,
+                    timeout=10, check=False, cwd=probe_dir,
+                )
             qe_version_text = (proc.stdout or "") + (proc.stderr or "")
         except Exception:
             qe_version_text = ""
