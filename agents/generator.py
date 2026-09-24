@@ -14,6 +14,7 @@ from typing import Dict, List, Any, Optional, Tuple
 from pathlib import Path
 from math import ceil
 import random
+import re
 import tempfile
 import numpy as np
 from dataclasses import dataclass
@@ -112,6 +113,49 @@ class MattergenGenerator:
             return Path(path).resolve()
         return Path(__file__).parent / "mattergen_sampling_conf"
 
+    @staticmethod
+    def _local_checkpoint_target(path: str) -> Tuple[Path, Any]:
+        # Inspect the supplied layout before resolving symlinks: HF snapshots
+        # may link last.ckpt to a blob outside the model directory.
+        supplied = Path(path).absolute()
+        if supplied.is_dir():
+            return supplied.resolve(), "last"
+        if supplied.parent.name != "checkpoints" or supplied.suffix != ".ckpt":
+            raise ValueError("Explicit MatterGen checkpoint must be <model_dir>/checkpoints/<epoch>.ckpt")
+        if not supplied.is_file():
+            raise ValueError(f"MatterGen checkpoint does not exist: {supplied}")
+        model_dir = supplied.parent.parent.resolve()
+        if not (model_dir / "config.yaml").is_file():
+            raise ValueError(f"MatterGen model directory is missing config.yaml: {model_dir}")
+        if supplied.name == "last.ckpt":
+            epoch = "last"
+        else:
+            match = re.fullmatch(r"epoch=(\d+)(?:-[^/]+)?\.ckpt", supplied.name)
+            if not match:
+                raise ValueError(f"Unsupported explicit MatterGen checkpoint filename: {supplied.name}")
+            epoch = int(match.group(1))
+
+        # Mirror MatterGen's recursive selector, but reject multiple matches
+        # instead of allowing filesystem iteration order to choose the artifact.
+        matches = []
+        for candidate in model_dir.rglob("*.ckpt"):
+            if not candidate.is_file():
+                continue
+            if epoch == "last":
+                selected = candidate.name.endswith("last.ckpt")
+            elif candidate.name.endswith("last.ckpt"):
+                continue
+            else:
+                try:
+                    selected = int(candidate.name.split(".ckpt")[0].split("-")[0].split("=")[1]) == epoch
+                except (ValueError, IndexError) as exc:
+                    raise ValueError(f"Malformed MatterGen checkpoint filename: {candidate}") from exc
+            if selected:
+                matches.append(candidate)
+        if len(matches) != 1 or matches[0].resolve() != supplied.resolve():
+            raise ValueError(f"Ambiguous MatterGen checkpoint selection for {supplied}")
+        return model_dir, epoch
+
     def _load_model(self) -> None:
         from mattergen.common.utils.data_classes import MatterGenCheckpointInfo
         from mattergen.generator import CrystalGenerator
@@ -138,9 +182,10 @@ class MattergenGenerator:
         ]
 
         if self.model_path:
+            model_dir, load_epoch = self._local_checkpoint_target(self.model_path)
             checkpoint_info = MatterGenCheckpointInfo(
-                model_path=Path(self.model_path).resolve(),
-                load_epoch="last",
+                model_path=model_dir,
+                load_epoch=load_epoch,
                 config_overrides=overrides,
             )
         else:

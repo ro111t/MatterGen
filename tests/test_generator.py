@@ -151,3 +151,102 @@ def test_backend_name_accuracy():
     agent_mg._mattergen = FakeMattergen()
     assert agent_mg.backend_name == "mattergen"
 
+
+
+@pytest.fixture
+def local_mattergen(monkeypatch, tmp_path):
+    """Exercise the adapter with the real checkpoint selector, without inference."""
+    import sys
+    from types import ModuleType
+
+    pytest.importorskip("mattergen.common.utils.data_classes")
+    fake_module = ModuleType("mattergen.generator")
+
+    class FakeCrystalGenerator:
+        def __init__(self, **kwargs):
+            self.checkpoint_info = kwargs["checkpoint_info"]
+
+        def load_sampling_config(self, **kwargs):
+            pass
+
+    fake_module.CrystalGenerator = FakeCrystalGenerator
+    monkeypatch.setitem(sys.modules, "mattergen.generator", fake_module)
+    monkeypatch.setattr(generator, "HAS_MATTERGEN", True)
+    model_dir = tmp_path / "mattergen_base"
+    (model_dir / "checkpoints").mkdir(parents=True)
+    (model_dir / "config.yaml").write_text("{}\n")
+    (model_dir / "checkpoints" / "last.ckpt").write_bytes(b"pinned checkpoint")
+    return model_dir
+
+
+@pytest.mark.parametrize("filename,epoch", [("last.ckpt", "last"), ("epoch=7.ckpt", 7), ("epoch=7-loss_val=0.1.ckpt", 7)])
+def test_mattergen_explicit_checkpoint_preserves_pinned_artifact(local_mattergen, filename, epoch):
+    from agents.research_execution import hash_path
+
+    checkpoint = local_mattergen / "checkpoints" / filename
+    checkpoint.write_bytes(b"pinned checkpoint")
+    pinned_path = str(checkpoint)
+    digest = hash_path(checkpoint)
+    agent = GenerationAgent(
+        use_mattergen=True, mattergen_model_path=pinned_path,
+        mattergen_sampling_config_path=str(local_mattergen), run_mode="research",
+    )
+    backend = agent._mattergen
+    info = backend._generator.checkpoint_info
+    assert info.model_path == local_mattergen.resolve()
+    assert info.load_epoch == epoch
+    assert backend.model_path == pinned_path
+    assert hash_path(checkpoint) == digest
+    assert generator.Path(info.checkpoint_path).resolve() == checkpoint.resolve()
+    assert dict(info.config)  # Adapter overrides compose from model_dir/config.yaml.
+
+
+def test_mattergen_directory_input_compatibility(local_mattergen):
+    backend = MattergenGenerator(model_path=str(local_mattergen), sampling_config_path=str(local_mattergen))
+    info = backend._generator.checkpoint_info
+    assert info.model_path == local_mattergen.resolve()
+    assert info.load_epoch == "last"
+    assert backend.model_path == str(local_mattergen)
+
+
+def test_mattergen_symlink_checkpoint_uses_supplied_layout(local_mattergen, tmp_path):
+    checkpoint = local_mattergen / "checkpoints" / "last.ckpt"
+    blob = tmp_path / "blob"
+    checkpoint.rename(blob)
+    checkpoint.symlink_to(blob)
+    backend = MattergenGenerator(model_path=str(checkpoint), sampling_config_path=str(local_mattergen))
+    info = backend._generator.checkpoint_info
+    assert info.model_path == local_mattergen.resolve()
+    assert info.load_epoch == "last"
+    assert generator.Path(info.checkpoint_path).resolve() == blob
+    assert backend.model_path == str(checkpoint)
+
+
+@pytest.mark.parametrize("case", ["outside", "missing", "unsupported", "config", "duplicate_last", "duplicate_epoch", "malformed_peer"])
+def test_mattergen_invalid_explicit_paths_fail_closed(local_mattergen, case):
+    checkpoint = local_mattergen / "checkpoints" / "last.ckpt"
+    if case == "outside":
+        checkpoint = local_mattergen / "last.ckpt"
+        checkpoint.write_bytes(b"wrong layout")
+    elif case == "missing":
+        checkpoint = checkpoint.with_name("epoch=99.ckpt")
+    elif case == "unsupported":
+        checkpoint = checkpoint.with_name("best.ckpt")
+        checkpoint.write_bytes(b"unsupported")
+    elif case == "config":
+        (local_mattergen / "config.yaml").unlink()
+    elif case == "duplicate_last":
+        other = local_mattergen / "nested" / "last.ckpt"
+        other.parent.mkdir()
+        other.write_bytes(b"different artifact")
+    else:
+        checkpoint = checkpoint.with_name("epoch=7.ckpt")
+        checkpoint.write_bytes(b"pinned epoch")
+        other = checkpoint.with_name("epoch=7-loss_val=0.2.ckpt" if case == "duplicate_epoch" else "unknown.ckpt")
+        other.write_bytes(b"other checkpoint")
+    with pytest.raises(RuntimeError, match="Research mode requires an available MatterGen backend") as exc:
+        GenerationAgent(
+            use_mattergen=True, mattergen_model_path=str(checkpoint),
+            mattergen_sampling_config_path=str(local_mattergen), run_mode="research",
+        )
+    assert isinstance(exc.value.__cause__, ValueError)
