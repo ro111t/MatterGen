@@ -101,6 +101,13 @@ class RunMetrics:
     oracle_order_source: str = "structured_record_or_list_order"
     run_status: str = "unknown"
     shuffle_validation: Optional[Dict[str, Any]] = None
+    proposal_binding_sha256: Optional[str] = None
+    parent_experiment_hash: Optional[str] = None
+    source_receipt_sha256: Optional[str] = None
+    selection_protocol: Optional[str] = None
+    proposal_stream_sha256: Optional[str] = None
+    selection_trajectory_sha256: Optional[str] = None
+    source_acquisition_cost: Optional[Dict[str, Any]] = None
 
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)
@@ -215,7 +222,7 @@ def extract_candidates_from_manifest(
                 # arms can reorder candidates before oracle admission.
                 pass
 
-    priority_audits = source.get("memory_priority_audit", [])
+    priority_audits = source.get("memory_priority_audit", source.get("manifest", {}).get("memory_priority_audit", []))
     priority_map = {
         str(p.get("candidate_id")): _finite_float(p.get("score"))
         for p in priority_audits
@@ -560,6 +567,13 @@ def compute_run_metrics(
             else "incomplete_oracle_call_index"
         ),
         run_status=run_status,
+        proposal_binding_sha256=manifest.get("config", {}).get("selection_artifacts", {}).get("proposal_binding_sha256"),
+        parent_experiment_hash=manifest.get("config", {}).get("selection_artifacts", {}).get("parent_experiment_hash"),
+        source_receipt_sha256=manifest.get("config", {}).get("selection_artifacts", {}).get("source_receipt_sha256"),
+        selection_protocol=(manifest.get("config", {}).get("selection_protocol") or {}).get("protocol_version"),
+        proposal_stream_sha256=manifest.get("config", {}).get("selection_artifacts", {}).get("proposal_stream_sha256"),
+        selection_trajectory_sha256=manifest.get("config", {}).get("selection_trajectory_sha256"),
+        source_acquisition_cost=manifest.get("config", {}).get("selection_artifacts", {}).get("source_acquisition_cost"),
         shuffle_validation=(manifest.get("memory_shuffle_audit") if isinstance(manifest.get("memory_shuffle_audit"), Mapping) else None),
     )
     return metrics, candidates

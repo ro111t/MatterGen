@@ -27,6 +27,7 @@ from experiments.spec import (
 
 class NodeType(str, Enum):
     PREFLIGHT = "preflight"
+    PROPOSAL_STREAM = "proposal_stream"
     REFERENCE_SET_VERIFICATION = "reference_set_verification"
     SOURCE_MEMORY_RUN = "source_memory_run"
     SOURCE_MEMORY_SNAPSHOT = "source_memory_snapshot"
@@ -281,6 +282,16 @@ class ExperimentDAG:
                 expected_output_path=str(output_root / "references" / f"{task.task_id}.verified.json").replace("\\", "/"),
             ))
 
+        if spec.run_mode == "research":
+            for task in all_tasks:
+                for seed in run_seeds:
+                    self.add_node(DAGNode(
+                        node_id=f"node_proposals_{task.task_id}_{seed}", node_type=NodeType.PROPOSAL_STREAM,
+                        description="Explicitly initialize authoritative paired proposal stream",
+                        dependencies={preflight_id, f"node_refset_{task.task_id}"},
+                        payload={"task_id": task.task_id, "seed": seed},
+                        expected_output_path=str(output_root / "proposal_bindings" / task.task_id / f"{seed}.json")))
+
         # 3. Neutral Source Memory Runs & Snapshots per Master Seed
         source_snapshot_node_ids: Dict[int, str] = {}
         for seed in run_seeds:
@@ -293,7 +304,7 @@ class ExperimentDAG:
                 node_id=source_run_node_id,
                 node_type=NodeType.SOURCE_MEMORY_RUN,
                 description=f"Run neutral source campaign for {spec.source_task.task_id} with seed {seed}",
-                dependencies=ref_node_ids | {preflight_id},
+                dependencies=ref_node_ids | {preflight_id} | ({f"node_proposals_{spec.source_task.task_id}_{seed}"} if spec.run_mode == "research" else set()),
                 payload={
                     "run_id": source_run_id,
                     "task_id": spec.source_task.task_id,
@@ -317,6 +328,8 @@ class ExperimentDAG:
             # Source memory snapshot creation & freezing
             snapshot_node_id = f"node_snapshot_source_seed{seed}"
             snapshot_path = str(output_root / "memory_snapshots" / f"source_{spec.source_task.task_id}_seed{seed}.db").replace("\\", "/")
+            if spec.run_mode == "research":
+                snapshot_path = str(output_root / "source_evidence" / f"seed{seed}.json")
             self.add_node(DAGNode(
                 node_id=snapshot_node_id,
                 node_type=NodeType.SOURCE_MEMORY_SNAPSHOT,
@@ -349,8 +362,10 @@ class ExperimentDAG:
                     target_run_dir = str(output_root / "runs" / cond / target_task.task_id / str(seed)).replace("\\", "/")
                     
                     dependencies = {preflight_id, f"node_refset_{target_task.task_id}"}
+                    if spec.run_mode == "research":
+                        dependencies.add(f"node_proposals_{target_task.task_id}_{seed}")
                     # Memory conditions depend on the immutable source snapshot for that paired seed
-                    if cond in MEMORY_ARMS:
+                    if cond in MEMORY_ARMS or spec.run_mode == "research":
                         dependencies.add(source_snapshot_node_ids[seed])
                     
                     # Resolve transfer declaration for target task
@@ -641,7 +656,7 @@ class ExperimentDAG:
                 if persisted_path:
                     persisted_norm = str(persisted_path).replace("\\", "/")
                     canonical_norm = str(canonical_path).replace("\\", "/")
-                    if target_node.node_type == NodeType.SOURCE_MEMORY_SNAPSHOT:
+                    if target_node.node_type == NodeType.SOURCE_MEMORY_SNAPSHOT and spec.run_mode != "research":
                         placeholder_path = Path(canonical_path)
                         expected_dir = str(placeholder_path.parent).replace("\\", "/")
                         persisted_p = Path(persisted_norm)

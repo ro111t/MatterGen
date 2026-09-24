@@ -109,7 +109,7 @@ def test_statistics_keep_all_preregistered_arms_and_holm_family(tmp_path):
     metric_a = compute_run_metrics(_candidate_provenance(), "a", "Li-P-Se", "structured_provenance_memory", 42, 4)[0]
     metric_b = compute_run_metrics(_candidate_provenance(), "b", "Li-P-Se", "adaptive_no_memory", 42, 4)[0]
     results, summary = run_statistical_analysis_pipeline([metric_a, metric_b], output_dir=tmp_path, expected_seeds=[42, 137])
-    assert len(results) == 32  # every declared target/control/metric row remains present
+    assert len(results) == 24  # every declared target/control/metric row remains present
     assert all(row.missing_count >= 1 for row in results)
     manifest = json.loads((tmp_path / "analysis_manifest.json").read_text())
     assert manifest["expected_seeds"] == [42, 137]
@@ -287,6 +287,10 @@ def _make_valid_run_rows(tasks=("task1", "task2"), seeds=(42, 137, 2024, 777, 99
                     "oracle_success_count": 10,
                     "oracle_failure_count": 0,
                     "provenance_complete": True,
+                    "selection_protocol": "iclr_common_proposals_v1",
+                    "proposal_stream_sha256": "a" * 64, "proposal_binding_sha256": "b" * 64,
+                    "parent_experiment_hash": "c" * 64, "source_receipt_sha256": "d" * 64,
+                    "selection_trajectory_sha256": "e" * 64,
                 }
                 if cond == "shuffled_memory_control":
                     row["shuffle_validation"] = {"valid": True, "fixed_points": 0}
@@ -297,7 +301,7 @@ def _make_valid_run_rows(tasks=("task1", "task2"), seeds=(42, 137, 2024, 777, 99
 def _make_valid_stat_rows(
     tasks=("task1", "task2"),
     seeds=(42, 137, 2024, 777, 999, 31415, 27182, 16180, 104729),
-    controls=("adaptive_no_memory", "text_summary_memory", "shuffled_memory_control"),
+    controls=("adaptive_no_memory", "shuffled_memory_control"),
     time_diff=-2.0,
     yield_diff=0.3,
     p_raw=None,
@@ -693,20 +697,20 @@ def test_task2_mathematical_sample_size_feasibility():
     from experiments.spec import calculate_minimum_exact_test_sample_size, ExperimentSpecError
 
     # Formula check: n_min = ceil(1 + log2(m / 0.05))
-    # T = 2 -> m = 12 -> 1 + log2(240) = 8.9069 -> 9
+    # T = 2 -> m = 8 -> ceil(1 + log2(160)) = 9
     assert calculate_minimum_exact_test_sample_size(2) == 9
-    # T = 1 -> m = 6 -> 1 + log2(120) = 7.9069 -> 8
+    # T = 1 -> m = 4 -> ceil(1 + log2(80)) = 8
     assert calculate_minimum_exact_test_sample_size(1) == 8
-    # Custom T = 3 -> m = 18 -> 1 + log2(360) = 9.49 -> 10
-    assert calculate_minimum_exact_test_sample_size(3) == 10
-    # Custom T = 4 -> m = 24 -> 1 + log2(480) = 9.9069 -> 10
+    # T = 3 -> m = 12 -> ceil(1 + log2(240)) = 9
+    assert calculate_minimum_exact_test_sample_size(3) == 9
+    # T = 4 -> m = 16 -> ceil(1 + log2(320)) = 10
     assert calculate_minimum_exact_test_sample_size(4) == 10
-    # Custom T = 5 -> m = 30 -> 1 + log2(600) = 10.2288 -> 11
-    assert calculate_minimum_exact_test_sample_size(5) == 11
+    # T = 5 -> m = 20 -> ceil(1 + log2(400)) = 10
+    assert calculate_minimum_exact_test_sample_size(5) == 10
 
-    # Exceeding exact permutation enumeration boundary (n > 16): T=274 requires n=17 -> raises ValueError
+    # Exceeding exact permutation enumeration boundary (n > 16): T=410 requires n=17 -> raises ValueError
     with pytest.raises(ValueError, match="exceeds exact permutation enumeration boundary"):
-        calculate_minimum_exact_test_sample_size(274)
+        calculate_minimum_exact_test_sample_size(410)
 
     # 16 research seeds accepted
     spec16 = _make_research_mode_spec(tasks=["t1", "t2"], seeds=list(range(1, 17)))
@@ -801,6 +805,10 @@ def _make_run_metric(
         provenance_complete=True,
         run_status="completed",
         shuffle_validation=shuffle_val,
+        selection_protocol="iclr_common_proposals_v1",
+        proposal_stream_sha256="a" * 64, proposal_binding_sha256="b" * 64,
+        parent_experiment_hash="c" * 64, source_receipt_sha256="d" * 64,
+        selection_trajectory_sha256="e" * 64,
     )
 
 
@@ -836,15 +844,15 @@ def test_task2_end_to_end_real_pipeline_positive_claim_supported(tmp_path):
                 yield_0_10=0.0,
                 censored=True,
             ))
-            # 3. text_summary_memory (censored at call 10, yield 0.1)
+            # 3. Faithful text is identical to structured evidence
             metrics_list.append(_make_run_metric(
                 run_id=f"run_text_summary_memory_{task}_seed{seed}",
                 task_id=task,
                 condition="text_summary_memory",
                 seed=seed,
-                oracle_calls_to_threshold=10,
-                yield_0_10=0.1,
-                censored=True,
+                oracle_calls_to_threshold=2,
+                yield_0_10=0.8,
+                censored=False,
             ))
             # 4. shuffled_memory_control (censored at call 10, yield 0.1)
             metrics_list.append(_make_run_metric(
@@ -868,11 +876,15 @@ def test_task2_end_to_end_real_pipeline_positive_claim_supported(tmp_path):
                 censored=True,
             ))
 
+    from experiments.release_integrity import parent_hash
+    for metric in metrics_list:
+        metric.parent_experiment_hash = parent_hash(spec)
     runs_list = [m.to_dict() for m in metrics_list]
 
     # Execute the REAL statistical analysis pipeline
     results, summary = run_statistical_analysis_pipeline(
         metrics_list,
+        parent_experiment_hash=parent_hash(spec),
         output_dir=stats_dir,
         expected_seeds=spec.master_seeds,
         expected_tasks=[t.task_id for t in spec.target_tasks],
@@ -912,6 +924,9 @@ def test_task3_stat_row_validation_adversarial_modes(tmp_path):
     spec = _make_valid_research_spec()
     generator = ReportGenerator(tmp_path)
     runs = _make_valid_run_rows(tasks=[t.task_id for t in spec.target_tasks], seeds=spec.master_seeds)
+    from experiments.release_integrity import parent_hash
+    for row in runs:
+        row["parent_experiment_hash"] = parent_hash(spec)
 
     # Helper to test invalid stat rows
     def _check_inconclusive(mutated_stats):

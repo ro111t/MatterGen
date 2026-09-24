@@ -378,10 +378,21 @@ def test_receipt_derived_from_verified_execution_grants_validity(tmp_path):
 
 def test_canonical_runner_constructs_and_passes_verified_execution(tmp_path, monkeypatch):
     spec, frozen, evaluator = _research_spec(tmp_path)
+    from experiments.selection_protocol import PROTOCOL, CONTRACT, generate_stream, proposal_identity
+    from pymatgen.core import Structure, Lattice
+    spec = replace(spec, condition="source_neutral", protocol_version=PROTOCOL, protocol=dict(CONTRACT),
+                   oracle_budget=100, proposal_budget=100)
+    class Proposals:
+        last_generation_backend = "mattergen"
+        def generate_batch(self, **kwargs):
+            return [Structure(Lattice.cubic(5), ["Li"], [[0, 0, 0]]) for _ in range(kwargs["num_candidates"])]
+    from tests.revised_helpers import authorize
+    from experiments.release_integrity import initialize_pair
+    spec = initialize_pair(authorize(spec, tmp_path, monkeypatch), Proposals)
     captured = {}
 
     class CaptureCampaign:
-        def __init__(self, config):
+        def __init__(self, config, *args):
             captured["config"] = config
             raise RuntimeError("capture-sentinel")
 
@@ -391,7 +402,7 @@ def test_canonical_runner_constructs_and_passes_verified_execution(tmp_path, mon
         "agents.research_execution.CHGNetRelaxationEvaluator",
         lambda **kwargs: evaluator,
     )
-    monkeypatch.setattr("experiments.runner.MaterialsDiscoveryCampaign", CaptureCampaign)
+    monkeypatch.setattr("experiments.revised_runner.RevisedCampaign", CaptureCampaign)
     with pytest.raises(CampaignRunnerError, match="capture-sentinel"):
         CampaignRunner.execute_run(spec)
 
@@ -411,9 +422,19 @@ def test_canonical_runner_constructs_and_passes_verified_execution(tmp_path, mon
     ctx.assert_matches_spec(spec)
 
 
-def test_runner_rejects_research_spec_tampering(tmp_path):
+def test_runner_rejects_research_spec_tampering(tmp_path, monkeypatch):
     spec, frozen, evaluator = _research_spec(tmp_path)
-    bad = replace(spec, reference_set_sha256="0" * 64)
+    from experiments.selection_protocol import PROTOCOL, CONTRACT
+    bad = replace(spec, reference_set_sha256="0" * 64, condition="source_neutral",
+                  protocol_version=PROTOCOL, protocol=dict(CONTRACT), oracle_budget=100, proposal_budget=100)
+    from tests.revised_helpers import authorize
+    from experiments.release_integrity import initialize_pair
+    from pymatgen.core import Structure, Lattice
+    class Proposals:
+        last_generation_backend = "mattergen"
+        def generate_batch(self, **kwargs):
+            return [Structure(Lattice.cubic(5), ["Li"], [[0, 0, 0]]) for _ in range(kwargs["num_candidates"])]
+    bad = initialize_pair(authorize(bad, tmp_path, monkeypatch), Proposals)
     with pytest.raises(CampaignRunnerError, match="SHA256 mismatch"):
         CampaignRunner.execute_run(bad)
 

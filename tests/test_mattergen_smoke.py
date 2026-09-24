@@ -36,6 +36,7 @@ def test_mattergen_generates_a_real_pymatgen_structure():
         use_mattergen=True,
         mattergen_pretrained="mattergen_base",
         mattergen_batch_size=1,
+        run_mode="research",
     )
     assert agent.use_mattergen, "MatterGen initialization fell back to the mock backend"
 
@@ -48,10 +49,10 @@ def test_mattergen_generates_a_real_pymatgen_structure():
     assert agent.last_generation_backend == "mattergen"
     assert len(structures) == 1
     assert isinstance(structures[0], Structure)
+    assert {element.symbol for element in structures[0].composition.elements} <= {"Li", "P", "S"}
 
 
 if __name__ == "__main__":
     os.environ["RUN_MATTERGEN_SMOKE"] = "1"
     test_mattergen_generates_a_real_pymatgen_structure()
     print("MatterGen smoke test passed: successfully generated a real pymatgen.Structure.")
-

@@ -86,6 +86,7 @@ class MattergenGenerator:
         config_overrides: Optional[List[str]] = None,
         sampling_config_path: Optional[str] = None,
         sampling_config_name: str = "default",
+        run_mode: RunMode | str = RunMode.DEVELOPMENT,
     ):
         if not HAS_MATTERGEN:
             raise ImportError(
@@ -94,6 +95,7 @@ class MattergenGenerator:
             )
 
         self.pretrained_name = pretrained_name
+        self.run_mode = normalize_run_mode(run_mode)
         self.model_path = model_path
         self.device = device
         if batch_size < 1:
@@ -160,8 +162,7 @@ class MattergenGenerator:
         from mattergen.common.utils.data_classes import MatterGenCheckpointInfo
         from mattergen.generator import CrystalGenerator
 
-        # Restrict element vocabulary to the user's desired chemical system.
-        # Also ensure hardcoded training paths that are absent from the pip wheel
+        # Bootstrap hardcoded training paths that are absent from the pip wheel
         # are populated from the bundled data files shipped with this project.
         try:
             import shutil
@@ -221,6 +222,26 @@ class MattergenGenerator:
         if num_candidates < 1:
             return []
 
+        from mattergen.common.utils.globals import SELECTED_ATOMIC_NUMBERS
+
+        if not elements:
+            raise ValueError("MatterGen generation requires a nonempty allowed element set")
+        if any(not isinstance(symbol, str) or not Element.is_valid_symbol(symbol)
+               for symbol in elements):
+            raise ValueError(f"Invalid MatterGen element symbols: {elements}")
+        allowed_symbols = frozenset(elements)
+        allowed_numbers = frozenset(Element(symbol).Z for symbol in allowed_symbols)
+        if not allowed_numbers.issubset(SELECTED_ATOMIC_NUMBERS):
+            raise ValueError(f"Requested elements violate MatterGen's global element restrictions: {elements}")
+
+        target_comps = list(target_compositions_dict if target_compositions_dict is not None else self.target_compositions)
+        if target_comps and self.run_mode == RunMode.RESEARCH:
+            raise RuntimeError(
+                "Research mode cannot use target_compositions_dict: runtime compositions "
+                "are not verified fixed-composition conditioning for the MatterGen base "
+                "atom-type-denoising sampler; the memory intervention requires validation."
+            )
+
         if seed is not None:
             random.seed(seed)
             np.random.seed(seed % (2**32))
@@ -234,21 +255,18 @@ class MattergenGenerator:
 
         num_batches = ceil(num_candidates / self.batch_size)
 
-        allowed_cond = set()
-        try:
-            allowed_cond = set(self._generator.diffusion_module.model.cond_fields_model_was_trained_on)
-        except Exception:
-            pass
+        # CrystalGenerator.model prepares the checkpoint and exposes the actual
+        # denoiser. A missing/incompatible extension point must fail, not sample
+        # without the declared chemical-system invariant.
+        denoiser = self._generator.model.diffusion_module.model
+        original_mask = denoiser.element_mask_func
+        if not callable(original_mask):
+            raise RuntimeError("Cannot install MatterGen element restriction: missing callable element_mask_func")
+        allowed_cond = set(denoiser.cond_fields_model_was_trained_on)
 
         properties = dict(self.properties_to_condition_on)
         if target_properties:
             properties.update(target_properties)
-
-        target_comps = list(target_compositions_dict if target_compositions_dict is not None else self.target_compositions)
-        if elements and not target_comps and not properties and "chemical_system" in allowed_cond:
-            # Best-effort chemical-system conditioning when supported by model
-            system = "-".join(sorted(elements))
-            properties["chemical_system"] = system
 
         # Filter properties strictly to those the model checkpoint was trained on
         if allowed_cond:
@@ -256,14 +274,50 @@ class MattergenGenerator:
         else:
             properties = {}
 
-        with tempfile.TemporaryDirectory() as tmpdir:
-            self._generator.properties_to_condition_on = properties
-            structures = self._generator.generate(
-                batch_size=self.batch_size,
-                num_batches=num_batches,
-                target_compositions_dict=target_comps,
-                output_dir=Path(tmpdir),
+        def restrict_elements(logits, x=None, batch_idx=None, predictions_are_zero_based=True):
+            import torch
+            from mattergen.denoiser import mask_disallowed_elements
+
+            kwargs = dict(x=x, batch_idx=batch_idx,
+                          predictions_are_zero_based=predictions_are_zero_based)
+            masked = original_mask(logits=logits, **kwargs)
+            # Retain global restrictions even if the existing hook is customized.
+            masked = mask_disallowed_elements(
+                logits=masked, predictions_are_zero_based=predictions_are_zero_based
             )
+            numbers = torch.arange(masked.shape[-1], device=masked.device)
+            if predictions_are_zero_based:
+                numbers = numbers + 1
+            keep = torch.zeros_like(numbers, dtype=torch.bool)
+            for number in allowed_numbers:
+                keep |= numbers == number
+            # Match MatterGen's finite logit floor: classifier-free guidance
+            # interpolates logits, for which -inf - -inf would produce NaNs.
+            return masked.masked_fill(~keep, -1e10)
+
+        try:
+            denoiser.element_mask_func = restrict_elements
+            if denoiser.element_mask_func is not restrict_elements:
+                raise RuntimeError("Cannot install MatterGen element restriction")
+            with tempfile.TemporaryDirectory() as tmpdir:
+                self._generator.properties_to_condition_on = properties
+                structures = list(self._generator.generate(
+                    batch_size=self.batch_size,
+                    num_batches=num_batches,
+                    target_compositions_dict=target_comps,
+                    output_dir=Path(tmpdir),
+                ))
+            # Check the complete backend output, including the final partial
+            # batch, before trimming. Never discard or resample a violation.
+            for index, structure in enumerate(structures):
+                species = {element.symbol for element in structure.composition.elements}
+                if not species or not species.issubset(allowed_symbols):
+                    raise RuntimeError(
+                        f"MatterGen chemical-system violation at output {index}: "
+                        f"{sorted(species)} outside allowed {sorted(allowed_symbols)}"
+                    )
+        finally:
+            denoiser.element_mask_func = original_mask
         # MatterGen produces whole batches. Keep the adapter contract exact when
         # the requested count is not a multiple of the MatterGen batch size.
         return list(structures)[:num_candidates]
@@ -313,6 +367,7 @@ class GenerationAgent:
                     batch_size=mattergen_batch_size,
                     sampling_config_path=mattergen_sampling_config_path,
                     sampling_config_name=mattergen_sampling_config_name,
+                    run_mode=self.run_mode,
                 )
                 print(f"  [Generator] MatterGen backend loaded ({mattergen_pretrained})")
             except Exception as e:
@@ -370,6 +425,8 @@ class GenerationAgent:
                 try:
                     structures = self._mattergen.generate(num_candidates, elements=elements, seed=seed, target_compositions_dict=target_compositions_dict)
                 except TypeError:
+                    if self.run_mode == RunMode.RESEARCH:
+                        raise
                     structures = self._mattergen.generate(num_candidates, elements=elements, target_compositions_dict=target_compositions_dict)
                 backend = "mattergen"
             except Exception as e:

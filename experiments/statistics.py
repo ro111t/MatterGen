@@ -20,7 +20,7 @@ from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 
 from experiments.spec import (
     calculate_minimum_exact_test_sample_size,
-    CONFIRMATORY_CONTROLS,
+    CONFIRMATORY_CONTROLS, FIVE_CONDITIONS,
     CONFIRMATORY_METRICS,
     DEFAULT_FAMILY_WISE_ALPHA,
 )
@@ -403,6 +403,8 @@ def run_statistical_analysis_pipeline(
     expected_tasks: Optional[Sequence[str]] = None,
     experiment_id: Optional[str] = None,
     spec_hash: Optional[str] = None,
+    revised_protocol: Optional[bool] = None,
+    parent_experiment_hash: Optional[str] = None,
 ) -> Tuple[List[PairedComparisonResult], Dict[str, Any]]:
     """Run the preregistered paired family without silently dropping arms.
 
@@ -410,8 +412,16 @@ def run_statistical_analysis_pipeline(
     inferred from whatever runs happened to finish.  This makes an entirely
     absent task (or arm) an explicit unavailable comparison in the manifest.
     """
+    revised = (analysis_version == "2.0.0" if revised_protocol is None else revised_protocol)
+    revised = revised or any(_get(r, "selection_protocol") is not None for r in run_metrics_list)
+    equivalence = None
+    if revised:
+        from experiments.release_integrity import validate_rows
+        if not parent_experiment_hash:
+            raise ValueError("Revised analysis requires authorized parent experiment identity")
+        equivalence = validate_rows(run_metrics_list, expected_tasks=expected_tasks, expected_seeds=expected_seeds, expected_parent=parent_experiment_hash)
     conditions = (
-        "structured_provenance_memory", "adaptive_no_memory", "text_summary_memory",
+        "structured_provenance_memory", "adaptive_no_memory",
         "shuffled_memory_control", "random_mattergen",
     )
     # Keep the preregistered task universe even when an arm or an entire task
@@ -541,7 +551,7 @@ def run_statistical_analysis_pipeline(
     target_tasks = [t for t in (expected_tasks or tasks) if t not in {"Li-P-S", "source", "source_task"}]
     if not target_tasks:
         target_tasks = list(tasks)
-    conf_controls = list(conditions[1:4])
+    conf_controls = list(CONFIRMATORY_CONTROLS)
     conf_metrics_sorted = sorted(confirmatory_metrics)
 
     planned_confirmatory_entries: List[Tuple[str, str, str, PairedComparisonResult, Optional[float]]] = []
@@ -600,8 +610,11 @@ def run_statistical_analysis_pipeline(
         "primary_endpoint_semantics": "right_censored_at_fixed_oracle_budget",
         "confirmatory_family": CONFIRMATORY_FAMILY_NAME,
         "confirmatory_metrics": sorted(confirmatory_metrics),
-        "confirmatory_controls": list(conditions[1:4]),
-        "all_conditions": list(conditions),
+        "confirmatory_controls": list(CONFIRMATORY_CONTROLS),
+        "representation_equivalence": equivalence,
+        "parent_experiment_hash": parent_experiment_hash,
+        "all_conditions": list(FIVE_CONDITIONS),
+        "efficacy_conditions": list(conditions),
         "expected_seeds": all_seeds,
         "expected_tasks": tasks,
         "total_comparisons": len(results),

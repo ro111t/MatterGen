@@ -59,24 +59,33 @@ def test_generation_agent_records_mattergen_when_it_succeeds(monkeypatch):
 
 def test_mattergen_generator_rounds_up_and_trims_partial_batches():
     """The adapter should return exactly the count requested from a batch model."""
+    from types import SimpleNamespace
+    from agents.integrity import RunMode
+    mask = pytest.importorskip("mattergen.denoiser").mask_disallowed_elements
+    from pymatgen.core import Lattice, Structure
+
     class FakeCrystalGenerator:
         def __init__(self):
             self.calls = []
+            self.model = SimpleNamespace(diffusion_module=SimpleNamespace(model=SimpleNamespace(
+                element_mask_func=mask, cond_fields_model_was_trained_on=[])))
 
         def generate(self, **kwargs):
             self.calls.append(kwargs)
-            return list(range(kwargs["batch_size"] * kwargs["num_batches"]))
+            return [Structure(Lattice.cubic(5), ["Li"], [[0, 0, 0]])
+                    for _ in range(kwargs["batch_size"] * kwargs["num_batches"])]
 
     fake_generator = FakeCrystalGenerator()
     backend = object.__new__(MattergenGenerator)
     backend.batch_size = 2
+    backend.run_mode = RunMode.DEVELOPMENT
     backend.properties_to_condition_on = {}
     backend.target_compositions = []
     backend._generator = fake_generator
 
     candidates = backend.generate(num_candidates=5, elements=["Li", "P", "S"])
 
-    assert candidates == [0, 1, 2, 3, 4]
+    assert len(candidates) == 5
     assert fake_generator.calls[0]["num_batches"] == 3
 
 

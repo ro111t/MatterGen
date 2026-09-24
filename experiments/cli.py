@@ -455,7 +455,29 @@ def _find_reusable_snapshot(
     return valid[0]
 
 
-def _build_run_spec(spec: ExperimentSpec, node: DAGNode, dag: ExperimentDAG) -> RunSpec:
+def _source_bindings(corpus, sha):
+    corpus = Path(corpus)
+    return {"source_corpus_manifest": str(corpus), "source_corpus_sha256": sha,
+            "source_text_sha256": _file_sha256(corpus.with_suffix(".txt")),
+            "source_receipt_sha256": _file_sha256(corpus.with_suffix(".receipt.json"))}
+
+
+def _initialize_or_verify_stream(spec, node, dag, *, initialize):
+    from experiments.release_integrity import initialize_pair, bind_pair, locate
+    run_node = next(n for n in dag.nodes.values()
+        if n.node_type in {NodeType.SOURCE_MEMORY_RUN, NodeType.TARGET_CAMPAIGN_RUN}
+        and n.payload["task_id"] == node.payload["task_id"] and n.payload["seed"] == node.payload["seed"])
+    run = _build_run_spec(spec, run_node, dag, initialization=True)
+    run = initialize_pair(run) if initialize else bind_pair(run)
+    binding = locate(run, run.proposal_binding_manifest)
+    stream = locate(run, run.proposal_stream_manifest)
+    node.result_artifacts = {str(p.relative_to(spec.output_root)): _file_sha256(p)
+        for p in (binding, binding.with_suffix('.sha256'), binding.with_suffix('.intent.json'),
+                  stream, stream.with_suffix('.sha256'))}
+    return run
+
+
+def _build_run_spec(spec: ExperimentSpec, node: DAGNode, dag: ExperimentDAG, *, initialization=False) -> RunSpec:
     payload = node.payload
     task = next(t for t in [spec.source_task, *spec.target_tasks] if t.task_id == payload["task_id"])
     snapshot_sha = payload.get("source_memory_snapshot_sha256")
@@ -465,7 +487,7 @@ def _build_run_spec(spec: ExperimentSpec, node: DAGNode, dag: ExperimentDAG) -> 
             if dep and dep.node_type == NodeType.SOURCE_MEMORY_SNAPSHOT:
                 snapshot_sha = dep.result_hash or dep.payload.get("snapshot_sha256")
                 break
-    return RunSpec(
+    resolved = RunSpec(
         run_id=payload["run_id"],
         experiment_id=spec.experiment_id,
         task_id=payload["task_id"],
@@ -484,11 +506,13 @@ def _build_run_spec(spec: ExperimentSpec, node: DAGNode, dag: ExperimentDAG) -> 
         memory_seed=payload.get("memory_seed", payload["seed"]),
         output_dir=payload["output_dir"],
         memory_transfer_declaration=payload.get("memory_transfer_declaration"),
-        reference_set_path=task.reference_set_path,
+        reference_set_path=(str(Path(spec.output_root) / "references" / f"{task.task_id}.frozen.json") if spec.run_mode == "research" else task.reference_set_path),
         reference_set_sha256=task.reference_set_sha256,
         reference_set_certified=task.reference_set_certified,
-        source_memory_snapshot_path=payload.get("source_memory_snapshot_path"),
-        source_memory_snapshot_sha256=snapshot_sha,
+        source_memory_snapshot_path=(payload.get("source_memory_snapshot_path") if spec.run_mode != "research" else None),
+        source_memory_snapshot_sha256=(snapshot_sha if spec.run_mode != "research" else None),
+        protocol_version=(spec.selection_protocol if spec.run_mode == "research" else None),
+        protocol=(dict(spec.selection_contract) if spec.run_mode == "research" else None),
         pinned_model_identity=spec.pinned_model_identity,
         pinned_relaxation_settings=spec.pinned_relaxation_settings,
         career_db_path=str(Path(payload["output_dir"]) / "career_memory.db"),
@@ -508,6 +532,29 @@ def _build_run_spec(spec: ExperimentSpec, node: DAGNode, dag: ExperimentDAG) -> 
         allow_llm_orchestration=False,
         strategy_mode=("fixed" if payload.get("condition") == "random_mattergen" else "adaptive"),
     )
+
+
+    if spec.run_mode == "research":
+        from dataclasses import replace
+        from experiments.selection_protocol import PROTOCOL, CONTRACT, file_hash
+        from experiments.revised_runner import prepare
+        from experiments.release_integrity import parent_hash, code_identity
+        resolved = replace(resolved, protocol_version=PROTOCOL, protocol=dict(CONTRACT),
+            artifact_root=str(spec.output_root), parent_experiment_hash=parent_hash(spec),
+            authorized_code_commit=spec.code_commit,
+            authorized_code_identity=code_identity(spec.code_commit, spec.output_root))
+        if resolved.condition != "source_neutral" and not initialization:
+            corpus = Path(payload["source_corpus_manifest"])
+            text = corpus.with_suffix(".txt")
+            resolved = replace(resolved, source_corpus_manifest=str(corpus.relative_to(spec.output_root)),
+                source_corpus_sha256=payload["source_corpus_sha256"],
+                source_text_path=str(text.relative_to(spec.output_root)), source_text_sha256=payload["source_text_sha256"],
+                source_receipt_manifest=str(corpus.with_suffix(".receipt.json").relative_to(spec.output_root)),
+                source_receipt_sha256=payload["source_receipt_sha256"])
+        stream_path = Path(spec.output_root) / "proposal_streams" / resolved.task_id / f"{resolved.seed}.json"
+        if not initialization:
+            resolved = prepare(resolved, stream_path)
+    return resolved
 
 
 def _verify_and_hydrate_completed_node(
@@ -560,7 +607,12 @@ def _verify_and_hydrate_completed_node(
                     f"Node '{node.node_id}' secondary artifact '{rel_path}' digest mismatch: expected {expected_digest}, got {actual_digest}"
                 )
 
-    if node.node_type == NodeType.PREFLIGHT:
+    if spec.run_mode == "research":
+        from experiments.release_integrity import code_identity
+        code_identity(spec.code_commit, spec.output_root)
+    if node.node_type == NodeType.PROPOSAL_STREAM:
+        _initialize_or_verify_stream(spec, node, dag, initialize=False)
+    elif node.node_type == NodeType.PREFLIGHT:
         preflight_p = Path(node.expected_output_path)
         try:
             p_data = json.loads(preflight_p.read_text(encoding="utf-8"))
@@ -587,7 +639,8 @@ def _verify_and_hydrate_completed_node(
                 f"expected '{expected_task_id}', got '{actual_task_id}'"
             )
 
-        ref_path = node.payload.get("reference_set_path")
+        ref_path = (str(output_root / "references" / f"{node.payload['task_id']}.frozen.json")
+                    if spec.run_mode == "research" else node.payload.get("reference_set_path"))
         if not ref_path:
             if spec.run_mode == "research":
                 raise RuntimeError(f"Node '{node.node_id}' reference set path is missing in research mode")
@@ -666,16 +719,24 @@ def _verify_and_hydrate_completed_node(
         actual_sha = _file_sha256(actual_snap_path)
         if not node.result_hash or actual_sha != node.result_hash:
             raise RuntimeError(f"Node '{node.node_id}' snapshot file SHA256 mismatch")
-        MemorySnapshotManager.verify_snapshot_integrity(
-            snapshot_path=actual_snap_path,
-            expected_source_task=node.payload["source_task"],
-            expected_master_seed=node.payload["seed"],
-            expected_sqlite_sha256=node.result_hash,
-        )
-        for dependent in dag.nodes.values():
-            if node.node_id in dependent.dependencies:
-                dependent.payload["source_memory_snapshot_path"] = str(actual_snap_path).replace("\\", "/")
-                dependent.payload["source_memory_snapshot_sha256"] = actual_sha
+        if spec.run_mode == "research":
+            from experiments.revised_runner import freeze_source
+            source_dir = output_root / "runs" / "source" / node.payload["source_task"] / str(node.payload["seed"])
+            sha, _, _ = freeze_source(source_dir, actual_snap_path, node.payload["seed"], root=output_root)
+            for dependent in dag.nodes.values():
+                if node.node_id in dependent.dependencies:
+                    dependent.payload.update(_source_bindings(actual_snap_path, sha))
+        else:
+            MemorySnapshotManager.verify_snapshot_integrity(
+                snapshot_path=actual_snap_path,
+                expected_source_task=node.payload["source_task"],
+                expected_master_seed=node.payload["seed"],
+                expected_sqlite_sha256=node.result_hash,
+            )
+            for dependent in dag.nodes.values():
+                if node.node_id in dependent.dependencies:
+                    dependent.payload["source_memory_snapshot_path"] = str(actual_snap_path).replace("\\", "/")
+                    dependent.payload["source_memory_snapshot_sha256"] = actual_sha
 
     elif node.node_type == NodeType.AGGREGATION:
         agg_dir = output_root / "aggregates"
@@ -819,6 +880,9 @@ def _verify_and_hydrate_completed_node(
 
 
 def _canonical_spec_identity_hash(spec: ExperimentSpec) -> str:
+    if spec.run_mode == "research":
+        from experiments.release_integrity import parent_hash
+        return parent_hash(spec)
     data = spec.to_dict()
     data["output_root"] = "<canonical>"
     return compute_sha256(data)
@@ -985,6 +1049,9 @@ def execute_full_experiment_pipeline(
                 node.expected_output_path = str(out).replace("\\", "/")
                 node.result_artifacts = {"preflight.json": _file_sha256(out)}
 
+            elif node.node_type == NodeType.PROPOSAL_STREAM:
+                _initialize_or_verify_stream(spec, node, dag, initialize=True)
+
             elif node.node_type in (NodeType.SOURCE_MEMORY_RUN, NodeType.TARGET_CAMPAIGN_RUN):
                 run_spec = _build_run_spec(spec, node, dag)
                 run_res = CampaignRunner.execute_run(run_spec, force_rerun=force_rerun)
@@ -1014,55 +1081,88 @@ def execute_full_experiment_pipeline(
                 payload = node.payload
                 p = payload.get("reference_set_path")
                 expected = payload.get("reference_set_sha256")
+                frozen_reference = output_root / "references" / f"{payload['task_id']}.frozen.json"
+                if spec.run_mode == "research" and frozen_reference.exists():
+                    p = str(frozen_reference)
                 if spec.run_mode == "research":
                     if not p or not expected or not Path(p).exists():
                         raise RuntimeError(f"Reference set missing for {payload['task_id']}")
                     actual = _file_sha256(Path(p))
                     if actual != expected.lower():
                         raise RuntimeError(f"Reference set hash mismatch for {payload['task_id']}")
+                if spec.run_mode == "research":
+                    from experiments.selection_protocol import create_only
+                    source_checksum = Path(p).with_suffix(Path(p).suffix + ".sha256")
+                    if source_checksum.read_text().strip() != expected.lower():
+                        raise RuntimeError("Frozen reference checksum mismatch")
+                    if not frozen_reference.exists():
+                        create_only(frozen_reference, Path(p).read_bytes())
+                        create_only(frozen_reference.with_suffix(frozen_reference.suffix + ".sha256"), source_checksum.read_bytes())
+                    p = str(frozen_reference)
                 out = output_root / "references" / f"{payload['task_id']}.verified.json"
-                _atomic_write_json(out, {**payload, "verified": True, "sha256": _file_sha256(Path(p)) if p and Path(p).is_file() else None})
+                _atomic_write_json(out, {**payload, "reference_set_path": p, "verified": True, "sha256": _file_sha256(Path(p)) if p and Path(p).is_file() else None})
                 node.expected_output_path = str(out).replace("\\", "/")
                 node.result_artifacts = {
                     str(out.relative_to(output_root)).replace("\\", "/"): _file_sha256(out)
                 }
+                if spec.run_mode == "research":
+                    node.result_artifacts[str(frozen_reference.relative_to(output_root))] = _file_sha256(frozen_reference)
+                    checksum = frozen_reference.with_suffix(frozen_reference.suffix + ".sha256")
+                    node.result_artifacts[str(checksum.relative_to(output_root))] = _file_sha256(checksum)
 
             elif node.node_type == NodeType.SOURCE_MEMORY_SNAPSHOT:
                 payload = node.payload
                 src_run_dir = Path(output_root / "runs" / "source" / payload["source_task"] / str(payload["seed"]))
-                src_db = src_run_dir / "career_memory.db"
-                dest_snap = Path(payload["snapshot_path"])
-                reusable = _find_reusable_snapshot(payload)
-                if reusable is None:
-                    meta = MemorySnapshotManager.create_snapshot(
-                        source_db_path=src_db, destination_snapshot_path=dest_snap,
-                        source_task=payload["source_task"], master_seed=payload["seed"],
-                        allowed_transfer_declarations=[
-                            td.to_dict() if hasattr(td, "to_dict") else td.__dict__
-                            for td in spec.transfer_declarations
-                        ],
-                        content_addressed=True,
-                    )
-                    snapshot_sha256 = meta.sqlite_file_sha256
-                    actual_snapshot_path = str(meta.snapshot_path)
+                if spec.run_mode == "research":
+                    from experiments.revised_runner import freeze_source
+                    corpus = output_root / "source_evidence" / f"seed{payload['seed']}.json"
+                    sha, text_path, text_sha = freeze_source(src_run_dir, corpus, payload["seed"], root=output_root)
+                    node.expected_output_path = str(corpus)
+                    node.payload.update(source_corpus_manifest=str(corpus), source_corpus_sha256=sha)
+                    node.result_artifacts = {str(corpus.relative_to(output_root)): sha,
+                                             str(Path(text_path).relative_to(output_root)): text_sha,
+                                             str(corpus.with_suffix(".receipt.json").relative_to(output_root)): _file_sha256(corpus.with_suffix(".receipt.json"))}
+                    for dependent in dag.nodes.values():
+                        if node.node_id in dependent.dependencies:
+                            dependent.payload.update(_source_bindings(corpus, sha))
                 else:
-                    snapshot_sha256 = str(reusable["sha256"])
-                    actual_snapshot_path = str(reusable["path"])
-                node.payload["snapshot_sha256"] = snapshot_sha256
-                node.payload["snapshot_path"] = actual_snapshot_path
-                node.expected_output_path = actual_snapshot_path
-                node.result_artifacts = {
-                    str(Path(actual_snapshot_path).relative_to(output_root)).replace("\\", "/"): snapshot_sha256
-                }
-                for dependent in dag.nodes.values():
-                    if node.node_id in dependent.dependencies:
-                        dependent.payload["source_memory_snapshot_path"] = actual_snapshot_path
-                        dependent.payload["source_memory_snapshot_sha256"] = snapshot_sha256
+                    src_db = src_run_dir / "career_memory.db"
+                    dest_snap = Path(payload["snapshot_path"])
+                    reusable = _find_reusable_snapshot(payload)
+                    if reusable is None:
+                        meta = MemorySnapshotManager.create_snapshot(
+                            source_db_path=src_db, destination_snapshot_path=dest_snap,
+                            source_task=payload["source_task"], master_seed=payload["seed"],
+                            allowed_transfer_declarations=[
+                                td.to_dict() if hasattr(td, "to_dict") else td.__dict__
+                                for td in spec.transfer_declarations
+                            ],
+                            content_addressed=True,
+                        )
+                        snapshot_sha256 = meta.sqlite_file_sha256
+                        actual_snapshot_path = str(meta.snapshot_path)
+                    else:
+                        snapshot_sha256 = str(reusable["sha256"])
+                        actual_snapshot_path = str(reusable["path"])
+                    node.payload["snapshot_sha256"] = snapshot_sha256
+                    node.payload["snapshot_path"] = actual_snapshot_path
+                    node.expected_output_path = actual_snapshot_path
+                    node.result_artifacts = {
+                        str(Path(actual_snapshot_path).relative_to(output_root)).replace("\\", "/"): snapshot_sha256
+                    }
+                    for dependent in dag.nodes.values():
+                        if node.node_id in dependent.dependencies:
+                            dependent.payload["source_memory_snapshot_path"] = actual_snapshot_path
+                            dependent.payload["source_memory_snapshot_sha256"] = snapshot_sha256
+
 
             elif node.node_type == NodeType.AGGREGATION:
                 agg_dir = output_root / "aggregates"; agg_dir.mkdir(parents=True, exist_ok=True)
                 run_data = [rm.to_dict() for rm in all_runs_metrics]
                 cand_data = [c.to_dict() for c in all_candidates]
+                if spec.run_mode == "research":
+                    from experiments.release_integrity import validate_rows, parent_hash
+                    validate_rows(run_data, expected_tasks=[t.task_id for t in spec.target_tasks], expected_seeds=spec.master_seeds, expected_parent=parent_hash(spec))
                 _atomic_write_json(agg_dir / "runs.json", run_data)
                 _atomic_write_json(agg_dir / "candidates.json", cand_data)
                 # The aggregate contract is content-addressed.  JSON is used
@@ -1077,6 +1177,7 @@ def execute_full_experiment_pipeline(
                 }
 
             elif node.node_type == NodeType.STATISTICAL_ANALYSIS:
+                from experiments.release_integrity import parent_hash
                 stats_dir = output_root / "statistics"
                 stats_kwargs = {
                     "run_metrics_list": all_runs_metrics,
@@ -1086,6 +1187,8 @@ def execute_full_experiment_pipeline(
                     "expected_tasks": [task.task_id for task in spec.target_tasks],
                     "experiment_id": spec.experiment_id,
                     "spec_hash": spec.spec_hash,
+                    "revised_protocol": spec.run_mode == "research",
+                    "parent_experiment_hash": parent_hash(spec),
                 }
                 run_statistical_analysis_pipeline(**stats_kwargs)
                 node.result_artifacts = {
@@ -1331,6 +1434,9 @@ def merge_shard_outputs(
         runtime_commits.add(runtime_commit)
         merged_seeds.update(shard_seeds)
         merged_run_nodes.update(expected_run_nodes)
+        if spec.run_mode == "research":
+            from experiments.release_integrity import verify_research_root
+            verify_research_root(spec, root, seeds)
         manifests.append({
             "root": str(root),
             "manifest": manifest,
@@ -1355,7 +1461,7 @@ def merge_shard_outputs(
     deduplicated: List[str] = []
     for entry in manifests:
         root = Path(entry["root"])
-        for subdir in ("runs", "memory_snapshots", "references"):
+        for subdir in ("runs", "memory_snapshots", "references", "proposal_streams", "proposal_bindings", "source_evidence"):
             source_dir = root / subdir
             if not source_dir.is_dir():
                 continue
@@ -1368,9 +1474,16 @@ def merge_shard_outputs(
                     deduplicated.append(str(relative).replace("\\", "/"))
                     continue
                 destination.parent.mkdir(parents=True, exist_ok=True)
-                shutil.copyfile(source, destination)
+                if spec.run_mode == "research":
+                    from experiments.selection_protocol import create_only
+                    create_only(destination, source.read_bytes())
+                else:
+                    shutil.copyfile(source, destination)
                 copied.append(str(relative).replace("\\", "/"))
     output_root.mkdir(parents=True, exist_ok=True)
+    if spec.run_mode == "research":
+        from experiments.release_integrity import verify_research_root
+        verify_research_root(spec, output_root, spec.master_seeds)
     merge_manifest = {
         "manifest_schema_version": "1.0.0",
         "experiment_id": spec.experiment_id,

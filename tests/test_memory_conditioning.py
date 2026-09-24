@@ -300,20 +300,22 @@ class TestCampaignStrategyModes:
 
 class TestMattergenAdapter:
     def test_mattergen_adapter_forwards_target_compositions_dict(self) -> None:
-        """The adapter must pass per-call target_compositions_dict to CrystalGenerator."""
+        """Development retains runtime composition forwarding, without claiming enforcement."""
+        pytest.importorskip("mattergen.denoiser")
+        from agents.integrity import RunMode
         # Construct a minimal MattergenGenerator without loading a real model.
         mg = MattergenGenerator.__new__(MattergenGenerator)
         mg.batch_size = 16
+        mg.run_mode = RunMode.DEVELOPMENT
         mg.target_compositions = []
         mg.properties_to_condition_on = {}
         fake_generator = MagicMock()
-        fake_generator.diffusion_module = MagicMock()
-        fake_generator.diffusion_module.model.cond_fields_model_was_trained_on = []
+        fake_generator.model.diffusion_module.model.cond_fields_model_was_trained_on = []
         fake_generator.load_sampling_config = MagicMock()
         fake_generator.generate = MagicMock(return_value=[])
         mg._generator = fake_generator
         target = [{"Li": 2.0, "P": 3.0, "Se": 4.0}]
-        mg.generate(32, target_compositions_dict=target)
+        mg.generate(32, elements=["Li", "P", "Se"], target_compositions_dict=target)
         _, kwargs = fake_generator.generate.call_args
         assert kwargs.get("target_compositions_dict") == target
 

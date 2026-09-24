@@ -88,6 +88,9 @@ class CampaignRunner:
     @classmethod
     def is_run_completed(cls, output_dir: Path, spec: Optional[RunSpec] = None) -> bool:
         """Verify completion only when spec, provenance, and artifact hashes agree."""
+        if spec is not None and spec.protocol_version is not None:
+            from experiments.revised_runner import completed
+            return completed(spec)
         output_dir = Path(output_dir)
         manifest_path = output_dir / "manifest.json"
         integrity_path = output_dir / "run_integrity.json"
@@ -98,6 +101,10 @@ class CampaignRunner:
             manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
             integrity = json.loads(integrity_path.read_text(encoding="utf-8"))
             saved_spec = json.loads(spec_path.read_text(encoding="utf-8"))
+            if saved_spec.get("run_mode") == "research":
+                # Revised research completions are verified only through their
+                # explicit pinned RunSpec and journal-aware boundary above.
+                return False
             saved_hash = RunSpec.from_dict(saved_spec).spec_hash
             if spec is not None and saved_hash != spec.spec_hash:
                 return False
@@ -308,6 +315,14 @@ class CampaignRunner:
     @classmethod
     def execute_run(cls, spec: RunSpec, force_rerun: bool = False) -> Dict[str, Any]:
         """Execute a run, or return a verified completion on safe resume."""
+        if spec.protocol_version is not None:
+            from experiments.revised_runner import execute
+            try:
+                return execute(spec, force_rerun=force_rerun)
+            except Exception as exc:
+                raise CampaignRunnerError(f"Revised protocol failed closed: {exc}", cls._classify_failure(exc)) from exc
+        if spec.run_mode == "research":
+            raise CampaignRunnerError("Old research protocol is not executable/resume compatible", RunTerminalState.FAILED_PREFLIGHT)
         output_dir = Path(spec.output_dir)
         if output_dir.exists() and not output_dir.is_dir():
             raise CampaignRunnerError(

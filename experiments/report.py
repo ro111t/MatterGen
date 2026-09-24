@@ -615,6 +615,18 @@ class ReportGenerator:
         tasks, seeds, conditions, source = ReportGenerator._expected_context(artifacts)
         if not tasks or not seeds or not conditions:
             return False, bool(runs), []
+        revised = source.get("spec", {}).get("run_mode") == "research" or any(r.get("selection_protocol") is not None for r in runs)
+        if revised:
+            from experiments.release_integrity import validate_rows
+            try:
+                from experiments.release_integrity import parent_data_hash
+                frozen = dict(source.get("spec", {}))
+                expected_parent = None
+                if frozen.get("schema_version") == "3.0.0":
+                    expected_parent = parent_data_hash(frozen)
+                validate_rows(runs, expected_tasks=tasks, expected_seeds=seeds, expected_parent=expected_parent)
+            except (ValueError, KeyError, TypeError):
+                return False, bool(runs), []
         target_rows = [r for r in runs if str(r.get("task_id")) in tasks and str(r.get("condition")) in conditions]
         source_task = source.get("expected_source_task", source.get("source_task"))
         source_task = str(source_task) if source_task is not None else None
@@ -1266,7 +1278,7 @@ class ReportGenerator:
 
             complete_runs, has_runs, _ = self._target_runs_complete(runs, artifacts)
             stats_complete = self._statistical_evidence_complete(stats, artifacts)
-            for cid, control in (("C1", "adaptive_no_memory"), ("C2", "text_summary_memory"), ("C3", "shuffled_memory_control")):
+            for cid, control in (("C1", "adaptive_no_memory"), ("C3", "shuffled_memory_control")):
                 relevant = [row for row in stats if row.get("condition_b") == control]
                 is_supported = (
                     complete_runs
@@ -1283,7 +1295,23 @@ class ReportGenerator:
             # development evidence and must never be relabelled as demo-only.
             evidence = bool(stats or qe or runs)
             claim_status = {f"C{i}": ("Inconclusive" if evidence else "Unavailable") for i in range(1, 6)}
-        rows = [("C1", "Structured memory improves discovery yield", "statistics/effects.csv"), ("C2", "Structured directives outperform text summary", "statistics/effects.csv"), ("C3", "Transfer signal survives shuffled control", "statistics/effects.csv"), ("C4", "Dual proposal/oracle budget and geometry gate are preserved", "aggregates/runs.json"), ("C5", "CHGNet retention agrees with local QE decomposition margins", "qe_audit/results.csv")]
+        revised = any(r.get("selection_protocol") == "iclr_common_proposals_v1" for r in runs)
+        if revised:
+            # Text is a sufficient-statistic representation-equivalence control,
+            # never a superiority claim under the frozen revised protocol.
+            by_key = {(r.get("task_id"), r.get("seed"), r.get("condition")): r for r in runs}
+            paired = []
+            for row in runs:
+                if row.get("condition") == "structured_provenance_memory":
+                    other = by_key.get((row.get("task_id"), row.get("seed"), "text_summary_memory"), {})
+                    paired.append(bool(row.get("selection_trajectory_sha256"))
+                                  and row.get("selection_trajectory_sha256") == other.get("selection_trajectory_sha256")
+                                  and row.get("proposal_stream_sha256") == other.get("proposal_stream_sha256"))
+            complete, _, _ = self._target_runs_complete(runs, artifacts)
+            claim_status["C2"] = "Supported" if research_eligible and complete and paired and all(paired) else "Inconclusive"
+        rows = [("C1", "Structured memory improves discovery yield", "statistics/effects.csv"), ("C2", "Structured and faithful text evidence give equivalent selection trajectories", "aggregates/runs.json"), ("C3", "Transfer signal survives shuffled control", "statistics/effects.csv"), ("C4", "Dual proposal/oracle budget and geometry gate are preserved", "aggregates/runs.json"), ("C5", "CHGNet retention agrees with local QE decomposition margins", "qe_audit/results.csv")]
+        if revised:
+            rows[1] = ("C2", "Structured and faithful text evidence give equivalent selection trajectories", "aggregates/runs.json")
         text = "# Paper Claim-Evidence Matrix\n\nStatuses are derived from validated artifacts; unavailable or incomplete evidence is not a positive result.\n\n| Claim | Evidence | Artifact | Status |\n| :--- | :--- | :--- | :--- |\n"
         text += "\n".join(f"| **{cid}**: {description} | preregistered run/statistics/QE artifact | `{artifact}` | **{claim_status[cid]}** |" for cid, description, artifact in rows) + "\n"
         path = self.paper_dir / "claim_evidence_matrix.md"

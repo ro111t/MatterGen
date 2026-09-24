@@ -2085,9 +2085,9 @@ def test_confirmatory_holm_family_preserves_multiplicity_with_missing_arm():
         expected_tasks=["target_1", "target_2"],
         expected_seeds=[1],
     )
-    assert manifest["planned_family_size"] == 12
+    assert manifest["planned_family_size"] == 8
     assert manifest["available_comparison_count"] == 2
-    assert manifest["unavailable_comparison_count"] == 10
+    assert manifest["unavailable_comparison_count"] == 6
     assert manifest["manifest"]["auc_definition"]["worst_value_cap_ev_per_atom"] == 1.0
     available_results = [r for r in results if r.p_value_adjusted is not None]
     assert len(available_results) == 2
@@ -2325,9 +2325,9 @@ def test_end_to_end_full_acceptance_gate(tmp_path, monkeypatch):
         expected_seeds=[42],
         output_dir=tmp_path / "stats_out",
     )
-    assert stat_manifest["planned_family_size"] == 12
+    assert stat_manifest["planned_family_size"] == 8
     assert stat_manifest["available_comparison_count"] == 2
-    assert stat_manifest["unavailable_comparison_count"] == 10
+    assert stat_manifest["unavailable_comparison_count"] == 6
 
     # 6. Step curve AUC
     run_manifest_payload = {

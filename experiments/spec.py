@@ -13,8 +13,9 @@ from pathlib import Path
 from typing import Any, Dict, List, Mapping, Optional, Sequence, Set, Tuple
 
 from agents.integrity import SCHEMA_VERSION
+from experiments.selection_protocol import CONTRACT, PROTOCOL
 
-SPEC_SCHEMA_VERSION = "2.0.0"
+SPEC_SCHEMA_VERSION = "3.0.0"
 BASE_COMMIT_SHA = "b5162348fe17db62480882d197f01bf768214f3e"
 
 FIVE_CONDITIONS = (
@@ -38,7 +39,6 @@ TARGET_TASKS = ("Li-P-Se", "Na-P-S")
 DEFAULT_FAMILY_WISE_ALPHA = 0.05
 CONFIRMATORY_CONTROLS = (
     "adaptive_no_memory",
-    "text_summary_memory",
     "shuffled_memory_control",
 )
 CONFIRMATORY_METRICS = (
@@ -242,8 +242,28 @@ class RunSpec:
     synthesis_mode: str = "mock"
     allow_llm_orchestration: bool = True
     strategy_mode: str = "adaptive"
+    artifact_root: Optional[str] = None
+    parent_experiment_hash: Optional[str] = None
+    authorized_code_commit: Optional[str] = None
+    authorized_code_identity: Optional[Dict[str, str]] = None
+    proposal_binding_manifest: Optional[str] = None
+    proposal_binding_sha256: Optional[str] = None
+    source_receipt_manifest: Optional[str] = None
+    source_receipt_sha256: Optional[str] = None
+    protocol_version: Optional[str] = None
+    protocol: Optional[Dict[str, Any]] = None
+    proposal_stream_manifest: Optional[str] = None
+    proposal_stream_sha256: Optional[str] = None
+    source_corpus_manifest: Optional[str] = None
+    source_corpus_sha256: Optional[str] = None
+    source_text_path: Optional[str] = None
+    source_text_sha256: Optional[str] = None
 
     def __post_init__(self):
+        if self.protocol_version is not None:
+            from experiments.selection_protocol import PROTOCOL, CONTRACT
+            if self.protocol_version != PROTOCOL or self.protocol != CONTRACT:
+                raise ExperimentSpecError("Unknown or modified frozen selection protocol")
         valid_conditions = FIVE_CONDITIONS + ("source_neutral",)
         if self.condition not in valid_conditions:
             raise ExperimentSpecError(f"Invalid condition '{self.condition}'; must be one of {valid_conditions}")
@@ -253,7 +273,7 @@ class RunSpec:
             raise ExperimentSpecError(f"oracle_budget must be positive, got {self.oracle_budget}")
         if self.oracle_budget > self.proposal_budget:
             raise ExperimentSpecError(f"oracle_budget ({self.oracle_budget}) cannot exceed proposal_budget ({self.proposal_budget})")
-        if self.condition in MEMORY_ARMS and not self.source_memory_snapshot_path:
+        if self.condition in MEMORY_ARMS and not self.source_memory_snapshot_path and self.protocol_version is None:
             raise ExperimentSpecError(f"Condition '{self.condition}' requires source_memory_snapshot_path")
         if self.run_mode not in {"development", "research"}:
             raise ExperimentSpecError("run_mode must be 'development' or 'research'")
@@ -300,7 +320,10 @@ class RunSpec:
 
     def identity_dict(self) -> Dict[str, Any]:
         value = asdict(self)
-        for field_name in ("output_dir", "career_db_path", "source_memory_snapshot_path"):
+        locations = ["output_dir", "career_db_path", "source_memory_snapshot_path"]
+        if self.protocol_version is not None:
+            locations.extend(["artifact_root", "reference_set_path", "mattergen_model_path", "mattergen_sampling_config_path"])
+        for field_name in locations:
             value.pop(field_name, None)
         return value
 
@@ -322,7 +345,9 @@ class ExperimentSpec:
     experiment_id: str
     schema_version: str = SPEC_SCHEMA_VERSION
     code_commit: str = BASE_COMMIT_SHA
-    analysis_version: str = "1.0.0"
+    analysis_version: str = "2.0.0"
+    selection_protocol: str = PROTOCOL
+    selection_contract: Dict[str, Any] = field(default_factory=lambda: dict(CONTRACT))
     source_task: TaskDefinition = field(
         default_factory=lambda: TaskDefinition(task_id=SOURCE_TASK, elements=["Li", "P", "S"])
     )
@@ -403,6 +428,9 @@ class ExperimentSpec:
             raise ExperimentSpecError("master_seeds list cannot be empty")
         if len(set(self.master_seeds)) != len(self.master_seeds):
             raise ExperimentSpecError("master_seeds contains duplicates")
+        from experiments.selection_protocol import PROTOCOL
+        if self.selection_protocol != PROTOCOL or self.selection_contract != CONTRACT:
+            raise ExperimentSpecError("Unknown selection protocol")
         if self.proposals_per_run <= 0 or self.oracle_budget_per_run <= 0:
             raise ExperimentSpecError("proposals_per_run and oracle_budget_per_run must be positive integers")
         if self.oracle_budget_per_run > self.proposals_per_run:
@@ -482,6 +510,8 @@ class ExperimentSpec:
             "schema_version": self.schema_version,
             "code_commit": self.code_commit,
             "analysis_version": self.analysis_version,
+            "selection_protocol": self.selection_protocol,
+            "selection_contract": self.selection_contract,
             "source_task": asdict(self.source_task),
             "target_tasks": [asdict(t) for t in self.target_tasks],
             "transfer_declarations": [asdict(td) for td in self.transfer_declarations],
@@ -513,7 +543,7 @@ class ExperimentSpec:
     @classmethod
     def from_dict(cls, data: Dict[str, Any]) -> ExperimentSpec:
         expected_keys = {
-            "experiment_id", "schema_version", "code_commit", "analysis_version",
+            "experiment_id", "schema_version", "code_commit", "analysis_version", "selection_protocol", "selection_contract",
             "source_task", "target_tasks", "transfer_declarations", "conditions",
             "master_seeds", "proposals_per_run", "oracle_budget_per_run",
             "iterations_per_run", "geometry_min_distance",
