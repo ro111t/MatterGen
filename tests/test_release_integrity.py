@@ -171,11 +171,12 @@ def test_cli_shard_relocation_closure_statistics_and_report(revised_fixture,tmp_
     from experiments.statistics import run_statistical_analysis_pipeline
     from experiments.report import ReportGenerator
     original, _, factory = revised_fixture
-    root = tmp_path / 'shard'
+    root = tmp_path / 'shard-a'
+    second_root = tmp_path / 'shard-b'
     task_args = dict(elements=original.elements,reference_set_path=original.reference_set_path,
         reference_set_sha256=original.reference_set_sha256,reference_set_certified=True)
     exp = ExperimentSpec(experiment_id='release-cli',code_commit=original.authorized_code_commit,
-        master_seeds=[42],source_task=TaskDefinition(task_id='source',**task_args),
+        master_seeds=[42,137],source_task=TaskDefinition(task_id='source',**task_args),
         target_tasks=[TaskDefinition(task_id='Li-P-Se',**task_args)],output_root=str(root),
         proposals_per_run=200,oracle_budget_per_run=100,iterations_per_run=5,
         generation_backend='mattergen',pinned_model_identity=original.pinned_model_identity,
@@ -198,20 +199,36 @@ def test_cli_shard_relocation_closure_statistics_and_report(revised_fixture,tmp_
     monkeypatch.setattr('experiments.cli.run_preflight_check',preflight)
     monkeypatch.setattr('experiments.cli._runtime_metadata',lambda:{'git_commit':original.authorized_code_commit})
     execute_full_experiment_pipeline(exp,seed_subset=[42],worker_id='cpu')
-    moved=tmp_path/'moved'
+    second_exp = replace(exp,run_mode='development',output_root=str(second_root))
+    object.__setattr__(second_exp,'run_mode','research')
+    execute_full_experiment_pipeline(second_exp,seed_subset=[137],worker_id='cpu-b')
+    moved=tmp_path/'moved-a'
+    moved_second=tmp_path/'moved-b'
     shutil.copytree(root,moved)
-    shutil.rmtree(root)  # proves verification does not depend on original absolute locations
+    shutil.copytree(second_root,moved_second)
+    shutil.rmtree(root)
+    shutil.rmtree(second_root)  # receipts retain their original, now stale shard-local paths
+    receipt_relative=Path('references/Li-P-Se.verified.json')
+    first_receipt=json.loads((moved/receipt_relative).read_text())
+    second_receipt=json.loads((moved_second/receipt_relative).read_text())
+    assert first_receipt['reference_set_path'] != second_receipt['reference_set_path']
+    assert {k:v for k,v in first_receipt.items() if k!='reference_set_path'} == {
+        k:v for k,v in second_receipt.items() if k!='reference_set_path'}
     # Original reference input is unavailable: the shard must carry its own pinned bytes.
     Path(original.reference_set_path).unlink()
     merged=tmp_path/'merged'
-    merge_shard_outputs(exp,[moved],merged)
-    metrics=verify_research_root(exp,merged,[42])
+    merge_shard_outputs(exp,[moved,moved_second],merged)
+    merged_receipt=json.loads((merged/receipt_relative).read_text())
+    merged_reference=merged/'references/Li-P-Se.frozen.json'
+    assert Path(merged_receipt['reference_set_path']).resolve() == merged_reference.resolve()
+    assert merged_receipt['sha256'] == file_hash(merged_reference)
+    metrics=verify_research_root(exp,merged,[42,137])
     endpoints = {m.condition: m.oracle_calls_to_first_candidate_at_or_below_0_10 for m in metrics}
     assert endpoints['random_mattergen'] == endpoints['adaptive_no_memory'] == 2
     assert endpoints['structured_provenance_memory'] == endpoints['text_summary_memory'] == 1
     assert all((merged/name).is_dir() for name in ['proposal_streams','proposal_bindings','source_evidence','runs','references'])
     result,summary=run_statistical_analysis_pipeline(metrics,analysis_version='2.0.0',parent_experiment_hash=parent_hash(exp),
-        output_dir=tmp_path/'statistics',expected_tasks=['Li-P-Se'],expected_seeds=[42])
+        output_dir=tmp_path/'statistics',expected_tasks=['Li-P-Se'],expected_seeds=[42,137])
     manifest=json.loads((tmp_path/'statistics'/'analysis_manifest.json').read_text())
     assert manifest['confirmatory_controls']==['adaptive_no_memory','shuffled_memory_control']
     assert manifest['planned_family_size']==4
@@ -219,15 +236,47 @@ def test_cli_shard_relocation_closure_statistics_and_report(revised_fixture,tmp_
     assert all(r.condition_b!='text_summary_memory' for r in result)
     # Actual report completeness with a research context, rather than a synthetic success flag.
     monkeypatch.setattr(ReportGenerator,'_expected_context',staticmethod(lambda artifacts:
-        (['Li-P-Se'],[42],list(FIVE_CONDITIONS),{'spec':{'run_mode':'research'},
+        (['Li-P-Se'],[42,137],list(FIVE_CONDITIONS),{'spec':{'run_mode':'research'},
             'expected_source_task':'source','proposal_budget_per_run':200,'oracle_budget_per_run':100})))
     assert ReportGenerator._target_runs_complete([m.to_dict() for m in metrics],{})[0]
     # Copy conflicts are rejected; completed shard is never silently preferred.
     conflict=merged/'references'/'Li-P-Se.verified.json'
+    canonical_receipt=conflict.read_bytes()
     conflict.chmod(0o644)
     conflict.write_text('conflict')
     with pytest.raises(RuntimeError,match='collision'):
-        merge_shard_outputs(exp,[moved],merged)
+        merge_shard_outputs(exp,[moved,moved_second],merged)
+    conflict.write_bytes(canonical_receipt)
+
+    # An ordinary artifact still requires byte-identical content.
+    ordinary=merged/'references/Li-P-Se.frozen.json.sha256'
+    ordinary_bytes=ordinary.read_bytes()
+    ordinary.chmod(0o644)
+    ordinary.write_text('conflicting checksum')
+    with pytest.raises(RuntimeError,match='collision'):
+        merge_shard_outputs(exp,[moved,moved_second],merged)
+    ordinary.write_bytes(ordinary_bytes)
+
+    source_receipt=moved_second/receipt_relative
+    original_bytes=source_receipt.read_bytes()
+    changes=[
+        {'reference_set_sha256':'0'*64}, {'sha256':'0'*64},
+        {'task_id':'other'}, {'elements':['Li','P','S']},
+        {'reference_set_certified':False}, {'verified':False},
+        {'reference_set_path':'/unrelated/references/Li-P-Se.frozen.json'},
+        {'unexpected_field':True},
+    ]
+    for change in changes:
+        mutated={**second_receipt,**change}
+        source_receipt.chmod(0o644)
+        source_receipt.write_text(json.dumps(mutated,indent=2,sort_keys=True))
+        with pytest.raises(RuntimeError,match='receipt|collision|identity'):
+            merge_shard_outputs(exp,[moved,moved_second],merged)
+        source_receipt.write_bytes(original_bytes)
+    source_receipt.write_text('{malformed')
+    with pytest.raises(RuntimeError,match='receipt'):
+        merge_shard_outputs(exp,[moved,moved_second],merged)
+    source_receipt.write_bytes(original_bytes)
 
 
 def test_git_authorization_covers_entire_tree(monkeypatch):

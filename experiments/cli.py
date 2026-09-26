@@ -1377,6 +1377,44 @@ def _file_sha256(path: Path) -> str:
     return h.hexdigest()
 
 
+def _merged_reference_receipt(
+    spec: ExperimentSpec, shard_root: Path, original_root: Path,
+    merged_root: Path, relative: Path,
+) -> bytes:
+    """Validate a shard-local receipt and bind it to the merged frozen bytes."""
+    tasks = {task.task_id: task for task in [spec.source_task, *spec.target_tasks]}
+    task_id = relative.name.removesuffix(".verified.json")
+    if relative != Path("references") / f"{task_id}.verified.json" or task_id not in tasks:
+        raise RuntimeError(f"Unexpected reference verification receipt '{relative}'")
+    task = tasks[task_id]
+    source = shard_root / relative
+    try:
+        raw = source.read_bytes()
+        receipt = json.loads(raw)
+    except (OSError, ValueError) as exc:
+        raise RuntimeError(f"Malformed reference verification receipt '{source}'") from exc
+    keys = {"task_id", "elements", "reference_set_path", "reference_set_sha256",
+            "sha256", "reference_set_certified", "verified"}
+    if not isinstance(receipt, dict) or set(receipt) != keys or raw != json.dumps(
+            receipt, indent=2, sort_keys=True, default=str).encode("utf-8"):
+        raise RuntimeError(f"Malformed or unexpected reference verification receipt '{source}'")
+    frozen_relative = Path("references") / f"{task_id}.frozen.json"
+    frozen_source = shard_root / frozen_relative
+    frozen_merged = merged_root / frozen_relative
+    expected_hash = task.reference_set_sha256
+    if (receipt["task_id"] != task_id or receipt["elements"] != task.elements
+            or receipt["reference_set_sha256"] != expected_hash
+            or receipt["sha256"] != expected_hash
+            or receipt["reference_set_certified"] is not True
+            or task.reference_set_certified is not True or receipt["verified"] is not True
+            or receipt["reference_set_path"] != str(original_root / frozen_relative)
+            or not frozen_source.is_file() or _file_sha256(frozen_source) != expected_hash
+            or not frozen_merged.is_file() or _file_sha256(frozen_merged) != expected_hash):
+        raise RuntimeError(f"Reference verification receipt collision or identity mismatch at '{relative}'")
+    merged = {**receipt, "reference_set_path": str(frozen_merged.resolve())}
+    return json.dumps(merged, indent=2, sort_keys=True, default=str).encode("utf-8")
+
+
 def merge_shard_outputs(
     spec: ExperimentSpec,
     shard_roots: Sequence[str | Path],
@@ -1468,6 +1506,16 @@ def merge_shard_outputs(
     deduplicated: List[str] = []
     for entry in manifests:
         root = Path(entry["root"])
+        if spec.run_mode == "research":
+            seed = entry["manifest"]["executed_seeds"][0]
+            source_spec = root / "runs" / "source" / spec.source_task.task_id / str(seed) / "run_spec.json"
+            try:
+                original_root = Path(json.loads(source_spec.read_text(encoding="utf-8"))["artifact_root"])
+            except (OSError, ValueError, KeyError, TypeError) as exc:
+                raise RuntimeError(f"Shard '{root}' has no original artifact root") from exc
+            for task in [spec.source_task, *spec.target_tasks]:
+                if not (root / "references" / f"{task.task_id}.verified.json").is_file():
+                    raise RuntimeError(f"Shard '{root}' is missing reference verification receipt for {task.task_id}")
         for subdir in ("runs", "memory_snapshots", "references", "proposal_streams", "proposal_bindings", "source_evidence"):
             source_dir = root / subdir
             if not source_dir.is_dir():
@@ -1475,6 +1523,18 @@ def merge_shard_outputs(
             for source in sorted(path for path in source_dir.rglob("*") if path.is_file()):
                 relative = source.relative_to(root)
                 destination = output_root / relative
+                if (spec.run_mode == "research" and relative.parent == Path("references")
+                        and relative.name.endswith(".verified.json")):
+                    merged_bytes = _merged_reference_receipt(spec, root, original_root, output_root, relative)
+                    if destination.exists():
+                        if destination.read_bytes() != merged_bytes:
+                            raise RuntimeError(f"Merge collision at '{relative}' has divergent content")
+                        deduplicated.append(str(relative).replace("\\", "/"))
+                    else:
+                        from experiments.selection_protocol import create_only
+                        create_only(destination, merged_bytes)
+                        copied.append(str(relative).replace("\\", "/"))
+                    continue
                 if destination.exists():
                     if _file_sha256(destination) != _file_sha256(source):
                         raise RuntimeError(f"Merge collision at '{relative}' has divergent content")
