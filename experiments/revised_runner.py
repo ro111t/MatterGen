@@ -55,12 +55,12 @@ def load_run_spec(directory, root):
     return replace(spec, **changes)
 
 
-def freeze_source(source_dir, path, seed, root=None):
-    """Export only a verified completed source run; never trust caller labels."""
+def _freeze_source(source_dir, path, seed, root, completion_check, *, create_missing):
+    """Recompute source evidence from a completed run and compare frozen bytes."""
     source_dir = Path(source_dir)
     from experiments.spec import RunSpec
     source_spec = load_run_spec(source_dir, root) if root is not None else RunSpec.from_dict(json.loads((source_dir / "run_spec.json").read_text()))
-    if source_spec.condition != "source_neutral" or source_spec.seed != seed or not completed(source_spec):
+    if source_spec.condition != "source_neutral" or source_spec.seed != seed or not completion_check(source_spec):
         raise ValueError("Source acquisition is not a verified completed paired source campaign")
     body = json.loads((source_dir / "selection_observations.json").read_text())
     observations = [{"id": row["id"], "descriptor": row["descriptor"], "y": row["y"]}
@@ -83,6 +83,8 @@ def freeze_source(source_dir, path, seed, root=None):
         if Path(path).read_bytes() != raw or text_path.read_bytes() != text:
             raise ValueError("Frozen source artifact cannot be replaced")
     else:
+        if not create_missing:
+            raise ValueError("Historical source artifact is missing")
         create_only(text_path, text)
         create_only(path, raw)
     receipt_path = Path(path).with_suffix(".receipt.json")
@@ -95,8 +97,21 @@ def freeze_source(source_dir, path, seed, root=None):
         if receipt_path.read_bytes() != canonical(receipt):
             raise ValueError("Frozen verification receipt changed")
     else:
+        if not create_missing:
+            raise ValueError("Historical source receipt is missing")
         create_only(receipt_path, canonical(receipt))
     return file_hash(path), str(text_path), file_hash(text_path)
+
+
+def freeze_source(source_dir, path, seed, root=None):
+    """Export only a verified completed source run; never trust caller labels."""
+    return _freeze_source(source_dir, path, seed, root, completed, create_missing=True)
+
+
+def _verify_frozen_source_for_merge(source_dir, path, seed, root):
+    from experiments.release_integrity import _bind_pair_artifacts
+    return _freeze_source(source_dir, path, seed, root,
+        lambda spec: _completed(spec, _bind_pair_artifacts), create_missing=False)
 
 
 def historical(spec):
@@ -290,13 +305,12 @@ class RevisedCampaign(MaterialsDiscoveryCampaign):
         return self._generate_final_report(time.monotonic() - started)
 
 
-def completed(spec):
+def _completed(spec, binding_verifier):
     directory = Path(spec.output_dir)
     try:
         saved = json.loads((directory / "run_spec.json").read_text())
         from experiments.spec import RunSpec
-        from experiments.release_integrity import bind_pair
-        spec = bind_pair(spec)
+        spec = binding_verifier(spec)
         if RunSpec.from_dict(saved).identity_dict() != spec.identity_dict():
             return False
         integrity = json.loads((directory / "run_integrity.json").read_text())
@@ -313,6 +327,8 @@ def completed(spec):
         required = {"manifest.json", "campaign_provenance.json", "selection_observations.json", "report.json"}
         if not required <= set(integrity["artifacts"]):
             return False
+        if not (directory / "selection_journal").is_dir():
+            return False
         journal = Journal(directory / "selection_journal")
         if journal.tail != integrity["journal_tail"]:
             return False
@@ -321,6 +337,11 @@ def completed(spec):
         return manifest["status"] == "completed" and bool(CampaignRunner._canonical_manifest_hash(manifest))
     except (OSError, ValueError, KeyError, TypeError):
         return False
+
+
+def completed(spec):
+    from experiments.release_integrity import bind_pair
+    return _completed(spec, bind_pair)
 
 
 def execute(spec, force_rerun=False):

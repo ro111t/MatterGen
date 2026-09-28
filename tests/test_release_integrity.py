@@ -5,6 +5,7 @@ from types import SimpleNamespace
 import json
 import os
 import stat
+import subprocess
 
 import pytest
 
@@ -166,7 +167,7 @@ def test_cli_shard_relocation_closure_statistics_and_report(revised_fixture,tmp_
     """Real CLI orchestration/runner/merge, with only expensive backends substituted."""
     import shutil
     from experiments.spec import ExperimentSpec, TaskDefinition, FIVE_CONDITIONS
-    from experiments.cli import execute_full_experiment_pipeline, merge_shard_outputs
+    from experiments.cli import execute_full_experiment_pipeline, merge_shard_outputs, finalize_merged_research_analysis
     from experiments.release_integrity import verify_research_root, parent_hash
     from experiments.statistics import run_statistical_analysis_pipeline
     from experiments.report import ReportGenerator
@@ -197,7 +198,9 @@ def test_cli_shard_relocation_closure_statistics_and_report(revised_fixture,tmp_
         (Path(spec.output_root)/'preflight.json').write_bytes(canonical(result))
         return result
     monkeypatch.setattr('experiments.cli.run_preflight_check',preflight)
-    monkeypatch.setattr('experiments.cli._runtime_metadata',lambda:{'git_commit':original.authorized_code_commit})
+    monkeypatch.setattr('experiments.cli._runtime_metadata',lambda:{'git_commit':original.authorized_code_commit,'git_dirty':False})
+    monkeypatch.setattr('experiments.release_integrity._finalization_identities',lambda spec, root:
+        (original.authorized_code_identity, {'commit':'later-finalization-commit','tree':'later-finalization-tree'}))
     execute_full_experiment_pipeline(exp,seed_subset=[42],worker_id='cpu')
     second_exp = replace(exp,run_mode='development',output_root=str(second_root))
     object.__setattr__(second_exp,'run_mode','research')
@@ -223,6 +226,11 @@ def test_cli_shard_relocation_closure_statistics_and_report(revised_fixture,tmp_
     assert Path(merged_receipt['reference_set_path']).resolve() == merged_reference.resolve()
     assert merged_receipt['sha256'] == file_hash(merged_reference)
     metrics=verify_research_root(exp,merged,[42,137])
+    finalized=finalize_merged_research_analysis(exp,merged)
+    assert finalized['status']=='ANALYSIS_COMPLETE'
+    assert finalized['experiment_execution_commit']==original.authorized_code_commit
+    assert (merged/'aggregates/runs.json').is_file()
+    assert (merged/'statistics/analysis_manifest.json').is_file()
     endpoints = {m.condition: m.oracle_calls_to_first_candidate_at_or_below_0_10 for m in metrics}
     assert endpoints['random_mattergen'] == endpoints['adaptive_no_memory'] == 2
     assert endpoints['structured_provenance_memory'] == endpoints['text_summary_memory'] == 1
@@ -278,6 +286,28 @@ def test_cli_shard_relocation_closure_statistics_and_report(revised_fixture,tmp_
         merge_shard_outputs(exp,[moved,moved_second],merged)
     source_receipt.write_bytes(original_bytes)
 
+    # A completed shard cannot claim that a later merge tool executed it.
+    shard_manifest=moved_second/'shard_manifest.json'
+    original_manifest=shard_manifest.read_bytes()
+    incorrect=json.loads(original_manifest)
+    incorrect['code_commit']='later-finalization-commit'
+    shard_manifest.write_text(json.dumps(incorrect))
+    with pytest.raises(RuntimeError,match='runtime execution commit'):
+        merge_shard_outputs(exp,[moved,moved_second],merged)
+    shard_manifest.write_bytes(original_manifest)
+    incorrect=json.loads(original_manifest)
+    incorrect['runtime']['git_commit']='later-finalization-commit'
+    shard_manifest.write_text(json.dumps(incorrect))
+    with pytest.raises(RuntimeError,match='runtime execution commit'):
+        merge_shard_outputs(exp,[moved,moved_second],merged)
+    shard_manifest.write_bytes(original_manifest)
+    incorrect=json.loads(original_manifest)
+    incorrect['runtime']['git_dirty']=True
+    shard_manifest.write_text(json.dumps(incorrect))
+    with pytest.raises(RuntimeError,match='runtime execution commit'):
+        merge_shard_outputs(exp,[moved,moved_second],merged)
+    shard_manifest.write_bytes(original_manifest)
+
 
 def test_git_authorization_covers_entire_tree(monkeypatch):
     from experiments.release_integrity import code_identity
@@ -294,6 +324,72 @@ def test_git_authorization_covers_entire_tree(monkeypatch):
             code_identity('c'*40)
     with pytest.raises(ValueError,match='commit'):
         code_identity('other')
+
+
+def test_historical_merge_identity_requires_clean_later_tooling(tmp_path,monkeypatch):
+    import experiments.release_integrity as integrity
+    repo=tmp_path/'code'
+    module=repo/'experiments/release_integrity.py'
+    module.parent.mkdir(parents=True)
+    module.write_text('execution code\n')
+    subprocess.run(['git','init','-q',str(repo)],check=True)
+    subprocess.run(['git','-C',str(repo),'add','.'],check=True)
+    subprocess.run(['git','-C',str(repo),'-c','user.name=Test','-c','user.email=test@example.org',
+                    'commit','-qm','execution'],check=True)
+    old=subprocess.check_output(['git','-C',str(repo),'rev-parse','HEAD'],text=True).strip()
+    old_tree=subprocess.check_output(['git','-C',str(repo),'rev-parse','HEAD^{tree}'],text=True).strip()
+    module.write_text('later merge tooling\n')
+    subprocess.run(['git','-C',str(repo),'add','.'],check=True)
+    subprocess.run(['git','-C',str(repo),'-c','user.name=Test','-c','user.email=test@example.org',
+                    'commit','-qm','finalization'],check=True)
+    current=subprocess.check_output(['git','-C',str(repo),'rev-parse','HEAD'],text=True).strip()
+    monkeypatch.setattr(integrity,'__file__',str(module))
+    spec=SimpleNamespace(run_mode='research',code_commit=old)
+    historical,finalizer=integrity._finalization_identities(spec,tmp_path/'results')
+    assert historical=={'commit':old,'tree':old_tree}
+    assert finalizer['commit']==current
+    with pytest.raises(ValueError,match='commit'):
+        integrity.code_identity(old,tmp_path/'results')
+    with pytest.raises(ValueError,match='commit'):
+        integrity.verify_code(SimpleNamespace(authorized_code_commit=old,
+            artifact_root=str(tmp_path/'results'),authorized_code_identity=historical,
+            parent_experiment_hash='a'*64))
+    with pytest.raises(ValueError,match='commit'):
+        integrity.initialize_pair(SimpleNamespace(authorized_code_commit=old,
+            artifact_root=str(tmp_path/'results'),authorized_code_identity=historical,
+            parent_experiment_hash='a'*64))
+    module.write_text('dirty finalization tooling\n')
+    with pytest.raises(ValueError,match='dirty'):
+        integrity._finalization_identities(spec,tmp_path/'results')
+
+
+def test_research_merge_cli_does_not_enter_execution_dag(tmp_path,monkeypatch,capsys):
+    import sys
+    from experiments.cli import main
+    from experiments.spec import ExperimentSpec, QEAuditConfig, TaskDefinition
+    spec=ExperimentSpec(
+        experiment_id='historical-merge-cli',code_commit='a'*40,
+        master_seeds=[42,137,2024,777,999,31415,27182,16180],
+        target_tasks=[TaskDefinition('Li-P-Se',['Li','P','Se'])],
+        run_mode='research',generation_backend='mattergen',output_root=str(tmp_path/'merged'),
+        pinned_model_identity={'name':'CHGNet','version':'0.4.2','checkpoint_sha256':'b'*64},
+        pinned_relaxation_settings={'fmax_ev_per_angstrom':0.05,'max_steps':500,'relax_cell':True},
+        mattergen_model_path='/pinned/last.ckpt',mattergen_checkpoint_sha256='c'*64,
+        qe_audit_config=QEAuditConfig(mock_execution=False,sssp_manifest_path='/pinned/sssp.json',
+            sssp_manifest_sha256='d'*64,qe_executable_version='7.5',qe_executable_sha256='e'*64),
+        validation_calculator='disabled',synthesis_mode='disabled')
+    path=tmp_path/'spec.json'
+    path.write_text(json.dumps(spec.to_dict()))
+    calls=[]
+    monkeypatch.setattr('experiments.cli.merge_shard_outputs',lambda *args: calls.append('merge') or {'merged_seeds':spec.master_seeds})
+    monkeypatch.setattr('experiments.cli.finalize_merged_research_analysis',lambda *args: calls.append('analysis') or {'status':'ANALYSIS_COMPLETE'})
+    monkeypatch.setattr('experiments.cli.execute_full_experiment_pipeline',lambda *args,**kwargs:
+        pytest.fail('research merge re-entered experiment execution'))
+    monkeypatch.setattr(sys,'argv',['experiments.cli','merge','--spec-file',str(path),
+        '--shard-roots',str(tmp_path/'shard')])
+    main()
+    assert calls==['merge','analysis']
+    assert json.loads(capsys.readouterr().out)['finalization']['status']=='ANALYSIS_COMPLETE'
 
 
 def test_parent_experiment_mismatch_blocks_analysis():

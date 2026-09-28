@@ -1476,12 +1476,19 @@ def merge_shard_outputs(
         runtime_commit = manifest.get("code_commit")
         if not isinstance(runtime_commit, str) or not runtime_commit:
             raise RuntimeError(f"Shard '{root}' is missing its runtime code commit")
+        runtime_details = manifest.get("runtime")
+        if (spec.run_mode == "research" and
+                (runtime_commit != spec.code_commit
+                 or not isinstance(runtime_details, dict)
+                 or runtime_details.get("git_commit") != spec.code_commit
+                 or runtime_details.get("git_dirty") is not False)):
+            raise RuntimeError(f"Shard '{root}' runtime execution commit differs from authorized experiment")
         runtime_commits.add(runtime_commit)
         merged_seeds.update(shard_seeds)
         merged_run_nodes.update(expected_run_nodes)
         if spec.run_mode == "research":
-            from experiments.release_integrity import verify_research_root
-            verify_research_root(spec, root, seeds)
+            from experiments.release_integrity import verify_historical_research_root_for_merge
+            verify_historical_research_root_for_merge(spec, root, seeds)
         manifests.append({
             "root": str(root),
             "manifest": manifest,
@@ -1549,8 +1556,11 @@ def merge_shard_outputs(
                 copied.append(str(relative).replace("\\", "/"))
     output_root.mkdir(parents=True, exist_ok=True)
     if spec.run_mode == "research":
-        from experiments.release_integrity import verify_research_root
-        verify_research_root(spec, output_root, spec.master_seeds)
+        from experiments.release_integrity import verify_historical_research_root_for_merge, _finalization_identities
+        verify_historical_research_root_for_merge(spec, output_root, spec.master_seeds)
+        _, finalization_identity = _finalization_identities(spec, output_root)
+    else:
+        finalization_identity = None
     merge_manifest = {
         "manifest_schema_version": "1.0.0",
         "experiment_id": spec.experiment_id,
@@ -1558,6 +1568,8 @@ def merge_shard_outputs(
         "canonical_spec_hash": expected_canonical_hash,
         "spec_code_commit": spec.code_commit,
         "code_commit": next(iter(runtime_commits)),
+        "experiment_execution_commit": spec.code_commit,
+        "finalization_code_identity": finalization_identity,
         "canonical_master_seeds": list(spec.master_seeds),
         "merged_seeds": sorted(merged_seeds),
         "expected_run_node_ids": sorted(expected_run_nodes),
@@ -1574,6 +1586,71 @@ def merge_shard_outputs(
         "merged_seeds": sorted(merged_seeds),
         "run_node_ids": sorted(merged_run_nodes),
     }
+
+
+def finalize_merged_research_analysis(spec: ExperimentSpec, output_root: Path) -> Dict[str, Any]:
+    """Derive aggregates and statistics from a verified historical closure only."""
+    from experiments.release_integrity import (verify_historical_research_root_for_merge,
+                                               parent_hash, _finalization_identities)
+    from experiments.revised_runner import load_run_spec
+    output_root = Path(output_root)
+    if spec.run_mode != "research":
+        raise RuntimeError("Historical finalization requires a research experiment")
+    manifest_path = output_root / "merge_manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    _, finalizer = _finalization_identities(spec, output_root)
+    if (manifest.get("experiment_id") != spec.experiment_id
+            or manifest.get("canonical_spec_hash") != parent_hash(spec)
+            or manifest.get("spec_code_commit") != spec.code_commit
+            or manifest.get("experiment_execution_commit") != spec.code_commit
+            or manifest.get("code_commit") != spec.code_commit
+            or manifest.get("finalization_code_identity") != finalizer
+            or manifest.get("canonical_master_seeds") != list(spec.master_seeds)
+            or manifest.get("merged_seeds") != sorted(spec.master_seeds)):
+        raise RuntimeError("Merged research identity or seed coverage mismatch")
+    expected_runs = {node.node_id for node in ExperimentDAG(spec).nodes.values()
+                     if node.node_type in {NodeType.SOURCE_MEMORY_RUN, NodeType.TARGET_CAMPAIGN_RUN}}
+    if (set(manifest.get("expected_run_node_ids", [])) != expected_runs
+            or set(manifest.get("merged_run_node_ids", [])) != expected_runs):
+        raise RuntimeError("Merged research DAG run coverage mismatch")
+    verified_rows = verify_historical_research_root_for_merge(spec, output_root, spec.master_seeds)
+    rows, candidates = [], []
+    for seed in spec.master_seeds:
+        for task, condition in [(spec.source_task, "source_neutral")] + [
+                (task, condition) for task in spec.target_tasks for condition in FIVE_CONDITIONS]:
+            directory = output_root / "runs" / ("source" if condition == "source_neutral" else condition) / task.task_id / str(seed)
+            run = load_run_spec(directory, output_root)
+            report = directory / "report.json"
+            provenance = json.loads((directory / "campaign_provenance.json").read_text(encoding="utf-8"))
+            if report.exists():
+                provenance = {**json.loads(report.read_text(encoding="utf-8")), **provenance}
+            metric, found = compute_run_metrics(provenance, run.run_id, task.task_id,
+                                                condition, seed, run.oracle_budget)
+            rows.append(metric)
+            for candidate in found:
+                _load_candidate_structure(candidate, directory)
+                _attach_reference_phase_structures(candidate, run.reference_set_path)
+            candidates.extend(found)
+    if [row.to_dict() for row in rows] != [row.to_dict() for row in verified_rows]:
+        raise RuntimeError("Derived aggregate rows differ from verified research trajectory")
+    agg_dir = output_root / "aggregates"
+    agg_dir.mkdir(parents=True, exist_ok=True)
+    run_data = [row.to_dict() for row in rows]
+    candidate_data = [candidate.to_dict() for candidate in candidates]
+    _atomic_write_json(agg_dir / "runs.json", run_data)
+    _atomic_write_json(agg_dir / "candidates.json", candidate_data)
+    _write_parquet(agg_dir / "runs.parquet", run_data)
+    _write_parquet(agg_dir / "candidates.parquet", candidate_data)
+    run_statistical_analysis_pipeline(
+        run_metrics_list=rows, analysis_version=spec.analysis_version,
+        output_dir=output_root / "statistics", expected_seeds=spec.master_seeds,
+        expected_tasks=[task.task_id for task in spec.target_tasks],
+        experiment_id=spec.experiment_id, spec_hash=spec.spec_hash,
+        revised_protocol=True, parent_experiment_hash=parent_hash(spec),
+    )
+    return {"status": "ANALYSIS_COMPLETE", "runs": len(rows),
+            "candidates": len(candidates), "experiment_execution_commit": spec.code_commit,
+            "finalization_code_identity": finalizer}
 
 
 def main():
@@ -1593,7 +1670,7 @@ def main():
     p_run.add_argument("--worker-id", type=str, default=None,
                        help="Worker identifier required for seed-shard execution")
 
-    p_merge = subparsers.add_parser("merge", help="Merge complete seed shards and finalize the canonical experiment")
+    p_merge = subparsers.add_parser("merge", help="Merge complete seed shards and derive verified aggregates/statistics")
     p_merge.add_argument("--spec-file", type=str, required=True)
     p_merge.add_argument("--shard-roots", type=str, nargs="+", required=True)
     p_merge.add_argument("--output-root", type=str, default=None)
@@ -1647,8 +1724,10 @@ def main():
         output_root = Path(args.output_root) if args.output_root else Path(spec_data["output_root"])
         spec_data["output_root"] = str(output_root)
         spec = ExperimentSpec.from_dict(spec_data)
-        merge_shard_outputs(spec, args.shard_roots, output_root)
-        print(json.dumps(execute_full_experiment_pipeline(spec), indent=2))
+        merged = merge_shard_outputs(spec, args.shard_roots, output_root)
+        result = (finalize_merged_research_analysis(spec, output_root)
+                  if spec.run_mode == "research" else execute_full_experiment_pipeline(spec))
+        print(json.dumps({"merge": merged, "finalization": result}, indent=2))
 
 
 if __name__ == "__main__":

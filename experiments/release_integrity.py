@@ -89,8 +89,13 @@ def initialize_pair(spec, factory=None):
 
 
 def bind_pair(spec):
-    from experiments.selection_protocol import ProposalReplay, proposal_identity
     verify_code(spec)
+    return _bind_pair_artifacts(spec)
+
+
+def _bind_pair_artifacts(spec):
+    """Verify a frozen binding's bytes; merge callers separately attest its code."""
+    from experiments.selection_protocol import ProposalReplay, proposal_identity
     rel = str(Path('proposal_bindings') / spec.task_id / f'{spec.seed}.json')
     path = locate(spec, rel)
     sha = path.with_suffix('.sha256').read_text()
@@ -151,13 +156,32 @@ def validate_rows(rows, *, expected_tasks=None, expected_seeds=None, expected_pa
     return {'protocol': PROTOCOL, 'paired_groups': len(groups), 'text_equivalence': True}
 
 
-def verify_research_root(spec, root, seeds):
-    """Verify a complete portable research closure without regenerating anything."""
-    from experiments.revised_runner import load_run_spec, completed, freeze_source
+def _finalization_identities(spec, root):
+    """Attest clean current tooling and the recorded historical Git tree."""
+    if spec.run_mode != 'research' or len(spec.code_commit) != 40 or any(
+            c not in '0123456789abcdef' for c in spec.code_commit):
+        raise ValueError('Historical research verification requires an authorized commit SHA')
+    repository = Path(__file__).resolve().parents[1]
+    def git(*args):
+        return subprocess.check_output(['git', '-C', str(repository), *args], text=True).strip()
+    current_commit = git('rev-parse', 'HEAD')
+    finalizer = code_identity(current_commit, root)
+    historical = {'commit': spec.code_commit,
+                  'tree': git('rev-parse', f'{spec.code_commit}^{{tree}}')}
+    return historical, finalizer
+
+
+def _verify_research_root_closure(spec, root, seeds, historical_identity=None):
+    from experiments.revised_runner import (load_run_spec, completed, freeze_source,
+                                            _completed, _verify_frozen_source_for_merge)
     from experiments.metrics import compute_run_metrics
     from experiments.spec import FIVE_CONDITIONS
     root = Path(root)
-    code_identity(spec.code_commit, root)
+    if historical_identity is None:
+        code_identity(spec.code_commit, root)
+    else:
+        if historical_identity['commit'] != spec.code_commit:
+            raise ValueError('Historical closure execution commit mismatch')
     rows = []
     for seed in seeds:
         source = root / 'runs' / 'source' / spec.source_task.task_id / str(seed)
@@ -165,12 +189,22 @@ def verify_research_root(spec, root, seeds):
         for path in (corpus, corpus.with_suffix('.txt'), corpus.with_suffix('.receipt.json')):
             if not path.is_file():
                 raise ValueError('Incomplete frozen source closure')
-        freeze_source(source, corpus, seed, root=root)
+        if historical_identity is None:
+            freeze_source(source, corpus, seed, root=root)
+        else:
+            source_spec = load_run_spec(source, root)
+            if (source_spec.authorized_code_commit != spec.code_commit
+                    or source_spec.authorized_code_identity != historical_identity):
+                raise ValueError('Historical source code identity mismatch')
+            _verify_frozen_source_for_merge(source, corpus, seed, root=root)
         for task, condition in [(spec.source_task, 'source_neutral')] + [(t, c) for t in spec.target_tasks for c in FIVE_CONDITIONS]:
             directory = root / 'runs' / ('source' if condition == 'source_neutral' else condition) / task.task_id / str(seed)
             run = load_run_spec(directory, root)
+            complete = (completed(run) if historical_identity is None else
+                        _completed(run, _bind_pair_artifacts))
             if (run.parent_experiment_hash != parent_hash(spec) or run.authorized_code_commit != spec.code_commit
-                    or run.task_id != task.task_id or run.condition != condition or run.seed != seed or not completed(run)):
+                    or (historical_identity is not None and run.authorized_code_identity != historical_identity)
+                    or run.task_id != task.task_id or run.condition != condition or run.seed != seed or not complete):
                 raise ValueError('Research closure run identity/completion mismatch')
             reference = Path(run.reference_set_path)
             if (file_hash(reference) != run.reference_set_sha256
@@ -181,3 +215,14 @@ def verify_research_root(spec, root, seeds):
             rows.append(metric)
     validate_rows(rows, expected_tasks=[t.task_id for t in spec.target_tasks], expected_seeds=seeds, expected_parent=parent_hash(spec))
     return rows
+
+
+def verify_research_root(spec, root, seeds):
+    """Verify a complete closure during execution under its authorized code."""
+    return _verify_research_root_closure(spec, root, seeds)
+
+
+def verify_historical_research_root_for_merge(spec, root, seeds):
+    """Read-only verification of completed research under clean later tooling."""
+    historical, _ = _finalization_identities(spec, root)
+    return _verify_research_root_closure(spec, root, seeds, historical)
